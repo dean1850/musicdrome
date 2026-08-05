@@ -79,15 +79,19 @@ Open <http://localhost:4533> and sign in. The library is scanned on startup;
 you can also trigger one from the admin console or with
 `docker compose exec musicdrome musicdrome scan`.
 
-The stack is just the music server. Two things plug in from outside it:
+The stack is one service and nothing else. Everything optional connects over an
+API to something you already run:
 
-- **Lidarr** — connect to the one you already run, via its API. See
-  [Acquisition and Lidarr](#acquisition-and-lidarr).
-- **Ollama** — the one optional profile, if you want AI without an API key:
+| | |
+|---|---|
+| **Lidarr** | `LIDARR_URL` + `LIDARR_API_KEY` — see [Acquisition and Lidarr](#acquisition-and-lidarr) |
+| **Ollama** | `AI_PROVIDER=ollama` + `OLLAMA_BASE_URL` — AI with no API key and nothing leaving your network |
+| **Anthropic / OpenAI** | `AI_PROVIDER` + the matching key |
+| **Last.fm / ListenBrainz / MusicBrainz** | keys and per-user tokens in Settings |
 
-  ```bash
-  docker compose --profile ollama up -d
-  ```
+Anything on the Docker host is reachable at `host.docker.internal` — compose
+maps it to the host gateway, so it works on Linux as well as Docker Desktop.
+`localhost` will not work; inside the container that is the container itself.
 
 ---
 
@@ -257,7 +261,7 @@ annotated reference; the tables below group the same variables.
 | `ANTHROPIC_MODEL` | `claude-opus-5` | |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | |
 | `ANTHROPIC_EFFORT` | `medium` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` |
-| `OLLAMA_BASE_URL` | `http://ollama:11434` | Provided by the `ollama` compose profile |
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Your own Ollama, as reachable from inside the container |
 | `OLLAMA_MODEL` | `llama3.1` | |
 | `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` | `https://api.openai.com/v1`, –, `gpt-4o-mini` | For OpenAI, LM Studio, vLLM, OpenRouter … |
 | `AI_MAX_TOKENS` | `8192` | Response budget |
@@ -448,9 +452,16 @@ without the prose.
 **Recommendations.** Seeded from Last.fm and ListenBrainz, ranked against your
 history, feeding the acquisition queue.
 
-The provider is pluggable: Anthropic by default, a local Ollama model
-(`docker compose --profile ollama up -d`, no API key and nothing leaves your
-network), or anything speaking the OpenAI chat-completions shape.
+The provider is pluggable, and none of them are bundled — you point Musicdrome
+at one:
+
+```bash
+AI_PROVIDER=anthropic     # ANTHROPIC_API_KEY
+AI_PROVIDER=ollama        # OLLAMA_BASE_URL — your own instance, no API key,
+                          # nothing leaves your network
+AI_PROVIDER=openai        # OPENAI_BASE_URL + OPENAI_API_KEY, or any
+                          # OpenAI-compatible endpoint (LM Studio, vLLM, …)
+```
 
 ---
 

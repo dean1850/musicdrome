@@ -1,14 +1,11 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  Musicdrome
 #
-#    docker compose up -d                        # the music server
-#    docker compose --profile ollama up -d       # + local LLM instead of Claude
+#    docker compose up -d
 #
-#  Lidarr is not part of this stack. Musicdrome talks to your existing Lidarr
-#  over its API — set LIDARR_URL and LIDARR_API_KEY in .env.
-#
-#  Tests are not part of this stack either. Run them from the tests/ directory
-#  against a running server — see tests/README.md.
+#  One service, nothing bundled. Lidarr and Ollama are things you already run;
+#  Musicdrome connects to them over their APIs — set LIDARR_URL / OLLAMA_BASE_URL
+#  in .env. Tests run from tests/ against a running server, not from here.
 #
 #  Every value below comes from .env — see .env.example.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -39,9 +36,9 @@ services:
       - "${CACHE_DIR:-./data/cache}:/cache"
       - "${PODCAST_DIR:-./data/podcasts}:/podcasts"
       - "${DOWNLOAD_DIR:-./data/downloads}:/downloads"
-    # Lets LIDARR_URL=http://host.docker.internal:8686 reach a Lidarr running
-    # on the Docker host. Docker Desktop provides this name already; the
-    # host-gateway mapping is what makes it work on Linux too.
+    # Lets http://host.docker.internal:<port> reach services on the Docker host
+    # — Lidarr, Ollama, anything else. Docker Desktop provides this name
+    # already; the host-gateway mapping is what makes it work on Linux too.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -51,26 +48,3 @@ services:
       timeout: 5s
       start_period: 40s
       retries: 3
-    networks:
-      - musicdrome
-
-  # ─── Optional: Ollama ────────────────────────────────────────────────────
-  # Set AI_PROVIDER=ollama in .env to route AI work here instead of Claude.
-  ollama:
-    image: ollama/ollama:latest
-    container_name: musicdrome-ollama
-    profiles: ["ollama"]
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama-models:/root/.ollama
-    networks:
-      - musicdrome
-
-networks:
-  musicdrome:
-    driver: bridge
-
-volumes:
-  ollama-models:
