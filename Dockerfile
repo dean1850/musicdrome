@@ -4,7 +4,9 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ─── Stage 1: frontend ─────────────────────────────────────────────────────
-FROM node:22-alpine AS frontend
+# Pinned to the builder's own platform — the output is static JS/CSS, so there
+# is nothing to gain from running node under emulation on a cross build.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend
 
 WORKDIR /build
 
@@ -17,6 +19,11 @@ RUN npm run build
 
 # ─── Stage 2: runtime ──────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
+
+# Links the published package back to this repository on GHCR.
+LABEL org.opencontainers.image.source="https://github.com/dean1850/musicdrome" \
+      org.opencontainers.image.title="Musicdrome" \
+      org.opencontainers.image.description="Self-hosted music server with a Subsonic API, AI playlists and podcasts"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

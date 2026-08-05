@@ -59,6 +59,10 @@ docker compose up -d
 docker compose logs -f musicdrome
 ```
 
+That pulls the published image from the GitHub Container Registry — there is
+nothing to build. See [Container image](#container-image) if the pull asks you
+to authenticate, or if you would rather build from source.
+
 The first start creates an administrator. If you left `DEFAULT_ADMIN_PASSWORD`
 blank, a generated one is printed to the log — take it before you lose the
 scrollback:
@@ -92,6 +96,77 @@ API to something you already run:
 Anything on the Docker host is reachable at `host.docker.internal` — compose
 maps it to the host gateway, so it works on Linux as well as Docker Desktop.
 `localhost` will not work; inside the container that is the container itself.
+
+---
+
+## Container image
+
+Images are built by GitHub Actions and published to the GitHub Container
+Registry:
+
+```
+ghcr.io/dean1850/musicdrome
+```
+
+Built for `linux/amd64` and `linux/arm64`, so the same tag runs on x86 servers,
+Apple Silicon and a Raspberry Pi 4/5.
+
+| Tag | Points at |
+|---|---|
+| `latest` | The most recent commit on `main` |
+| `v1.2.3`, `1.2`, `1` | A released version — `1.2` and `1` move forward within their range |
+| `sha-<commit>` | One exact commit, never reused |
+| `<branch>` | The head of that branch, for testing an unmerged change |
+
+Pick which one compose runs with `MUSICDROME_IMAGE` / `MUSICDROME_TAG` in
+`.env`. `latest` follows `main`; pin to a `v*` or `sha-*` tag if you would
+rather upgrade deliberately.
+
+**Authentication.** The package inherits the repository's visibility. While the
+repository is private you need to log in once before pulling — a [personal
+access token](https://github.com/settings/tokens) with the `read:packages`
+scope is enough:
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
+```
+
+To drop that step, open the package page → **Package settings** → **Change
+visibility** → **Public**. Nothing in the image contains secrets; your `.env`
+stays on the host.
+
+**Updating.**
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+**Building it yourself.** The build override swaps the published image for a
+local build of the working tree:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+Or without compose:
+
+```bash
+docker build -t ghcr.io/dean1850/musicdrome:latest .
+```
+
+**How the publish works.** `.github/workflows/docker-publish.yml` builds on
+every push to `main`, on `v*.*.*` tags, and on demand from the Actions tab.
+Pull requests build too, `amd64` only and never pushed, so a broken Dockerfile
+is caught before it merges. Authentication uses the automatic `GITHUB_TOKEN` —
+there are no secrets to configure.
+
+To cut a release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
 
 ---
 
@@ -635,6 +710,7 @@ backend/musicdrome/
 frontend/src/        React SPA — pages, components, stores
 tests/               Playwright E2E + Subsonic conformance
 docker/              entrypoint
+.github/workflows/   image build and publish to ghcr.io
 ```
 
 ---
