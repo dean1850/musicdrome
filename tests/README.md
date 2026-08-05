@@ -36,15 +36,31 @@ npm run test:ui                        # interactive runner
 npm run report                         # open the last HTML report
 ```
 
-## Running against a container
+## Running against a deployed server
+
+Set `E2E_BASE_URL` and the config skips its own server, pointing the whole suite
+at whatever is already running — your compose stack, a dev server, a staging box:
 
 ```bash
-docker compose --profile test run --rm playwright
+docker compose up -d                                  # or however you run it
+cd tests
+E2E_BASE_URL=http://localhost:4533 npm test
 ```
 
-Compose sets `E2E_BASE_URL`, which makes the config skip its own server and
-target the running `musicdrome` service — so the suite exercises the image you
-would actually deploy. The service must be healthy first (`docker compose up -d`).
+This exercises the image you would actually deploy. Two things to know before
+pointing it at a real instance:
+
+- **It writes.** The suite creates accounts and playlists, stars tracks and
+  increments play counts. Do not aim it at a library you care about.
+- **It expects the seeded library** — 19 specific tracks across 5 albums. The
+  browsing and search specs assert exact counts, so against your own library
+  those fail while auth, playback, playlists and the Subsonic conformance specs
+  still tell you something useful. Narrow the run with `--grep` when you only
+  want the library-independent parts:
+
+  ```bash
+  E2E_BASE_URL=http://localhost:4533 npm test -- --grep "Subsonic"
+  ```
 
 ## Prerequisites
 
@@ -54,8 +70,8 @@ The frontend must be built before the E2E specs will find a UI:
 cd frontend && npm install && npm run build
 ```
 
-The container image builds it as part of `docker build`, so the compose path
-needs no extra step.
+Only needed for the throwaway-server path. When you point `E2E_BASE_URL` at a
+container, the image already built the UI as part of `docker build`.
 
 ## Notes on the design
 

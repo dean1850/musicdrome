@@ -2,9 +2,9 @@ import { existsSync } from 'node:fs'
 import { defineConfig, devices } from '@playwright/test'
 
 /**
- * When E2E_BASE_URL points at an already-running server (the compose `test`
- * profile does this), Playwright talks to it directly. Otherwise it boots a
- * throwaway instance itself via run-test-server.sh.
+ * Set E2E_BASE_URL to test an already-running server — a `docker compose up`
+ * stack, or a dev server — and Playwright talks to it directly. Leave it unset
+ * and Playwright boots a throwaway instance itself via run-test-server.sh.
  */
 const externalServer = Boolean(process.env.E2E_BASE_URL)
 const port = process.env.E2E_PORT || '4599'

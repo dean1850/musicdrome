@@ -26,11 +26,9 @@ data/
 *.db-wal
 *.db-shm
 
-# Test artefacts
-tests/.tmp
-tests/node_modules
-tests/test-results
-tests/playwright-report
+# Tests. Nothing in the image builds from these — the suite runs from the host
+# against a running server.
+tests/
 test-results
 playwright-report
 

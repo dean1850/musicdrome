@@ -21,7 +21,7 @@ Docker Compose.
 | **Multiuser** | Local accounts, admin-managed. Per-user play counts, stars, ratings, playlists, play queues and scrobble credentials. |
 | **Transcoding** | On-the-fly ffmpeg transcoding with per-user bitrate caps, HTTP range support and an LRU disk cache. |
 | **Podcasts** | RSS subscriptions, scheduled refresh, episode download and playback through both the web UI and the Subsonic podcast endpoints. |
-| **Lidarr** | Two-way sync — push wanted artists/albums into Lidarr, pull imported releases back into the library. |
+| **Lidarr** | Two-way sync with your existing Lidarr over its API — push wanted artists/albums, pull imported releases back into the library. Nothing bundled. |
 | **Acquisition** | yt-dlp fetching of recommended tracks, behind an approval queue by default, or fully automatic if you choose. |
 | **Web UI** | React + Tailwind, dark-first, keyboard shortcuts, queue player, search, discovery, analytics and an admin console. |
 
@@ -79,12 +79,15 @@ Open <http://localhost:4533> and sign in. The library is scanned on startup;
 you can also trigger one from the admin console or with
 `docker compose exec musicdrome musicdrome scan`.
 
-Optional extras ship as compose profiles:
+The stack is just the music server. Two things plug in from outside it:
 
-```bash
-docker compose --profile lidarr up -d     # bundled Lidarr
-docker compose --profile ollama up -d     # local AI, no API key needed
-```
+- **Lidarr** — connect to the one you already run, via its API. See
+  [Acquisition and Lidarr](#acquisition-and-lidarr).
+- **Ollama** — the one optional profile, if you want AI without an API key:
+
+  ```bash
+  docker compose --profile ollama up -d
+  ```
 
 ---
 
@@ -298,9 +301,9 @@ annotated reference; the tables below group the same variables.
 | Variable | Default | Description |
 |---|---|---|
 | `LIDARR_ENABLED` | `false` | |
-| `LIDARR_URL` | `http://lidarr:8686` | The `lidarr` compose profile provides this |
+| `LIDARR_URL` | `http://host.docker.internal:8686` | Your Lidarr, as reachable *from inside the container* — see below |
 | `LIDARR_API_KEY` | – | Lidarr → Settings → General |
-| `LIDARR_ROOT_FOLDER` | `/music` | The root folder *as Lidarr sees it* |
+| `LIDARR_ROOT_FOLDER` | `/music` | The root folder *as Lidarr sees it*, which is probably not `/music` if Lidarr runs elsewhere |
 | `LIDARR_QUALITY_PROFILE_ID` | `1` | |
 | `LIDARR_METADATA_PROFILE_ID` | `1` | |
 | `LIDARR_MONITOR_MODE` | `all` | `all`/`future`/`missing`/`existing`/`latest`/`first`/`none` |
@@ -466,9 +469,38 @@ it under **Discover → Wanted**. Set it to `true` and anything scoring above
 `ACQUISITION_MIN_CONFIDENCE` is fetched unattended, capped by
 `ACQUISITION_MAX_PER_DAY`.
 
-Lidarr sync is two-way: approved wanted items are pushed as monitored
-artists/albums, and releases Lidarr finishes importing are pulled back and
-indexed.
+### Connecting Lidarr
+
+Musicdrome talks to a Lidarr you already run — it does not ship one. Set three
+values in `.env`:
+
+```bash
+LIDARR_ENABLED=true
+LIDARR_URL=http://host.docker.internal:8686
+LIDARR_API_KEY=...                 # Lidarr → Settings → General → API Key
+LIDARR_ROOT_FOLDER=/music          # the library path as *Lidarr* sees it
+```
+
+`LIDARR_URL` must be reachable **from inside the Musicdrome container**, which
+is the one thing that trips people up:
+
+| Where Lidarr runs | Use |
+|---|---|
+| On the Docker host | `http://host.docker.internal:8686` — compose maps this to the host gateway, so it works on Linux too, not just Docker Desktop |
+| Elsewhere on your LAN or a NAS | `http://192.168.1.20:8686` |
+| In a different compose stack | Attach Musicdrome to that stack's network, then use the service name: `http://lidarr:8686` |
+| Behind a reverse proxy | The external URL, e.g. `https://lidarr.example.com` |
+
+`http://localhost:8686` will **not** work — inside the container that is the
+container itself.
+
+`LIDARR_ROOT_FOLDER` is Lidarr's own path for the library, not Musicdrome's. If
+Musicdrome sees `/music` but Lidarr calls the same folder `/data/media/music`,
+use the latter. Both do need to be pointed at the same actual directory for
+imports to land somewhere Musicdrome will scan.
+
+Sync is two-way: approved wanted items are pushed as monitored artists/albums,
+and releases Lidarr finishes importing are pulled back and indexed.
 
 > Musicdrome downloads what you tell it to download. You are responsible for
 > having the right to obtain the material you queue, and for whatever your Lidarr
@@ -533,14 +565,16 @@ playback, playlists, discovery, podcasts, admin, dark mode, and Subsonic
 conformance — both auth mechanisms, XML/JSON/JSONP envelopes and the Subsonic
 error codes.
 
-Against the container instead:
+To test a server that is already running — your compose stack, a dev server —
+point the suite at it instead:
 
 ```bash
-docker compose up -d
-docker compose --profile test run --rm playwright
+E2E_BASE_URL=http://localhost:4533 npm test
 ```
 
-See [`tests/README.md`](tests/README.md) for details.
+That path writes to the target (accounts, playlists, play counts) and the
+browsing specs assert counts from the seeded library, so aim it at a throwaway
+instance rather than your real one. See [`tests/README.md`](tests/README.md).
 
 ---
 

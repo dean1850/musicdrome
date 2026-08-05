@@ -1,10 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  Musicdrome
 #
-#    docker compose up -d                        # just the music server
-#    docker compose --profile lidarr up -d       # + Lidarr for torrent sync
+#    docker compose up -d                        # the music server
 #    docker compose --profile ollama up -d       # + local LLM instead of Claude
-#    docker compose --profile test run --rm playwright   # E2E suite
+#
+#  Lidarr is not part of this stack. Musicdrome talks to your existing Lidarr
+#  over its API — set LIDARR_URL and LIDARR_API_KEY in .env.
+#
+#  Tests are not part of this stack either. Run them from the tests/ directory
+#  against a running server — see tests/README.md.
 #
 #  Every value below comes from .env — see .env.example.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -35,6 +39,11 @@ services:
       - "${CACHE_DIR:-./data/cache}:/cache"
       - "${PODCAST_DIR:-./data/podcasts}:/podcasts"
       - "${DOWNLOAD_DIR:-./data/downloads}:/downloads"
+    # Lets LIDARR_URL=http://host.docker.internal:8686 reach a Lidarr running
+    # on the Docker host. Docker Desktop provides this name already; the
+    # host-gateway mapping is what makes it work on Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test:
         ["CMD-SHELL", "curl -fsS http://127.0.0.1:${MUSICDROME_PORT:-4533}/api/v1/health || exit 1"]
@@ -42,28 +51,6 @@ services:
       timeout: 5s
       start_period: 40s
       retries: 3
-    networks:
-      - musicdrome
-
-  # ─── Optional: Lidarr ────────────────────────────────────────────────────
-  # Handles indexers and the torrent/usenet client. Musicdrome pushes wanted
-  # artists here and pulls back what Lidarr imports. Point LIDARR_ROOT_FOLDER
-  # at /music so both containers see the same library.
-  lidarr:
-    image: lscr.io/linuxserver/lidarr:latest
-    container_name: musicdrome-lidarr
-    profiles: ["lidarr"]
-    restart: unless-stopped
-    environment:
-      PUID: "${PUID:-1000}"
-      PGID: "${PGID:-1000}"
-      TZ: "${TZ:-UTC}"
-    ports:
-      - "8686:8686"
-    volumes:
-      - "${LIDARR_CONFIG_DIR:-./data/lidarr}:/config"
-      - "${MUSIC_DIR:-./data/music}:/music"
-      - "${DOWNLOAD_DIR:-./data/downloads}:/downloads"
     networks:
       - musicdrome
 
@@ -78,27 +65,6 @@ services:
       - "11434:11434"
     volumes:
       - ollama-models:/root/.ollama
-    networks:
-      - musicdrome
-
-  # ─── Test harness ────────────────────────────────────────────────────────
-  playwright:
-    build:
-      context: .
-      dockerfile: tests/Dockerfile.playwright
-    profiles: ["test"]
-    depends_on:
-      musicdrome:
-        condition: service_healthy
-    environment:
-      E2E_BASE_URL: "http://musicdrome:${MUSICDROME_PORT:-4533}"
-      E2E_ADMIN_USERNAME: "${E2E_ADMIN_USERNAME:-admin}"
-      E2E_ADMIN_PASSWORD: "${E2E_ADMIN_PASSWORD:-testadmin123}"
-      CI: "true"
-    volumes:
-      - ./tests:/tests
-      - ./test-results:/tests/test-results
-      - ./playwright-report:/tests/playwright-report
     networks:
       - musicdrome
 
