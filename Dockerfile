@@ -42,7 +42,8 @@ COPY backend/ /app/
 COPY --from=frontend /build/dist /app/static
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh \
+COPY docker/musicdrome /usr/local/bin/musicdrome
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/musicdrome \
     && mkdir -p /music /config /cache /podcasts /downloads
 
 VOLUME ["/config", "/cache", "/podcasts", "/downloads"]

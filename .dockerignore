@@ -1,0 +1,48 @@
+# Keep the build context small and reproducible. Without this, the frontend
+# stage would copy a host node_modules over the one it just installed, and the
+# runtime stage would drag in the local venv and any scanned library data.
+
+.git
+.gitignore
+.github
+
+# Local environments
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Node
+**/node_modules
+frontend/dist
+npm-debug.log*
+
+# Runtime data — never belongs in an image
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Test artefacts
+tests/.tmp
+tests/node_modules
+tests/test-results
+tests/playwright-report
+test-results
+playwright-report
+
+# Secrets and docs
+.env
+.env.*
+!.env.example
+README.md
+LICENSE
+
+# Editors / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
