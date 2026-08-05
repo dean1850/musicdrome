@@ -3,6 +3,15 @@
 #
 #    docker compose up -d
 #
+#  Runs the image published to the GitHub Container Registry — no build, no
+#  source checkout needed beyond this file and .env. Update with:
+#
+#    docker compose pull && docker compose up -d
+#
+#  To build from this working tree instead, layer the build override on top:
+#
+#    docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
 #  One service, nothing bundled. Lidarr and Ollama are things you already run;
 #  Musicdrome connects to them over their APIs — set LIDARR_URL / OLLAMA_BASE_URL
 #  in .env. Tests run from tests/ against a running server, not from here.
@@ -12,10 +21,7 @@
 
 services:
   musicdrome:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: musicdrome:latest
+    image: "${MUSICDROME_IMAGE:-ghcr.io/dean1850/musicdrome}:${MUSICDROME_TAG:-latest}"
     container_name: musicdrome
     restart: unless-stopped
     env_file:
