@@ -107,7 +107,13 @@ def add_channel(db: Session, url: str, user: User | None = None) -> PodcastChann
     try:
         refresh_channel(db, channel)
     except Exception as exc:
+        # A feed we cannot read is not a subscription. Drop the row rather than
+        # leaving a permanently broken channel behind for the user to clean up.
         log.warning("initial fetch failed for %s: %s", url, exc)
+        db.delete(channel)
+        db.commit()
+        raise ValueError(f"could not read that feed: {exc}") from exc
+
     return channel
 
 

@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-base text-zinc-100;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Slim scrollbars that read as part of the dark surface rather than on top of it */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-zinc-700;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-zinc-600;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-accent ring-offset-2 ring-offset-base;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-line bg-surface;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm
+           font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-dim;
+  }
+  .btn-ghost {
+    @apply btn text-zinc-300 hover:bg-elevated hover:text-white;
+  }
+  .btn-outline {
+    @apply btn border border-line text-zinc-200 hover:border-zinc-600 hover:bg-elevated;
+  }
+  .btn-danger {
+    @apply btn bg-red-600/90 text-white hover:bg-red-600;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-line bg-elevated px-3 py-2 text-sm
+           text-zinc-100 placeholder-subtle transition-colors
+           focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium uppercase tracking-wide text-muted;
+  }
+
+  .chip {
+    @apply inline-flex items-center rounded-full border border-line bg-elevated
+           px-2.5 py-0.5 text-xs text-muted;
+  }
+
+  .page-title {
+    @apply text-2xl font-semibold tracking-tight text-white;
+  }
+
+  /* Row hover reveals the play affordance without shifting layout */
+  .track-row {
+    @apply grid items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors hover:bg-elevated;
+  }
+}
+
+/* Range input styled to match the dark surface across engines */
+input[type='range'] {
+  @apply h-1 w-full cursor-pointer appearance-none rounded-full bg-zinc-700;
+}
+input[type='range']::-webkit-slider-thumb {
+  @apply h-3 w-3 appearance-none rounded-full bg-white shadow;
+}
+input[type='range']::-moz-range-thumb {
+  @apply h-3 w-3 rounded-full border-0 bg-white;
+}

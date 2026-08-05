@@ -193,6 +193,9 @@ def create_playlist(request: Request, ctx: SubsonicContext = Depends(get_context
         )
         position += 1
 
+    # The session runs with autoflush off, so the new entries have to be pushed
+    # before _recalculate counts them — otherwise the playlist reports 0 tracks.
+    ctx.db.flush()
     _recalculate(ctx, playlist)
     ctx.db.commit()
     ctx.db.refresh(playlist)

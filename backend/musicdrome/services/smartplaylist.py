@@ -408,7 +408,13 @@ def seed_default_playlists(db: Session, user: User) -> int:
             rules=spec["rules"],
         )
         db.add(playlist)
+        db.flush()
+        # Materialise immediately. Without this the starter playlists would read
+        # as empty until the first scheduled refresh, which is up to an hour
+        # after the account is created.
+        refresh_playlist(db, playlist)
         created += 1
+
     db.commit()
     return created
 

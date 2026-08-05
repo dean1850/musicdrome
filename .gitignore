@@ -68,3 +68,4 @@ Thumbs.db
 
 # Local dev virtualenv
 .venv/
+tests/.tmp/
