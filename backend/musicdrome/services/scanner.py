@@ -65,7 +65,7 @@ def is_scanning() -> bool:
 # ─── Filesystem walking ────────────────────────────────────────────────────
 
 
-def _is_ignored(path: Path) -> bool:
+def is_ignored(path: Path) -> bool:
     parts = set(path.parts)
     for pattern in settings.ignore_patterns:
         if pattern in parts:
@@ -91,7 +91,7 @@ def iter_audio_files(root: Path) -> list[Path]:
             continue
         if path.suffix.lower().lstrip(".") not in extensions:
             continue
-        if _is_ignored(path.relative_to(root) if path.is_relative_to(root) else path):
+        if is_ignored(path.relative_to(root) if path.is_relative_to(root) else path):
             continue
         found.append(path)
     return found
@@ -504,6 +504,8 @@ def scan_library(full: bool = False) -> ScanResult:
             "scan complete: %d seen, %d added, %d updated, %d removed, %d errors",
             result.seen, result.added, result.updated, result.removed, result.errors,
         )
+
+        import_playlist_files()
     except Exception as exc:
         log.exception("scan failed: %s", exc)
         if run_id:
@@ -527,6 +529,23 @@ def scan_library(full: bool = False) -> ScanResult:
         _scan_lock.release()
 
     return result
+
+
+def import_playlist_files(*, force: bool = False) -> None:
+    """Pick up any ``.m3u`` sitting in the library.
+
+    Called at the end of a scan rather than during it: an entry can only be
+    resolved once the audio it names has been indexed, and a downloader drops
+    the playlist file in the same breath as the tracks.
+    """
+    if not settings.playlist_auto_import:
+        return
+    try:
+        from .playlistfile import import_all
+
+        import_all(force=force)
+    except Exception:
+        log.exception("playlist import failed")
 
 
 def scan_paths(paths: list[Path]) -> ScanResult:

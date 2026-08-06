@@ -13,6 +13,7 @@ import type {
   LibraryStats,
   Playlist,
   PlaylistDetail,
+  PlaylistImportStatus,
   PodcastChannel,
   PodcastEpisode,
   Recommendation,
@@ -86,7 +87,9 @@ async function refreshAccessToken(): Promise<boolean> {
 async function request<T>(path: string, init: RequestInit = {}, retry = true): Promise<T> {
   const headers = new Headers(init.headers)
   if (tokens.access) headers.set('Authorization', `Bearer ${tokens.access}`)
-  if (init.body && !headers.has('Content-Type')) {
+  // FormData sets its own Content-Type, boundary and all — overriding it here
+  // would make the request unparseable at the other end.
+  if (init.body && !headers.has('Content-Type') && !(init.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json')
   }
 
@@ -188,7 +191,7 @@ export const api = {
     post<{ message: string }>(`/rate/${kind}/${id}${qs({ rating })}`),
 
   // ── Playlists ──
-  playlists: (kind: 'all' | 'manual' | 'smart' | 'ai' = 'all') =>
+  playlists: (kind: 'all' | 'manual' | 'smart' | 'ai' | 'imported' = 'all') =>
     get<Playlist[]>(`/playlists${qs({ kind })}`),
   playlist: (id: number) => get<PlaylistDetail>(`/playlists/${id}`),
   createPlaylist: (payload: { name: string; comment?: string; public?: boolean; track_ids?: number[] }) =>
@@ -203,6 +206,19 @@ export const api = {
     post<Playlist>('/playlists-smart', payload),
   updateSmartPlaylist: (id: number, payload: Record<string, unknown>) =>
     put<Playlist>(`/playlists-smart/${id}`, payload),
+  importPlaylists: (force = false) =>
+    post<{ ok: boolean; message: string; data: Record<string, number> }>('/playlists-import', {
+      force,
+    }),
+  importStatus: () => get<PlaylistImportStatus>('/playlists-import/status'),
+  uploadPlaylist: (file: File) => {
+    const body = new FormData()
+    body.append('file', file)
+    // No Content-Type header: the browser has to set the multipart boundary.
+    return request<Playlist>('/playlists-import/upload', { method: 'POST', body })
+  },
+  exportPlaylistUrl: (id: number) =>
+    `${BASE}/playlists/${id}/export.m3u?token=${encodeURIComponent(tokens.access)}`,
   createAIPlaylist: (payload: { brief: string; max_tracks?: number; seed_genre?: string }) =>
     post<Playlist>('/playlists-ai', payload),
   previewAIPlaylist: (payload: { brief: string; max_tracks?: number; seed_genre?: string }) =>

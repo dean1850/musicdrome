@@ -28,6 +28,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_playlists(args: argparse.Namespace) -> int:
+    from .services import playlistfile
+
+    init_db()
+    stats = playlistfile.import_all(force=args.force)
+    print(
+        f"{stats['files']} playlist file(s): {stats['created']} imported, "
+        f"{stats['updated']} updated, {stats['deleted']} removed, "
+        f"{stats['missing']} entries not in the library, {stats['errors']} errors"
+    )
+    return 0
+
+
 def cmd_create_user(args: argparse.Namespace) -> int:
     from .services.smartplaylist import seed_default_playlists
 
@@ -126,6 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan", help="scan the music library")
     scan.add_argument("--full", action="store_true", help="re-read tags for every file")
     scan.set_defaults(func=cmd_scan)
+
+    playlists = sub.add_parser(
+        "import-playlists", help="import .m3u playlist files found in the library"
+    )
+    playlists.add_argument(
+        "--force", action="store_true", help="re-read files whose mtime has not moved"
+    )
+    playlists.set_defaults(func=cmd_import_playlists)
 
     create = sub.add_parser("create-user", help="create a user account")
     create.add_argument("username")

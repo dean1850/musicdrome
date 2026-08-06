@@ -8,7 +8,6 @@ import threading
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import or_, select
 
-from ..db import utcnow
 from ..models import (
     Playlist,
     PlaylistTrack,
@@ -18,6 +17,7 @@ from ..models import (
     User,
 )
 from ..services import podcasts as podcast_service
+from ..services.playlists import detach, recalculate
 from .common import (
     EPISODE,
     PLAYLIST,
@@ -125,29 +125,6 @@ def _collect_ids(request: Request, params: dict, name: str) -> list[str]:
     return values
 
 
-def _recalculate(ctx: SubsonicContext, playlist: Playlist) -> None:
-    entries = ctx.db.scalars(
-        select(PlaylistTrack)
-        .where(PlaylistTrack.playlist_id == playlist.id)
-        .order_by(PlaylistTrack.position)
-    ).all()
-
-    playlist.song_count = len(entries)
-    playlist.duration = sum(
-        entry.track.duration for entry in entries if entry.track is not None
-    )
-    playlist.cover_art_path = next(
-        (
-            entry.track.cover_art_path
-            for entry in entries
-            if entry.track is not None and entry.track.cover_art_path
-        ),
-        None,
-    )
-    playlist.updated_at = utcnow()
-    ctx.db.add(playlist)
-
-
 @endpoint(router, "createPlaylist")
 def create_playlist(request: Request, ctx: SubsonicContext = Depends(get_context)):
     if not ctx.user.playlist_role:
@@ -175,10 +152,8 @@ def create_playlist(request: Request, ctx: SubsonicContext = Depends(get_context
         ctx.db.add(playlist)
         ctx.db.flush()
 
-    # A smart or AI playlist becomes a plain one once edited by hand
-    playlist.is_smart = False
-    playlist.is_ai = False
-    playlist.rules = None
+    # A smart, AI or imported playlist becomes a plain one once edited by hand
+    detach(playlist)
 
     position = 0
     for raw in _collect_ids(request, params, "songId"):
@@ -194,9 +169,9 @@ def create_playlist(request: Request, ctx: SubsonicContext = Depends(get_context
         position += 1
 
     # The session runs with autoflush off, so the new entries have to be pushed
-    # before _recalculate counts them — otherwise the playlist reports 0 tracks.
+    # before recalculate() counts them — otherwise the playlist reports 0 tracks.
     ctx.db.flush()
-    _recalculate(ctx, playlist)
+    recalculate(ctx.db, playlist)
     ctx.db.commit()
     ctx.db.refresh(playlist)
 
@@ -276,12 +251,10 @@ def update_playlist(request: Request, ctx: SubsonicContext = Depends(get_context
         next_position += 1
 
     if remove_indices or _collect_ids(request, params, "songIdToAdd"):
-        playlist.is_smart = False
-        playlist.is_ai = False
-        playlist.rules = None
+        detach(playlist)
 
     ctx.db.flush()
-    _recalculate(ctx, playlist)
+    recalculate(ctx.db, playlist)
     ctx.db.commit()
     return ctx.ok()
 

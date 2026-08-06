@@ -16,6 +16,7 @@ Docker Compose.
 | **Subsonic API** | v1.16.1 at `/rest` with OpenSubsonic extensions. Works with DSub, Substreamer, play:Sub, Symfonium, Sonixd, Feishin and other Airsonic-compatible clients. XML, JSON and JSONP envelopes; both plaintext and salted-token auth. |
 | **Library** | Recursive scanner reading tags from MP3, FLAC, OGG/Opus, M4A/AAC, WAV, WMA, AIFF, APE, MPC and WavPack. Embedded and folder cover art, MusicBrainz IDs, disc/track numbers, multi-value artist and genre fields. Optional live filesystem watching. |
 | **Smart playlists** | Navidrome-compatible rule documents (`all`/`any`/`not` with 19 operators) refreshed on a schedule, **plus** AI-curated playlists that reason over your play history, Last.fm and MusicBrainz data. |
+| **M3U import** | `.m3u`/`.m3u8` files dropped in the library — by Downtify, spotDL or your own hand — become playlists within seconds, and stay in step with the file. Build playlists by hand too: drag to reorder, and export any of them back out as M3U. |
 | **AI analytics** | Narrative reports over your listening — taste profile, discovery rate, listening clock, artist affinity — written on top of real SQL aggregates, never invented numbers. |
 | **Scrobbling** | Last.fm and ListenBrainz, with a durable retry queue so nothing is lost while a service is down. |
 | **Multiuser** | Local accounts, admin-managed. Per-user play counts, stars, ratings, playlists, play queues and scrobble credentials. |
@@ -350,6 +351,21 @@ annotated reference; the tables below group the same variables.
 </details>
 
 <details>
+<summary><b>Playlist files (.m3u)</b></summary>
+
+| Variable | Default | Description |
+|---|---|---|
+| `PLAYLIST_AUTO_IMPORT` | `true` | Import `.m3u` files found in the library |
+| `PLAYLIST_IMPORT_DIRS` | – | Extra folders to search, beyond `MUSIC_DIR`. Comma-separated *container* paths |
+| `PLAYLIST_IMPORT_EXTENSIONS` | `m3u,m3u8` | |
+| `PLAYLIST_IMPORT_OWNER` | – | Account that owns imported playlists. Blank = first admin |
+| `PLAYLIST_IMPORT_PUBLIC` | `true` | Make them visible to every user, not just the owner |
+| `PLAYLIST_IMPORT_INTERVAL_MINUTES` | `60` | Backstop sweep, for shares whose file events never arrive |
+| `PLAYLIST_IMPORT_PRUNE` | `true` | Delete the playlist when its `.m3u` is deleted |
+
+</details>
+
+<details>
 <summary><b>Smart playlists</b></summary>
 
 | Variable | Default | Description |
@@ -509,6 +525,72 @@ immediately rather than waiting for the first scheduled refresh. Set
 
 ---
 
+## Playlist files (.m3u)
+
+Any `.m3u` or `.m3u8` inside the library becomes a playlist, the way Navidrome
+does it. Point a downloader at your music folder and its playlists show up on
+their own — no button to press, nothing to configure.
+
+**Downtify**, which writes `<downloads>/Playlists/<name>.m3u` with the track
+paths relative to that file, works if its download folder *is* your `MUSIC_DIR`.
+If it writes somewhere else, mount that folder into the container and name it:
+
+```bash
+PLAYLIST_IMPORT_DIRS=/downloads/Playlists
+```
+
+spotDL, Soulseek clients, Picard, foobar2000 exports and hand-written files all
+work the same way.
+
+**When it runs.** Three moments, so nothing is missed:
+
+| | |
+|---|---|
+| **On write** | The filesystem watcher sees the file land and imports it within seconds. Audio is indexed first, so a playlist written in the same breath as its tracks still resolves them. |
+| **After every scan** | Startup and scheduled scans finish by importing playlist files. |
+| **On a timer** | `PLAYLIST_IMPORT_INTERVAL_MINUTES`, as a backstop for network shares whose inotify events never arrive. |
+
+Or on demand: **Playlists → Import M3U → Scan now**, or
+`docker compose exec musicdrome musicdrome import-playlists`.
+
+**Finding the track.** Each entry is resolved down a ladder, stopping at the
+first hit:
+
+1. the path as written, resolved against the playlist file's own folder
+2. the same, case-insensitively — for a library that came off a Windows share
+3. the trailing path segments, which survives the library being mounted at a
+   different root than it had when the file was written, and a differing
+   extension
+4. the `#EXTINF` artist and title
+
+Steps 3 and 4 only accept an unambiguous match. If two tracks would satisfy
+them the entry counts as missing rather than being guessed at.
+
+Percent-encoded `file://` URIs, Windows backslashes, CRLF line endings, byte
+order marks and Windows codepages are all handled; `http://` entries are
+skipped, since a remote stream is not a library track.
+
+**Entries you do not own** are skipped and counted — the playlist page shows how
+many. They are picked up automatically once the files land, so a playlist
+imported before its downloads finished fills itself in.
+
+**Staying in sync.** The file is the source of truth. Editing it re-imports the
+track list; deleting it deletes the playlist (`PLAYLIST_IMPORT_PRUNE=false` to
+keep it). Renaming the playlist in the web UI sticks — the name is only taken
+from the file the first time it is seen. Editing the *track list*, here or from
+a Subsonic client, hands the playlist over to you and it stops following the
+file.
+
+Imported playlists belong to the first administrator and are public, so every
+account sees them; `PLAYLIST_IMPORT_OWNER` and `PLAYLIST_IMPORT_PUBLIC` change
+that. If a configured import folder is not mounted, nothing is pruned — a
+missing volume must not read as "the user deleted everything".
+
+**Going the other way**, any playlist — manual, smart, AI or imported — exports
+as an extended M3U from its page, with paths relative to the music folder.
+
+---
+
 ## AI features
 
 With `AI_ENABLED=true` and a provider configured, three things become available.
@@ -626,6 +708,7 @@ docker compose exec musicdrome musicdrome <command>
 | Command | Purpose |
 |---|---|
 | `scan [--full]` | Index the library; `--full` re-reads tags for unchanged files |
+| `import-playlists [--force]` | Import `.m3u` files found in the library; `--force` re-reads unchanged ones |
 | `create-user NAME [--password P] [--admin]` | Add an account; prompts if no password given |
 | `set-password NAME [--password P]` | Reset a password (writes both stored copies) |
 | `list-users` | Show accounts and roles |
@@ -705,9 +788,11 @@ backend/musicdrome/
                      podcasts, admin
   services/          scanner, tags, watcher, transcode, scrobble,
                      lastfm, listenbrainz, musicbrainz, smartplaylist,
-                     podcasts, lidarr, acquisition, recommendations, jobs
+                     playlists, playlistfile, podcasts, lidarr,
+                     acquisition, recommendations, jobs
   services/ai/       provider abstraction, curator, analytics
 frontend/src/        React SPA — pages, components, stores
+backend/tests/       pytest — M3U parsing, resolution, import lifecycle
 tests/               Playwright E2E + Subsonic conformance
 docker/              entrypoint
 .github/workflows/   image build and publish to ghcr.io

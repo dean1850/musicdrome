@@ -79,9 +79,64 @@ def session_scope() -> Iterator[Session]:
         db.close()
 
 
+def _sync_schema() -> None:
+    """Add columns and indexes that ``create_all`` cannot.
+
+    ``create_all`` creates missing *tables* but silently leaves an existing one
+    alone, so a column added to a model would never reach a database that
+    already has the table. There is no migration tool here on purpose — SQLite
+    plus a handful of additive ``ALTER TABLE``s keeps an upgrade to a plain
+    container pull. Only additions are handled; nothing is ever dropped.
+    """
+    from sqlalchemy import inspect
+    from sqlalchemy.schema import CreateIndex
+
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+
+    with engine.begin() as connection:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in tables:
+                continue  # create_all just built it, columns and all
+
+            present = {column["name"] for column in inspector.get_columns(table.name)}
+            added = False
+            for column in table.columns:
+                if column.name in present:
+                    continue
+
+                type_sql = column.type.compile(engine.dialect)
+                clause = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {type_sql}'
+
+                # SQLite cannot add a NOT NULL column without a default, and a
+                # callable default (utcnow) has no SQL equivalent — those go in
+                # nullable and are filled by the ORM from then on.
+                default = getattr(column.default, "arg", None)
+                if default is not None and not callable(default):
+                    literal = (
+                        f"'{default}'"
+                        if isinstance(default, str)
+                        else str(int(default) if isinstance(default, bool) else default)
+                    )
+                    clause += f" NOT NULL DEFAULT {literal}"
+
+                connection.exec_driver_sql(clause)
+                log.info("added column %s.%s", table.name, column.name)
+                added = True
+
+            if not added:
+                continue
+
+            existing_indexes = {index["name"] for index in inspector.get_indexes(table.name)}
+            for index in table.indexes:
+                if index.name not in existing_indexes:
+                    connection.execute(CreateIndex(index, if_not_exists=True))
+
+
 def init_db() -> None:
     """Create any missing tables and indexes."""
     from . import models  # noqa: F401  (registers mappers on Base)
 
     Base.metadata.create_all(bind=engine)
+    _sync_schema()
     log.info("database ready at %s", settings.database_url)

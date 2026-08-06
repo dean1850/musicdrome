@@ -176,6 +176,19 @@ class Settings(BaseSettings):
     ai_min_plays_for_profile: int = Field(20, validation_alias="AI_MIN_PLAYS_FOR_PROFILE")
     ai_context_track_limit: int = Field(300, validation_alias="AI_CONTEXT_TRACK_LIMIT")
 
+    # ─── Playlist files (.m3u) ────────────────────────────────────────────
+    playlist_auto_import: bool = Field(True, validation_alias="PLAYLIST_AUTO_IMPORT")
+    playlist_import_dirs: str = Field("", validation_alias="PLAYLIST_IMPORT_DIRS")
+    playlist_import_extensions: str = Field(
+        "m3u,m3u8", validation_alias="PLAYLIST_IMPORT_EXTENSIONS"
+    )
+    playlist_import_owner: str = Field("", validation_alias="PLAYLIST_IMPORT_OWNER")
+    playlist_import_public: bool = Field(True, validation_alias="PLAYLIST_IMPORT_PUBLIC")
+    playlist_import_interval_minutes: int = Field(
+        60, validation_alias="PLAYLIST_IMPORT_INTERVAL_MINUTES"
+    )
+    playlist_import_prune: bool = Field(True, validation_alias="PLAYLIST_IMPORT_PRUNE")
+
     # ─── Smart playlists ──────────────────────────────────────────────────
     smart_playlist_enabled: bool = Field(True, validation_alias="SMART_PLAYLIST_ENABLED")
     smart_playlist_refresh_minutes: int = Field(
@@ -266,6 +279,29 @@ class Settings(BaseSettings):
     @property
     def cover_names(self) -> list[str]:
         return [n.lower() for n in _csv(self.cover_art_names)]
+
+    @property
+    def playlist_extensions(self) -> set[str]:
+        """Playlist file suffixes the importer accepts, lowercase, no dot."""
+        return {e.lower().lstrip(".") for e in _csv(self.playlist_import_extensions)}
+
+    @property
+    def playlist_import_roots(self) -> list[Path]:
+        """Folders searched for playlist files.
+
+        The music directory is always included — that is where a downloader
+        writing alongside the library puts its ``.m3u``. Extra roots exist for
+        the case where the downloader's output is mounted separately.
+        """
+        roots: list[Path] = [self.music_dir]
+        for raw in _csv(self.playlist_import_dirs):
+            roots.append(Path(raw).expanduser())
+
+        unique: list[Path] = []
+        for root in roots:
+            if root not in unique:
+                unique.append(root)
+        return unique
 
     @property
     def cors_origin_list(self) -> list[str]:

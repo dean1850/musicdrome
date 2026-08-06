@@ -175,6 +175,33 @@ export const Download = ({ className = base }: Props) => (
   </svg>
 )
 
+export const Upload = ({ className = base }: Props) => (
+  <svg className={className} viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+    <path d="M12 21V10m0 0 4 4m-4-4-4 4M4 6V4.5A1.5 1.5 0 0 1 5.5 3h13A1.5 1.5 0 0 1 20 4.5V6" />
+  </svg>
+)
+
+export const Pencil = ({ className = base }: Props) => (
+  <svg className={className} viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+    <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3ZM14.5 7.5l2 2" />
+  </svg>
+)
+
+export const FileMusic = ({ className = base }: Props) => (
+  <svg className={className} viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" />
+    <path d="M14 3v5h5M10 18v-4.5l4-1V17" />
+    <circle cx="9" cy="18" r="1.2" />
+    <circle cx="13" cy="17" r="1.2" />
+  </svg>
+)
+
+export const Grip = ({ className = base }: Props) => (
+  <svg className={className} viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+    <path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" strokeWidth="2.5" />
+  </svg>
+)
+
 export const Plus = ({ className = base }: Props) => (
   <svg className={className} viewBox="0 0 24 24" {...stroke} aria-hidden="true">
     <path d="M12 5v14M5 12h14" />

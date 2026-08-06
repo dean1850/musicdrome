@@ -1,11 +1,11 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../lib/api'
 import { duration as fmtDuration } from '../lib/format'
 import { usePlayer } from '../store/player'
 import type { Track } from '../types'
-import { Heart, Play, Plus } from './icons'
-import { EmptyState, Modal, Stars } from './ui'
+import { Grip, Heart, Play, Plus, X } from './icons'
+import { EmptyState, ErrorBanner, Modal, Stars } from './ui'
 import type { Playlist } from '../types'
 
 interface Props {
@@ -16,6 +16,9 @@ interface Props {
   showNumber?: boolean
   showNotes?: boolean
   emptyLabel?: string
+  /** Supplying either of these turns the list into a playlist editor. */
+  onRemove?: (track: Track, index: number) => void
+  onReorder?: (from: number, to: number) => void
 }
 
 export default function TrackList({
@@ -25,11 +28,15 @@ export default function TrackList({
   showNumber = false,
   showNotes = false,
   emptyLabel = 'No tracks here yet.',
+  onRemove,
+  onReorder,
 }: Props) {
   const { playQueue, current, playing } = usePlayer()
   const [starred, setStarred] = useState<Record<number, boolean>>({})
   const [ratings, setRatings] = useState<Record<number, number>>({})
   const [addTarget, setAddTarget] = useState<Track | null>(null)
+  const [dragIndex, setDragIndex] = useState<number | null>(null)
+  const [overIndex, setOverIndex] = useState<number | null>(null)
 
   const currentTrack = current()
 
@@ -60,8 +67,15 @@ export default function TrackList({
     }
   }
 
+  function move(from: number, to: number) {
+    if (!onReorder) return
+    if (to < 0 || to >= tracks.length || to === from) return
+    onReorder(from, to)
+  }
+
   // Column template mirrors what's actually rendered
   const columns = [
+    onReorder ? '1.5rem' : null,
     showNumber ? '2rem' : null,
     '2rem',
     'minmax(0,3fr)',
@@ -71,6 +85,7 @@ export default function TrackList({
     '3.5rem',
     '2rem',
     '2rem',
+    onRemove ? '2rem' : null,
   ]
     .filter(Boolean)
     .join(' ')
@@ -82,6 +97,7 @@ export default function TrackList({
           className="grid gap-3 border-b border-line px-3 pb-2 text-[11px] uppercase tracking-wide text-subtle"
           style={{ gridTemplateColumns: columns }}
         >
+          {onReorder && <span />}
           {showNumber && <span className="text-right">#</span>}
           <span />
           <span>Title</span>
@@ -91,19 +107,66 @@ export default function TrackList({
           <span className="text-right">Time</span>
           <span />
           <span />
+          {onRemove && <span />}
         </div>
 
         <ul className="mt-1">
           {tracks.map((track, i) => {
             const isCurrent = currentTrack?.id === track.id
+            const isDropTarget = overIndex === i && dragIndex !== null && dragIndex !== i
             return (
-              <li key={`${track.id}-${i}`}>
+              <li
+                key={`${track.id}-${i}`}
+                draggable={Boolean(onReorder)}
+                onDragStart={(event) => {
+                  setDragIndex(i)
+                  event.dataTransfer.effectAllowed = 'move'
+                }}
+                onDragOver={(event) => {
+                  if (dragIndex === null) return
+                  event.preventDefault()
+                  setOverIndex(i)
+                }}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  if (dragIndex !== null) move(dragIndex, i)
+                  setDragIndex(null)
+                  setOverIndex(null)
+                }}
+                onDragEnd={() => {
+                  setDragIndex(null)
+                  setOverIndex(null)
+                }}
+                className={`${isDropTarget ? 'border-t-2 border-accent' : ''} ${
+                  dragIndex === i ? 'opacity-40' : ''
+                }`}
+              >
                 <div
                   className={`track-row group ${isCurrent ? 'bg-elevated' : ''}`}
                   style={{ gridTemplateColumns: columns }}
                   data-testid="track-row"
                   data-track-id={track.id}
                 >
+                  {onReorder && (
+                    <button
+                      className="cursor-grab text-subtle opacity-0 transition-opacity group-hover:opacity-100 hover:text-white focus:opacity-100"
+                      aria-label={`Reorder ${track.title}. Use the arrow keys to move it.`}
+                      title="Drag to reorder, or use the arrow keys"
+                      data-testid="reorder-track"
+                      onKeyDown={(event) => {
+                        if (event.key === 'ArrowUp') {
+                          event.preventDefault()
+                          move(i, i - 1)
+                        } else if (event.key === 'ArrowDown') {
+                          event.preventDefault()
+                          move(i, i + 1)
+                        }
+                      }}
+                    >
+                      <Grip className="h-4 w-4" />
+                    </button>
+                  )}
+
                   {showNumber && (
                     <span className="text-right text-xs tabular-nums text-subtle">
                       {track.track_number || i + 1}
@@ -196,6 +259,17 @@ export default function TrackList({
                   >
                     <Plus className="h-4 w-4" />
                   </button>
+
+                  {onRemove && (
+                    <button
+                      onClick={() => onRemove(track, i)}
+                      className="text-subtle opacity-0 transition-opacity group-hover:opacity-100 hover:text-red-300"
+                      aria-label={`Remove ${track.title} from this playlist`}
+                      data-testid="remove-track"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  )}
                 </div>
               </li>
             )
@@ -210,52 +284,110 @@ export default function TrackList({
 
 function AddToPlaylistModal({ track, onClose }: { track: Track | null; onClose: () => void }) {
   const [playlists, setPlaylists] = useState<Playlist[] | null>(null)
-  const [busy, setBusy] = useState(false)
   const [done, setDone] = useState('')
+  const [error, setError] = useState('')
+  const [newName, setNewName] = useState('')
+  const [creating, setCreating] = useState(false)
 
-  if (track && playlists === null && !busy) {
-    setBusy(true)
+  useEffect(() => {
+    if (!track) return
+    let cancelled = false
+    setPlaylists(null)
+    setError('')
     void api
       .playlists('manual')
-      .then(setPlaylists)
-      .catch(() => setPlaylists([]))
-      .finally(() => setBusy(false))
+      .then((result) => !cancelled && setPlaylists(result))
+      .catch(() => !cancelled && setPlaylists([]))
+    return () => {
+      cancelled = true
+    }
+  }, [track])
+
+  function confirm(name: string) {
+    setDone(`Added to ${name}`)
+    setTimeout(() => {
+      setDone('')
+      setNewName('')
+      onClose()
+    }, 900)
   }
 
   async function add(playlist: Playlist) {
     if (!track) return
-    await api.addToPlaylist(playlist.id, [track.id])
-    setDone(`Added to ${playlist.name}`)
-    setTimeout(() => {
-      setDone('')
-      onClose()
-    }, 900)
+    try {
+      await api.addToPlaylist(playlist.id, [track.id])
+      confirm(playlist.name)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not add the track')
+    }
+  }
+
+  async function createAndAdd() {
+    if (!track || !newName.trim()) return
+    setCreating(true)
+    setError('')
+    try {
+      const playlist = await api.createPlaylist({
+        name: newName.trim(),
+        track_ids: [track.id],
+      })
+      confirm(playlist.name)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not create the playlist')
+    } finally {
+      setCreating(false)
+    }
   }
 
   return (
     <Modal open={!!track} title="Add to playlist" onClose={onClose}>
       {done ? (
         <p className="py-6 text-center text-sm text-accent-soft">{done}</p>
-      ) : !playlists ? (
-        <p className="py-6 text-center text-sm text-muted">Loading playlists…</p>
-      ) : playlists.length === 0 ? (
-        <p className="py-6 text-center text-sm text-muted">
-          You have no editable playlists yet. Create one from the Playlists page.
-        </p>
       ) : (
-        <ul className="space-y-1">
-          {playlists.map((playlist) => (
-            <li key={playlist.id}>
-              <button
-                onClick={() => add(playlist)}
-                className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm hover:bg-elevated"
-              >
-                <span className="text-zinc-100">{playlist.name}</span>
-                <span className="text-xs text-subtle">{playlist.song_count} tracks</span>
-              </button>
-            </li>
-          ))}
-        </ul>
+        <div className="space-y-4">
+          <ErrorBanner message={error} onDismiss={() => setError('')} />
+
+          <div className="flex gap-2">
+            <input
+              className="input"
+              placeholder="New playlist name…"
+              value={newName}
+              onChange={(event) => setNewName(event.target.value)}
+              onKeyDown={(event) => event.key === 'Enter' && void createAndAdd()}
+              data-testid="quick-playlist-name"
+            />
+            <button
+              className="btn-outline shrink-0"
+              onClick={createAndAdd}
+              disabled={creating || !newName.trim()}
+              data-testid="quick-playlist-create"
+            >
+              <Plus className="h-4 w-4" /> Create
+            </button>
+          </div>
+
+          {!playlists ? (
+            <p className="py-4 text-center text-sm text-muted">Loading playlists…</p>
+          ) : playlists.length === 0 ? (
+            <p className="py-4 text-center text-sm text-muted">
+              No editable playlists yet — name one above to start.
+            </p>
+          ) : (
+            <ul className="space-y-1 border-t border-line pt-3">
+              {playlists.map((playlist) => (
+                <li key={playlist.id}>
+                  <button
+                    onClick={() => add(playlist)}
+                    className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm hover:bg-elevated"
+                  >
+                    <span className="text-zinc-100">{playlist.name}</span>
+                    <span className="text-xs text-subtle">{playlist.song_count} tracks</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </Modal>
   )

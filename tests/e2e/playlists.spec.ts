@@ -117,4 +117,86 @@ test.describe('playlists', () => {
     // The E2E server runs with AI_ENABLED=false
     await expect(page.getByTestId('new-ai')).toBeDisabled()
   })
+
+  test('renames a playlist and reorders its tracks', async ({ page }) => {
+    const name = `Sortable ${Date.now()}`
+    await createPlaylist(page, name)
+
+    // Two tracks, added from an album page
+    await gotoTab(page, 'albums')
+    await page.getByText('Test Patterns').click()
+    for (const index of [0, 1]) {
+      const row = page.getByTestId('track-row').nth(index)
+      await row.hover()
+      await row.getByTestId('add-to-playlist').click()
+      await page.getByTestId('modal').getByRole('button', { name: new RegExp(name) }).click()
+      await expect(page.getByTestId('modal')).toBeHidden()
+    }
+
+    await gotoTab(page, 'playlists')
+    await card(page, name).click()
+    await expect(page.getByTestId('track-row')).toHaveCount(2)
+    await expect(page.getByTestId('track-row').first()).toContainText('Colour Bars')
+
+    // Keyboard reordering — the same path the drag handle drives
+    await page.getByTestId('reorder-track').first().focus()
+    await page.keyboard.press('ArrowDown')
+    await expect(page.getByTestId('track-row').first()).toContainText('Vertical Hold')
+
+    // Removing a track
+    const row = page.getByTestId('track-row').first()
+    await row.hover()
+    await row.getByTestId('remove-track').click()
+    await expect(page.getByTestId('track-row')).toHaveCount(1)
+
+    // Renaming
+    const renamed = `${name} renamed`
+    await page.getByTestId('edit-playlist').click()
+    await page.getByTestId('edit-playlist-name').fill(renamed)
+    await page.getByTestId('save-playlist').click()
+    await expect(page.getByTestId('playlist-title')).toHaveText(renamed)
+  })
+})
+
+test.describe('m3u playlists', () => {
+  test('imports the .m3u file seeded in the library', async ({ page }) => {
+    await page.getByTestId('tab-imported').click()
+    await expect(card(page, 'Downtify Mix')).toBeVisible()
+
+    await card(page, 'Downtify Mix').click()
+    await expect(page.getByTestId('playlist-title')).toHaveText('Downtify Mix')
+
+    // Two of the three entries are in the library; the third is not
+    await expect(page.getByTestId('track-row')).toHaveCount(2)
+    await expect(page.getByTestId('track-row').first()).toContainText('Colour Bars')
+    await expect(page.getByTestId('track-row').nth(1)).toContainText('Copper Rain')
+    await expect(page.getByTestId('import-missing')).toContainText('1')
+    await expect(page.getByTestId('import-info')).toContainText('Downtify Mix.m3u')
+  })
+
+  test('imports an uploaded .m3u file', async ({ page }) => {
+    await page.getByTestId('import-m3u').click()
+    await page.getByTestId('import-upload').setInputFiles({
+      name: 'Uploaded Mix.m3u',
+      mimeType: 'audio/x-mpegurl',
+      buffer: Buffer.from(
+        '#EXTM3U\n' +
+          '#PLAYLIST:Uploaded Mix\n' +
+          '#EXTINF:2,Aurora Fields - First Light\n' +
+          'Aurora Fields/Northern Lights/01 - First Light.wav\n',
+      ),
+    })
+
+    await expect(page.getByTestId('toast')).toContainText('Uploaded Mix')
+    await page.getByTestId('tab-imported').click()
+    await card(page, 'Uploaded Mix').click()
+    await expect(page.getByTestId('track-row')).toHaveCount(1)
+    await expect(page.getByTestId('track-row').first()).toContainText('First Light')
+  })
+
+  test('re-scans the library for playlist files on demand', async ({ page }) => {
+    await page.getByTestId('import-m3u').click()
+    await page.getByTestId('import-scan').click()
+    await expect(page.getByTestId('toast')).toContainText('playlist file')
+  })
 })

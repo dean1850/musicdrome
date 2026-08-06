@@ -390,6 +390,18 @@ class Playlist(Base):
     ai_seed: Mapped[dict | None] = mapped_column(JSON, default=None)
     last_generated_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
 
+    # Playlists read from an .m3u on disk stay bound to that file: its mtime
+    # drives a re-import and deleting it deletes the playlist. ``sync`` goes
+    # false once the track list is edited by hand, which hands ownership to the
+    # user without losing ``import_path`` — otherwise the next pass would see an
+    # unknown file and import a duplicate.
+    is_imported: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    import_path: Mapped[str | None] = mapped_column(Text, default=None, index=True)
+    import_mtime: Mapped[float] = mapped_column(Float, default=0.0)
+    import_missing: Mapped[int] = mapped_column(Integer, default=0)
+    sync: Mapped[bool] = mapped_column(Boolean, default=False)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+
     cover_art_path: Mapped[str | None] = mapped_column(Text, default=None)
     duration: Mapped[int] = mapped_column(Integer, default=0)
     song_count: Mapped[int] = mapped_column(Integer, default=0)

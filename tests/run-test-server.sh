@@ -46,7 +46,18 @@ export LIDARR_ENABLED=false
 export PYTHONPATH="$ROOT/backend"
 
 "$PYTHON" "$HERE/seed_library.py" "$TMP/music" >&2
+
+# The admin is created up front rather than left to the server's first-run
+# bootstrap: imported playlists need an owner, and the scan below is what
+# imports the seeded .m3u.
+"$PYTHON" -m musicdrome.cli create-user "$DEFAULT_ADMIN_USERNAME" \
+    --password "$DEFAULT_ADMIN_PASSWORD" --admin >&2
+
 "$PYTHON" -m musicdrome.cli scan >&2
+
+# The starter smart playlists were materialised against an empty library a
+# moment ago; fill them in now that the tracks are indexed.
+"$PYTHON" -m musicdrome.cli refresh playlists >&2
 
 exec "$PYTHON" -m uvicorn musicdrome.main:app \
     --host 127.0.0.1 --port "$PORT" --log-level warning
