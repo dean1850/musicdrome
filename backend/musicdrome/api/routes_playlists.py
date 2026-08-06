@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from ..auth import get_current_user
+from ..auth import get_current_admin, get_current_user
+from ..config import settings
 from ..db import get_db, utcnow
 from ..models import Playlist, PlaylistTrack, Track, User
+from ..services import playlistfile
 from ..services.ai.curator import create_ai_playlist, generate_playlist, save_playlist
 from ..services.ai.provider import AIError
+from ..services.playlists import detach, recalculate, replace_tracks
 from ..services.smartplaylist import (
     DEFAULT_PLAYLISTS,
     RuleError,
@@ -25,6 +38,7 @@ from .schemas import (
     GenericResponse,
     PlaylistCreateRequest,
     PlaylistDetail,
+    PlaylistImportRequest,
     PlaylistOut,
     PlaylistUpdateRequest,
     SmartPlaylistRequest,
@@ -54,6 +68,11 @@ def _playlist_out(db: Session, playlist: Playlist) -> PlaylistOut:
         created_at=playlist.created_at,
         updated_at=playlist.updated_at,
         last_generated_at=playlist.last_generated_at,
+        is_imported=playlist.is_imported,
+        import_path=playlist.import_path,
+        import_missing=playlist.import_missing,
+        sync=playlist.sync,
+        imported_at=playlist.imported_at,
     )
 
 
@@ -69,28 +88,12 @@ def _load(db: Session, playlist_id: int, user: User, *, for_write: bool = False)
     return playlist
 
 
-def _recalculate(db: Session, playlist: Playlist) -> None:
-    entries = db.scalars(
-        select(PlaylistTrack)
-        .where(PlaylistTrack.playlist_id == playlist.id)
-        .order_by(PlaylistTrack.position)
-    ).all()
-    playlist.song_count = len(entries)
-    playlist.duration = sum(e.track.duration for e in entries if e.track is not None)
-    playlist.cover_art_path = next(
-        (e.track.cover_art_path for e in entries if e.track and e.track.cover_art_path),
-        None,
-    )
-    playlist.updated_at = utcnow()
-    db.add(playlist)
-
-
 # ─── CRUD ──────────────────────────────────────────────────────────────────
 
 
 @router.get("/playlists", response_model=list[PlaylistOut])
 def list_playlists(
-    kind: str = Query("all", pattern="^(all|manual|smart|ai)$"),
+    kind: str = Query("all", pattern="^(all|manual|smart|ai|imported)$"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -101,8 +104,15 @@ def list_playlists(
         stmt = stmt.where(Playlist.is_smart.is_(True))
     elif kind == "ai":
         stmt = stmt.where(Playlist.is_ai.is_(True))
+    elif kind == "imported":
+        stmt = stmt.where(Playlist.is_imported.is_(True))
     elif kind == "manual":
-        stmt = stmt.where(Playlist.is_smart.is_(False), Playlist.is_ai.is_(False))
+        # Anything a person can edit freely: no rules, no model, no file.
+        stmt = stmt.where(
+            Playlist.is_smart.is_(False),
+            Playlist.is_ai.is_(False),
+            Playlist.sync.is_(False),
+        )
 
     playlists = db.scalars(stmt.order_by(Playlist.name)).all()
     return [_playlist_out(db, playlist) for playlist in playlists]
@@ -157,16 +167,8 @@ def create_playlist(
     db.add(playlist)
     db.flush()
 
-    for position, track_id in enumerate(payload.track_ids):
-        if db.get(Track, track_id) is not None:
-            db.add(
-                PlaylistTrack(
-                    playlist_id=playlist.id, track_id=track_id, position=position
-                )
-            )
-
-    db.flush()
-    _recalculate(db, playlist)
+    replace_tracks(db, playlist, payload.track_ids)
+    recalculate(db, playlist)
     db.commit()
     db.refresh(playlist)
     return _playlist_out(db, playlist)
@@ -189,23 +191,13 @@ def update_playlist(
         playlist.public = payload.public
 
     if payload.track_ids is not None:
-        db.query(PlaylistTrack).filter(
-            PlaylistTrack.playlist_id == playlist.id
-        ).delete(synchronize_session=False)
-        for position, track_id in enumerate(payload.track_ids):
-            if db.get(Track, track_id) is not None:
-                db.add(
-                    PlaylistTrack(
-                        playlist_id=playlist.id, track_id=track_id, position=position
-                    )
-                )
-        # Hand-editing the track list detaches it from its generator
-        playlist.is_smart = False
-        playlist.is_ai = False
-        playlist.rules = None
+        replace_tracks(db, playlist, payload.track_ids)
+        # Hand-editing the track list detaches it from whatever was generating
+        # it — rules, a model, or an .m3u on disk.
+        detach(playlist)
 
     db.flush()
-    _recalculate(db, playlist)
+    recalculate(db, playlist)
     db.commit()
     db.refresh(playlist)
     return _playlist_out(db, playlist)
@@ -240,6 +232,7 @@ def add_tracks(
     )
     next_position = (position or -1) + 1
 
+    added = False
     for track_id in track_ids:
         if db.get(Track, track_id) is None:
             continue
@@ -249,12 +242,155 @@ def add_tracks(
             )
         )
         next_position += 1
+        added = True
+
+    if added:
+        detach(playlist)
 
     db.flush()
-    _recalculate(db, playlist)
+    recalculate(db, playlist)
     db.commit()
     db.refresh(playlist)
     return _playlist_out(db, playlist)
+
+
+# ─── M3U import / export ───────────────────────────────────────────────────
+#
+# Paths deliberately mirror /playlists-smart and /playlists-ai: a literal
+# segment under /playlists/ would be swallowed by /playlists/{playlist_id}.
+
+
+@router.post("/playlists-import", response_model=GenericResponse)
+def import_playlist_files(
+    payload: PlaylistImportRequest,
+    admin: User = Depends(get_current_admin),
+):
+    """Re-read every ``.m3u`` under the configured roots, now.
+
+    Normally unnecessary — the watcher picks a file up seconds after it is
+    written, and the scanner sweeps on its own schedule — but useful right
+    after pointing the server at a folder full of them.
+    """
+    stats = playlistfile.import_all(force=payload.force)
+    if stats.get("skipped"):
+        return GenericResponse(ok=False, message="An import is already running")
+
+    return GenericResponse(
+        message=(
+            f"{stats['files']} playlist file(s): {stats['created']} imported, "
+            f"{stats['updated']} updated, {stats['deleted']} removed"
+        ),
+        data={key: value for key, value in stats.items() if key != "at"},
+    )
+
+
+@router.get("/playlists-import/status")
+def playlist_import_status(admin: User = Depends(get_current_admin)):
+    # Counting walks each root, which is why this is not on the playlists page:
+    # it answers "why has it not found my file" and is asked once, by an admin.
+    roots = [
+        {
+            "path": str(root),
+            "exists": root.is_dir(),
+            "files": len(playlistfile.discover([root])) if root.is_dir() else 0,
+        }
+        for root in settings.playlist_import_roots
+    ]
+    return {
+        "enabled": settings.playlist_auto_import,
+        "roots": roots,
+        "extensions": sorted(settings.playlist_extensions),
+        "interval_minutes": settings.playlist_import_interval_minutes,
+        "public": settings.playlist_import_public,
+        "prune": settings.playlist_import_prune,
+        "last_run": playlistfile.last_run(),
+    }
+
+
+@router.post(
+    "/playlists-import/upload",
+    response_model=PlaylistOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_playlist_file(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Import a single ``.m3u`` the user hands over, rather than one on disk.
+
+    The result belongs to the uploader and is not bound to a file, so it
+    behaves like any hand-built playlist from here on.
+    """
+    if not user.playlist_role:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Playlist management is disabled"
+        )
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="The file is empty"
+        )
+
+    name = Path(file.filename or "Imported playlist").stem
+    document = playlistfile.parse_m3u_bytes(raw, name=name)
+    if not document.entries:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No playlist entries found — is this an M3U file?",
+        )
+
+    # Relative entries have no folder to resolve against here, so they fall to
+    # the path-tail and metadata steps of the ladder.
+    index = playlistfile.build_index(db)
+    track_ids, missing = playlistfile.resolve_document(
+        document, settings.music_dir, index
+    )
+    if not track_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"None of the {len(missing)} entries match a track in your library"
+            ),
+        )
+
+    playlist = Playlist(
+        name=document.name or name,
+        comment=f"Imported from {file.filename}",
+        owner_id=user.id,
+        public=False,
+        is_imported=True,
+        sync=False,
+        import_missing=len(missing),
+        imported_at=utcnow(),
+    )
+    db.add(playlist)
+    db.flush()
+
+    replace_tracks(db, playlist, track_ids)
+    recalculate(db, playlist)
+    db.commit()
+    db.refresh(playlist)
+    return _playlist_out(db, playlist)
+
+
+@router.get("/playlists/{playlist_id}/export.m3u", response_class=PlainTextResponse)
+def export_playlist(
+    playlist_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    playlist = _load(db, playlist_id, user)
+    safe_name = "".join(
+        char if char.isalnum() or char in " -_" else "_" for char in playlist.name
+    ).strip() or "playlist"
+
+    return PlainTextResponse(
+        playlistfile.export_m3u(db, playlist),
+        media_type="audio/x-mpegurl",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.m3u"'},
+    )
 
 
 # ─── Smart playlists ───────────────────────────────────────────────────────

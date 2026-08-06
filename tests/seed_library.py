@@ -113,6 +113,27 @@ def tag(path: Path, *, title: str, artist: str, album: str, track: int, year: in
     audio.save()
 
 
+def write_playlist_file(root: Path) -> None:
+    """A Downtify-shaped drop: the .m3u in Playlists/, paths relative to it.
+
+    One entry deliberately names a track nobody has downloaded, so the suite
+    covers the "not in your library" path as well as the happy one.
+    """
+    folder = root / "Playlists"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "Downtify Mix.m3u").write_text(
+        "#EXTM3U\n"
+        "#PLAYLIST:Downtify Mix\n"
+        "#EXTINF:2,Signal Drift - Colour Bars\n"
+        "../Signal Drift/Test Patterns/01 - Colour Bars.wav\n"
+        "#EXTINF:2,Nadia Okonkwo - Copper Rain\n"
+        "../Nadia Okonkwo/Salt and Copper/02 - Copper Rain.wav\n"
+        "#EXTINF:2,Someone Else - Not Downloaded\n"
+        "../Someone Else/Missing Album/01 - Not Downloaded.wav\n",
+        encoding="utf-8",
+    )
+
+
 def build(root: Path, seconds: float = 2.0) -> int:
     root.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -136,6 +157,7 @@ def build(root: Path, seconds: float = 2.0) -> int:
                 )
             written += 1
 
+    write_playlist_file(root)
     return written
 
 

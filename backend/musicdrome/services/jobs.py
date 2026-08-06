@@ -64,8 +64,8 @@ def _in(seconds: int):
 
 def register_jobs() -> None:
     """Wire up every recurring task."""
-    from . import acquisition, enrich, lidarr, podcasts, recommendations, scanner
-    from . import scrobble, smartplaylist, transcode
+    from . import acquisition, enrich, lidarr, playlistfile, podcasts, recommendations
+    from . import scanner, scrobble, smartplaylist, transcode
     from .ai import analytics as ai_analytics
     from .ai import curator as ai_curator
 
@@ -81,6 +81,16 @@ def register_jobs() -> None:
     _every("scrobble_prune", lambda: scrobble.prune_queue(30), hours=24)
 
     # ─── Playlists ─────────────────────────────────────────────────────
+    if settings.playlist_auto_import:
+        # A backstop for the watcher: covers a network share whose events
+        # never reach inotify, and a file written while the server was down.
+        _every(
+            "playlist_import",
+            playlistfile.import_all,
+            minutes=settings.playlist_import_interval_minutes,
+            first_run_seconds=90,
+        )
+
     if settings.smart_playlist_enabled:
         _every(
             "smart_playlists",

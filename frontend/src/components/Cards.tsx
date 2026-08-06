@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import { api } from '../lib/api'
 import { usePlayer } from '../store/player'
 import type { Album, Artist, Playlist } from '../types'
-import { List, Play, Sparkles } from './icons'
+import { FileMusic, List, Play, Sparkles } from './icons'
 
 export function AlbumCard({ album }: { album: Album }) {
   const { playQueue } = usePlayer()
@@ -73,7 +73,13 @@ export function ArtistCard({ artist }: { artist: Artist }) {
 }
 
 export function PlaylistCard({ playlist }: { playlist: Playlist }) {
-  const badge = playlist.is_ai ? 'AI' : playlist.is_smart ? 'Smart' : null
+  const badge = playlist.is_ai
+    ? 'AI'
+    : playlist.is_smart
+      ? 'Smart'
+      : playlist.is_imported
+        ? 'M3U'
+        : null
 
   return (
     <Link
@@ -90,7 +96,13 @@ export function PlaylistCard({ playlist }: { playlist: Playlist }) {
         />
         {badge && (
           <span className="absolute left-2 top-2 flex items-center gap-1 rounded-full bg-black/70 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-accent-soft backdrop-blur">
-            {playlist.is_ai ? <Sparkles className="h-3 w-3" /> : <List className="h-3 w-3" />}
+            {playlist.is_ai ? (
+              <Sparkles className="h-3 w-3" />
+            ) : playlist.is_smart ? (
+              <List className="h-3 w-3" />
+            ) : (
+              <FileMusic className="h-3 w-3" />
+            )}
             {badge}
           </span>
         )}

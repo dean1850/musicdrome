@@ -161,6 +161,11 @@ class PlaylistOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_generated_at: datetime | None = None
+    is_imported: bool = False
+    import_path: str | None = None
+    import_missing: int = 0
+    sync: bool = False
+    imported_at: datetime | None = None
 
 
 class PlaylistDetail(PlaylistOut):
@@ -186,6 +191,11 @@ class SmartPlaylistRequest(BaseModel):
     comment: str = ""
     public: bool = False
     rules: dict
+
+
+class PlaylistImportRequest(BaseModel):
+    # Re-read every playlist file, even ones whose mtime has not moved
+    force: bool = False
 
 
 class AIPlaylistRequest(BaseModel):

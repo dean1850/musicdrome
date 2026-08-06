@@ -58,7 +58,12 @@ class _DebouncedHandler(FileSystemEventHandler):
             return True
         if path.is_dir():
             return True
-        return path.suffix.lower().lstrip(".") in settings.extensions
+        suffix = path.suffix.lower().lstrip(".")
+        return suffix in settings.extensions or suffix in settings.playlist_extensions
+
+    @staticmethod
+    def _is_playlist(path: Path) -> bool:
+        return path.suffix.lower().lstrip(".") in settings.playlist_extensions
 
     def _record(self, event: FileSystemEvent, *, deleted: bool) -> None:
         path = Path(str(event.src_path))
@@ -92,16 +97,28 @@ class _DebouncedHandler(FileSystemEventHandler):
             except Exception:
                 log.exception("watcher failed to process deletions")
 
+        indexed = False
         if changed:
             try:
                 result = scanner.scan_paths(changed)
-                if result.added or result.updated:
+                indexed = bool(result.added or result.updated)
+                if indexed:
                     log.info(
                         "watcher indexed %d new / %d updated tracks",
                         result.added, result.updated,
                     )
             except Exception:
                 log.exception("watcher failed to process changes")
+
+        # Audio first, playlists second: a downloader writes the .m3u alongside
+        # the tracks, and its entries only resolve once those are indexed. New
+        # audio alone is reason enough to re-run — it may complete a playlist
+        # that imported with entries missing.
+        touched_playlist = any(
+            self._is_playlist(path) for path in (*changed, *deleted)
+        )
+        if touched_playlist or indexed:
+            scanner.import_playlist_files()
 
 
 class LibraryWatcher:
@@ -121,11 +138,24 @@ class LibraryWatcher:
             return
 
         observer = Observer()
-        observer.schedule(_DebouncedHandler(), str(settings.music_dir), recursive=True)
+        handler = _DebouncedHandler()
+        watched = [settings.music_dir]
+
+        # Playlist roots outside the library — a downloader's output mounted
+        # separately — are watched too, otherwise its .m3u only lands on the
+        # next scheduled import instead of the moment it is written.
+        if settings.playlist_auto_import:
+            for root in settings.playlist_import_roots:
+                if root not in watched and root.is_dir():
+                    watched.append(root)
+
+        for root in watched:
+            observer.schedule(handler, str(root), recursive=True)
+
         observer.daemon = True
         observer.start()
         self._observer = observer
-        log.info("watching %s for changes", settings.music_dir)
+        log.info("watching %s for changes", ", ".join(str(root) for root in watched))
 
     def stop(self) -> None:
         if self._observer is None:

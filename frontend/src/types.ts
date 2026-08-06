@@ -82,6 +82,30 @@ export interface Playlist {
   created_at: string
   updated_at: string
   last_generated_at: string | null
+  is_imported: boolean
+  import_path: string | null
+  import_missing: number
+  /** True while the playlist still follows its .m3u file on disk. */
+  sync: boolean
+  imported_at: string | null
+}
+
+export interface PlaylistImportStatus {
+  enabled: boolean
+  roots: { path: string; exists: boolean; files: number }[]
+  extensions: string[]
+  interval_minutes: number
+  public: boolean
+  prune: boolean
+  last_run: {
+    at: string | null
+    files: number
+    created: number
+    updated: number
+    deleted: number
+    missing: number
+    errors: number
+  }
 }
 
 export interface PlaylistDetail extends Playlist {

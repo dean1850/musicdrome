@@ -1,12 +1,12 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Grid, PlaylistCard } from '../components/Cards'
-import { List, Plus, Sparkles } from '../components/icons'
+import { List, Plus, Refresh, Sparkles, Upload } from '../components/icons'
 import { EmptyState, ErrorBanner, Loading, Modal, Spinner, Tabs, Toast } from '../components/ui'
 import { api } from '../lib/api'
 import { useAsync } from '../lib/hooks'
 import { useAuth } from '../store/auth'
 
-type Kind = 'all' | 'manual' | 'smart' | 'ai'
+type Kind = 'all' | 'manual' | 'smart' | 'ai' | 'imported'
 
 export default function Playlists() {
   const { user, server } = useAuth()
@@ -15,6 +15,7 @@ export default function Playlists() {
   const [newOpen, setNewOpen] = useState(false)
   const [aiOpen, setAiOpen] = useState(false)
   const [smartOpen, setSmartOpen] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
 
   const { data: playlists, loading, error, reload } = useAsync(() => api.playlists(kind), [kind])
 
@@ -30,6 +31,9 @@ export default function Playlists() {
           </button>
           <button className="btn-outline" onClick={() => setSmartOpen(true)} data-testid="new-smart">
             <List className="h-4 w-4" /> New smart playlist
+          </button>
+          <button className="btn-outline" onClick={() => setImportOpen(true)} data-testid="import-m3u">
+            <Upload className="h-4 w-4" /> Import M3U
           </button>
           <button
             className="btn-primary"
@@ -51,6 +55,7 @@ export default function Playlists() {
           { value: 'manual', label: 'Manual' },
           { value: 'smart', label: 'Smart' },
           { value: 'ai', label: 'AI' },
+          { value: 'imported', label: 'Imported' },
         ]}
       />
 
@@ -97,6 +102,15 @@ export default function Playlists() {
         onClose={() => setAiOpen(false)}
         onDone={(name) => {
           setToast(`Curated "${name}"`)
+          void reload()
+        }}
+      />
+      <ImportModal
+        open={importOpen}
+        isAdmin={Boolean(user?.is_admin)}
+        onClose={() => setImportOpen(false)}
+        onDone={(message) => {
+          setToast(message)
           void reload()
         }}
       />
@@ -184,6 +198,149 @@ function NewPlaylistModal({
           />
           Visible to other users on this server
         </label>
+      </div>
+    </Modal>
+  )
+}
+
+function ImportModal({
+  open,
+  isAdmin,
+  onClose,
+  onDone,
+}: {
+  open: boolean
+  isAdmin: boolean
+  onClose: () => void
+  onDone: (message: string) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const fileInput = useRef<HTMLInputElement>(null)
+
+  // Only fetched for admins — it walks the import roots to count files.
+  const { data: status, reload: reloadStatus } = useAsync(
+    () => (open && isAdmin ? api.importStatus() : Promise.resolve(null)),
+    [open, isAdmin],
+  )
+
+  async function scanNow(force: boolean) {
+    setBusy(true)
+    setError('')
+    try {
+      const result = await api.importPlaylists(force)
+      if (!result.ok) setError(result.message)
+      else onDone(result.message)
+      void reloadStatus()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'The import failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function upload(file: File) {
+    setBusy(true)
+    setError('')
+    try {
+      const playlist = await api.uploadPlaylist(file)
+      onDone(
+        playlist.import_missing
+          ? `Imported "${playlist.name}" — ${playlist.import_missing} entries are not in your library`
+          : `Imported "${playlist.name}"`,
+      )
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not read that file')
+    } finally {
+      setBusy(false)
+      if (fileInput.current) fileInput.current.value = ''
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      title="Import M3U playlists"
+      onClose={onClose}
+      wide
+      footer={
+        <button className="btn-ghost" onClick={onClose}>
+          Close
+        </button>
+      }
+    >
+      <ErrorBanner message={error} onDismiss={() => setError('')} />
+
+      <div className="space-y-6">
+        <section>
+          <h3 className="text-sm font-semibold text-white">Automatic</h3>
+          <p className="mt-1 text-sm text-muted">
+            Any <code className="text-zinc-200">.m3u</code> or{' '}
+            <code className="text-zinc-200">.m3u8</code> file inside your library is imported on
+            its own — within seconds of a downloader writing it, and again on every library scan.
+            Editing the file re-syncs the playlist; deleting it removes the playlist.
+          </p>
+
+          {isAdmin && status && (
+            <div className="mt-3 space-y-2 rounded-lg border border-line bg-elevated p-3 text-xs">
+              {status.roots.map((root) => (
+                <div key={root.path} className="flex items-center justify-between gap-3">
+                  <code className="truncate text-zinc-300" title={root.path}>
+                    {root.path}
+                  </code>
+                  <span className={root.exists ? 'shrink-0 text-subtle' : 'shrink-0 text-red-300'}>
+                    {root.exists ? `${root.files} file(s)` : 'not mounted'}
+                  </span>
+                </div>
+              ))}
+              {status.last_run.at && (
+                <p className="border-t border-line pt-2 text-subtle">
+                  Last pass: {status.last_run.created} imported, {status.last_run.updated} updated,{' '}
+                  {status.last_run.deleted} removed, {status.last_run.missing} entries not in the
+                  library
+                </p>
+              )}
+            </div>
+          )}
+
+          {isAdmin && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                className="btn-outline"
+                onClick={() => scanNow(false)}
+                disabled={busy}
+                data-testid="import-scan"
+              >
+                {busy ? <Spinner className="h-4 w-4" /> : <Refresh className="h-4 w-4" />} Scan now
+              </button>
+              <button className="btn-ghost" onClick={() => scanNow(true)} disabled={busy}>
+                Re-read every file
+              </button>
+            </div>
+          )}
+        </section>
+
+        <section className="border-t border-line pt-5">
+          <h3 className="text-sm font-semibold text-white">Upload a file</h3>
+          <p className="mt-1 text-sm text-muted">
+            For a playlist that lives somewhere Musicdrome cannot see. Its entries are matched
+            against your library by path and by artist and title; the result is a normal playlist
+            you own, not tied to the file.
+          </p>
+          <input
+            ref={fileInput}
+            type="file"
+            accept=".m3u,.m3u8,audio/x-mpegurl,audio/mpegurl"
+            disabled={busy}
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file) void upload(file)
+            }}
+            data-testid="import-upload"
+            className="mt-3 block w-full cursor-pointer rounded-lg border border-line bg-elevated text-sm text-muted file:mr-3 file:cursor-pointer file:rounded-l-lg file:border-0 file:bg-surface file:px-4 file:py-2.5 file:text-sm file:text-zinc-100 hover:file:bg-line"
+          />
+        </section>
       </div>
     </Modal>
   )
