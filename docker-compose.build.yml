@@ -1,0 +1,18 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Build from this working tree instead of pulling the published image.
+#
+#    docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+#  Use this when you have the source checked out — to run a change you have
+#  not pushed, or because the published image is not reachable.
+#
+#  The image name is kept so the built image lands under the same tag; nothing
+#  is pushed anywhere.
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+  musicdrome:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build

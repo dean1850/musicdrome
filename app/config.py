@@ -83,7 +83,7 @@ MUSICBRAINZ_USER_AGENT = _env(
 AI_PROVIDER = _env("AI_PROVIDER", default="ollama").lower()
 
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", default="claude-sonnet-4-5")
+ANTHROPIC_MODEL = _env("ANTHROPIC_MODEL", default="claude-opus-5")
 ANTHROPIC_BASE_URL = _env("ANTHROPIC_BASE_URL", default="https://api.anthropic.com")
 
 OPENAI_API_KEY = _env("OPENAI_API_KEY")

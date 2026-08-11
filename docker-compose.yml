@@ -33,7 +33,12 @@ services:
       - "${DATA_DIR:-./data/config}:/config"
       # Optional: an existing library, mounted read-only, read for artist and
       # title tags only so its tracks are never suggested to you.
-      - "${EXCLUDE_MUSIC_DIR:-/dev/null}:/library:ro"
+      #
+      # The fallback has to be a real directory — a bind mount cannot point at
+      # nothing. When EXCLUDE_MUSIC_DIR is unset this mounts ./data/music
+      # instead and the container-side variable above stays empty, so the
+      # directory is mounted but never scanned.
+      - "${EXCLUDE_MUSIC_DIR:-./data/music}:/library:ro"
     # Lets http://host.docker.internal:<port> reach Ollama on the Docker host.
     # Docker Desktop provides this name already; the mapping is what makes it
     # work on Linux too.
