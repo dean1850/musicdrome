@@ -51,16 +51,17 @@ def _get(path: str, params: dict[str, Any]) -> dict[str, Any]:
 def recent_tracks(since: int = 0, max_pages: int = 25) -> Iterator[dict[str, Any]]:
     """Yield plays newer than ``since`` (unix seconds).
 
-    ListenBrainz pages backwards from newest, so this walks down with
-    ``max_ts`` until it reaches ``since`` or runs out of pages.
+    Listens come back newest-first, and the endpoint accepts ``max_ts`` *or*
+    ``min_ts`` but **never both in one call**. So rather than bounding the
+    window from both ends, this walks backwards from the newest listen using
+    ``max_ts`` alone and stops as soon as it reaches ``since`` — which cannot
+    trip the constraint, and needs no cursor arithmetic.
     """
     max_ts = 0
     for _ in range(max_pages):
         params: dict[str, Any] = {"count": PAGE_SIZE}
         if max_ts:
             params["max_ts"] = max_ts
-        if since:
-            params["min_ts"] = since
 
         data = _get(f"1/user/{config.LISTENBRAINZ_USER}/listens", params)
         listens = (data.get("payload") or {}).get("listens") or []
@@ -70,12 +71,17 @@ def recent_tracks(since: int = 0, max_pages: int = 25) -> Iterator[dict[str, Any
         oldest = None
         for listen in listens:
             played_at = int(listen.get("listened_at") or 0)
+            if not played_at:
+                continue
+            if played_at <= since:
+                return  # caught up: everything from here down is already stored
+
+            oldest = played_at if oldest is None else min(oldest, played_at)
             metadata = listen.get("track_metadata") or {}
             artist = (metadata.get("artist_name") or "").strip()
             title = (metadata.get("track_name") or "").strip()
-            if not played_at or not artist or not title:
+            if not artist or not title:
                 continue
-            oldest = played_at if oldest is None else min(oldest, played_at)
             yield {
                 "artist": artist,
                 "title": title,

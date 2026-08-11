@@ -79,7 +79,11 @@ def recent_tracks(since: int = 0, max_pages: int = 25) -> Iterator[dict[str, Any
                 "user": config.LASTFM_USER,
                 "limit": PAGE_SIZE,
                 "page": page,
-                "from": since + 1 if since else None,
+                # `from` is a lower bound on the scrobble timestamp. Passing the
+                # cursor itself rather than cursor+1 can re-fetch the boundary
+                # play, which the UNIQUE constraint absorbs — the other way
+                # round would silently skip it.
+                "from": since or None,
                 "extended": 0,
             },
         )

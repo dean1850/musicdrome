@@ -38,6 +38,21 @@ Open <http://localhost:3046> and press **Scan now**.
 Update with `docker compose pull && docker compose up -d`. The database survives
 schema changes automatically.
 
+### Building from source instead
+
+If you have the repository checked out — to run an unpushed change, or because
+the published image isn't reachable — layer the build override on top:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+> **`unauthorized` when pulling?** GHCR packages are **private by default, even
+> for a public repository** — publishing the image does not publish the package.
+> On GitHub go to your profile → **Packages** → `musicdrome` → **Package
+> settings** → **Change visibility** → **Public**. Until then, build from source
+> with the command above.
+
 ## What you need
 
 **A listening history.** Either is enough, both is fine:
