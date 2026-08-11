@@ -27,8 +27,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest -q
+
   build:
     name: Build and publish
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -38,8 +56,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Only needed for the arm64 leg; the frontend stage is pinned to the
-      # native builder platform so node never runs under emulation.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -74,7 +90,7 @@ jobs:
             type=sha,prefix=sha-
           labels: |
             org.opencontainers.image.title=Musicdrome
-            org.opencontainers.image.description=Self-hosted music server with a Subsonic API, AI playlists and podcasts
+            org.opencontainers.image.description=AI music discovery that downloads what it recommends
 
       - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
         id: build

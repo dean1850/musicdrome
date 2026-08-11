@@ -1,0 +1,17 @@
+# ── Web ─────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# ── HTTP client (Last.fm, ListenBrainz, MusicBrainz, every AI backend) ──
+httpx==0.28.1
+
+# ── Track matching and download ─────────────────────────
+ytmusicapi==1.9.0
+yt-dlp==2025.1.15
+mutagen==1.47.0
+
+# ── Scan schedule ───────────────────────────────────────
+APScheduler==3.11.0
+
+# ── Testing (not installed in the image) ────────────────
+# pytest==8.3.4

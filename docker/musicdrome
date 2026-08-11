@@ -1,5 +1,0 @@
-#!/bin/sh
-# Thin wrapper so `docker compose exec musicdrome musicdrome scan` works.
-# `exec` bypasses the entrypoint, so there is otherwise no `musicdrome` command
-# on PATH — only `python -m musicdrome.cli`.
-exec python -m musicdrome.cli "$@"

@@ -1,71 +1,27 @@
-# ── Environment ─────────────────────────────────────────
+# Environment
 .env
-.env.local
-.env.*.local
 
-# ── Runtime data ────────────────────────────────────────
+# Runtime data
 data/
-!data/.gitkeep
 *.db
 *.db-wal
 *.db-shm
-*.sqlite
-*.sqlite3
 
-# ── Python ──────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+.pytest_cache/
 .venv/
 venv/
-ENV/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-coverage.xml
+*.egg-info/
 
-# ── Node / frontend ─────────────────────────────────────
+# Browser tests
 node_modules/
-frontend/dist/
-frontend/.vite/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-.eslintcache
-
-# ── Playwright ──────────────────────────────────────────
 test-results/
 playwright-report/
-playwright/.cache/
-blob-report/
 
-# ── Editors / OS ────────────────────────────────────────
+# Editors and OS
 .vscode/
 .idea/
-*.swp
-*.swo
 .DS_Store
 Thumbs.db
-
-# Local dev virtualenv
-.venv/
-tests/.tmp/

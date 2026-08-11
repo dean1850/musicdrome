@@ -3,18 +3,12 @@
 #
 #    docker compose up -d
 #
-#  Runs the image published to the GitHub Container Registry — no build, no
-#  source checkout needed beyond this file and .env. Update with:
+#  Runs the published image — no clone, no build. Update with:
 #
 #    docker compose pull && docker compose up -d
 #
-#  To build from this working tree instead, layer the build override on top:
-#
-#    docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-#
-#  One service, nothing bundled. Lidarr and Ollama are things you already run;
-#  Musicdrome connects to them over their APIs — set LIDARR_URL / OLLAMA_BASE_URL
-#  in .env. Tests run from tests/ against a running server, not from here.
+#  One container, one SQLite file. Ollama, if you use it, is something you
+#  already run; Musicdrome talks to it over HTTP.
 #
 #  Every value below comes from .env — see .env.example.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -27,30 +21,27 @@ services:
     env_file:
       - .env
     environment:
-      # Container-internal paths. The host side is set by *_DIR in .env.
       MUSICDROME_MUSIC_DIR: /music
       MUSICDROME_DATA_DIR: /config
-      MUSICDROME_CACHE_DIR: /cache
-      MUSICDROME_PODCAST_DIR: /podcasts
-      MUSICDROME_DOWNLOAD_DIR: /downloads
-      MUSICDROME_STATIC_DIR: /app/static
+      EXCLUDE_MUSIC_DIR: "${EXCLUDE_MUSIC_DIR:+/library}"
     ports:
-      - "${MUSICDROME_PORT:-4533}:${MUSICDROME_PORT:-4533}"
+      - "${MUSICDROME_PORT:-3046}:${MUSICDROME_PORT:-3046}"
     volumes:
-      - "${MUSIC_DIR:-./data/music}:/music:${MUSIC_MOUNT_MODE:-rw}"
+      # Where downloads are filed as Artist/Album/01 - Title.mp3
+      - "${MUSIC_DIR:-./data/music}:/music"
+      # The SQLite database
       - "${DATA_DIR:-./data/config}:/config"
-      - "${CACHE_DIR:-./data/cache}:/cache"
-      - "${PODCAST_DIR:-./data/podcasts}:/podcasts"
-      - "${DOWNLOAD_DIR:-./data/downloads}:/downloads"
-    # Lets http://host.docker.internal:<port> reach services on the Docker host
-    # — Lidarr, Ollama, anything else. Docker Desktop provides this name
-    # already; the host-gateway mapping is what makes it work on Linux too.
+      # Optional: an existing library, mounted read-only, read for artist and
+      # title tags only so its tracks are never suggested to you.
+      - "${EXCLUDE_MUSIC_DIR:-/dev/null}:/library:ro"
+    # Lets http://host.docker.internal:<port> reach Ollama on the Docker host.
+    # Docker Desktop provides this name already; the mapping is what makes it
+    # work on Linux too.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test:
-        ["CMD-SHELL", "curl -fsS http://127.0.0.1:${MUSICDROME_PORT:-4533}/api/v1/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${MUSICDROME_PORT:-3046}/api/health || exit 1"]
       interval: 30s
       timeout: 5s
-      start_period: 40s
+      start_period: 20s
       retries: 3

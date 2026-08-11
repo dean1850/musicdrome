@@ -1,811 +1,159 @@
 # Musicdrome
 
-A self-hosted music server built as a Navidrome replacement — the same Subsonic
-API your existing clients already speak, plus AI-curated smart playlists,
-listening analytics, podcasts, Lidarr sync and automated track acquisition.
+AI music discovery that downloads what it recommends.
 
-Dark mode only. Every setting lives in `.env`. Runs as a single container under
-Docker Compose.
+Musicdrome reads what you already listen to from Last.fm and ListenBrainz, asks
+an AI what you would like next, scores every suggestion with a match percentage,
+and downloads the ones you pick as tagged MP3s at 320 kbps.
 
----
+Single container: FastAPI plus vanilla HTML, CSS and JavaScript. No database
+server, no build step, no telemetry, no third-party embeds. Dark only.
 
-## Features
-
-| | |
-|---|---|
-| **Subsonic API** | v1.16.1 at `/rest` with OpenSubsonic extensions. Works with DSub, Substreamer, play:Sub, Symfonium, Sonixd, Feishin and other Airsonic-compatible clients. XML, JSON and JSONP envelopes; both plaintext and salted-token auth. |
-| **Library** | Recursive scanner reading tags from MP3, FLAC, OGG/Opus, M4A/AAC, WAV, WMA, AIFF, APE, MPC and WavPack. Embedded and folder cover art, MusicBrainz IDs, disc/track numbers, multi-value artist and genre fields. Optional live filesystem watching. |
-| **Smart playlists** | Navidrome-compatible rule documents (`all`/`any`/`not` with 19 operators) refreshed on a schedule, **plus** AI-curated playlists that reason over your play history, Last.fm and MusicBrainz data. |
-| **M3U import** | `.m3u`/`.m3u8` files dropped in the library — by Downtify, spotDL or your own hand — become playlists within seconds, and stay in step with the file. Build playlists by hand too: drag to reorder, and export any of them back out as M3U. |
-| **AI analytics** | Narrative reports over your listening — taste profile, discovery rate, listening clock, artist affinity — written on top of real SQL aggregates, never invented numbers. |
-| **Scrobbling** | Last.fm and ListenBrainz, with a durable retry queue so nothing is lost while a service is down. |
-| **Multiuser** | Local accounts, admin-managed. Per-user play counts, stars, ratings, playlists, play queues and scrobble credentials. |
-| **Transcoding** | On-the-fly ffmpeg transcoding with per-user bitrate caps, HTTP range support and an LRU disk cache. |
-| **Podcasts** | RSS subscriptions, scheduled refresh, episode download and playback through both the web UI and the Subsonic podcast endpoints. |
-| **Lidarr** | Two-way sync with your existing Lidarr over its API — push wanted artists/albums, pull imported releases back into the library. Nothing bundled. |
-| **Acquisition** | yt-dlp fetching of recommended tracks, behind an approval queue by default, or fully automatic if you choose. |
-| **Web UI** | React + Tailwind, dark-first, keyboard shortcuts, queue player, search, discovery, analytics and an admin console. |
-
----
+```
+   your scrobbles          one AI call            you decide
+ Last.fm ─┐                     │                      │
+          ├──▶ SQLite ──▶ 40 ranked tracks ──▶  ↓ download  ♥ save  ✕ hide
+ ListenBrainz ┘           + match % + why            │
+                                                     ▼
+                              YouTube Music ─▶ yt-dlp ─▶ MP3 320
+                                                     │
+                                MusicBrainz tags, cover art, and
+                                Artist/Album/01 - Title.mp3
+```
 
 ## Quick start
 
-```bash
-git clone https://github.com/dean1850/musicdrome.git
-cd musicdrome
-cp .env.example .env
-```
-
-Edit `.env`. At minimum, point it at your music and set the two secrets:
+No clone, no build. Two files and a `docker compose up`:
 
 ```bash
-MUSIC_DIR=/path/to/your/music
-```
-
-```bash
-# SECRET_KEY
-python3 -c "import secrets; print(secrets.token_urlsafe(48))"
-
-# CREDENTIAL_ENCRYPTION_KEY
-python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
-
-Both must be stable values. If `SECRET_KEY` is left blank a fresh one is
-generated at every start, which logs everybody out on each restart.
-
-Then:
-
-```bash
-docker compose up -d
-docker compose logs -f musicdrome
-```
-
-That pulls the published image from the GitHub Container Registry — there is
-nothing to build. See [Container image](#container-image) if the pull asks you
-to authenticate, or if you would rather build from source.
-
-The first start creates an administrator. If you left `DEFAULT_ADMIN_PASSWORD`
-blank, a generated one is printed to the log — take it before you lose the
-scrollback:
-
-```
-  ┌──────────────────────────────────────────────────────────┐
-  │  Musicdrome created its first administrator account.     │
-  │                                                          │
-  │    username: admin                                       │
-  │    password: 7f2c9a41e83b5d06                            │
-  │                                                          │
-  │  Change it after signing in, or set DEFAULT_ADMIN_*      │
-  │  in .env before the first start.                         │
-  └──────────────────────────────────────────────────────────┘
-```
-
-Open <http://localhost:4533> and sign in. The library is scanned on startup;
-you can also trigger one from the admin console or with
-`docker compose exec musicdrome musicdrome scan`.
-
-The stack is one service and nothing else. Everything optional connects over an
-API to something you already run:
-
-| | |
-|---|---|
-| **Lidarr** | `LIDARR_URL` + `LIDARR_API_KEY` — see [Acquisition and Lidarr](#acquisition-and-lidarr) |
-| **Ollama** | `AI_PROVIDER=ollama` + `OLLAMA_BASE_URL` — AI with no API key and nothing leaving your network |
-| **Anthropic / OpenAI** | `AI_PROVIDER` + the matching key |
-| **Last.fm / ListenBrainz / MusicBrainz** | keys and per-user tokens in Settings |
-
-Anything on the Docker host is reachable at `host.docker.internal` — compose
-maps it to the host gateway, so it works on Linux as well as Docker Desktop.
-`localhost` will not work; inside the container that is the container itself.
-
----
-
-## Container image
-
-Images are built by GitHub Actions and published to the GitHub Container
-Registry:
-
-```
-ghcr.io/dean1850/musicdrome
-```
-
-Built for `linux/amd64` and `linux/arm64`, so the same tag runs on x86 servers,
-Apple Silicon and a Raspberry Pi 4/5.
-
-| Tag | Points at |
-|---|---|
-| `latest` | The most recent commit on `main` |
-| `v1.2.3`, `1.2`, `1` | A released version — `1.2` and `1` move forward within their range |
-| `sha-<commit>` | One exact commit, never reused |
-| `<branch>` | The head of that branch, for testing an unmerged change |
-
-Pick which one compose runs with `MUSICDROME_IMAGE` / `MUSICDROME_TAG` in
-`.env`. `latest` follows `main`; pin to a `v*` or `sha-*` tag if you would
-rather upgrade deliberately.
-
-**Authentication.** The package inherits the repository's visibility. While the
-repository is private you need to log in once before pulling — a [personal
-access token](https://github.com/settings/tokens) with the `read:packages`
-scope is enough:
-
-```bash
-echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
-```
-
-To drop that step, open the package page → **Package settings** → **Change
-visibility** → **Public**. Nothing in the image contains secrets; your `.env`
-stays on the host.
-
-**Updating.**
-
-```bash
-docker compose pull
+mkdir musicdrome && cd musicdrome
+curl -O https://raw.githubusercontent.com/dean1850/musicdrome/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/dean1850/musicdrome/main/.env.example
+# fill in .env, then
 docker compose up -d
 ```
 
-**Building it yourself.** The build override swaps the published image for a
-local build of the working tree:
+Open <http://localhost:3046> and press **Scan now**.
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-```
+Update with `docker compose pull && docker compose up -d`. The database survives
+schema changes automatically.
 
-Or without compose:
+## What you need
 
-```bash
-docker build -t ghcr.io/dean1850/musicdrome:latest .
-```
+**A listening history.** Either is enough, both is fine:
 
-**How the publish works.** `.github/workflows/docker-publish.yml` builds on
-every push to `main`, on `v*.*.*` tags, and on demand from the Actions tab.
-Pull requests build too, `amd64` only and never pushed, so a broken Dockerfile
-is caught before it merges. Authentication uses the automatic `GITHUB_TOKEN` —
-there are no secrets to configure.
+- **Last.fm** — a free [API key](https://www.last.fm/api/account/create) and your
+  username. Musicdrome only reads; it never scrobbles, so it needs no password
+  and no API secret. Whatever you already listen with keeps scrobbling as it does.
+- **ListenBrainz** — just your username, for a public profile.
 
-To cut a release:
+**An AI backend.** One of:
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
+| `AI_PROVIDER` | Needs | Notes |
+|---|---|---|
+| `ollama` | A running Ollama | Local and free. One call per scan means an 8B model is genuinely fine here. |
+| `anthropic` | `ANTHROPIC_API_KEY` | |
+| `openai` | `OPENAI_API_KEY` | Also works with LM Studio, vLLM or anything OpenAI-compatible via `OPENAI_BASE_URL`. |
 
----
+## How a scan works
 
-## Connecting a Subsonic client
+1. **Sync.** New scrobbles are pulled from every configured source. Each keeps
+   its own cursor, so only new plays are fetched.
+2. **Profile.** Your most-played artists, most-played tracks and most recently
+   discovered artists over the listening window.
+3. **Ask.** One AI call returns the whole batch — 40 tracks by default, each with
+   an artist, a title, a match percentage and a one-line reason naming what in
+   your history led there.
+4. **Resolve.** Each answer goes to MusicBrainz for the canonical artist, album,
+   year and recording length, then to Last.fm for cover art and genre tags.
+5. **Filter.** Anything you already have is dropped — see below.
+6. **Show.** What survives becomes cards you can download, save or hide.
 
-Point any Subsonic client at the same host and port:
+Downloads then search YouTube Music through `ytmusicapi`, score candidates on
+artist, title and duration against the MusicBrainz recording, and fall back to a
+plain YouTube search when YouTube Music does not carry the track. A card that
+cannot be matched confidently is marked failed rather than guessed at — a wrong
+file in your library is worse than a missing one.
 
-| Field | Value |
-|---|---|
-| Server / URL | `http://your-host:4533` |
-| Username | your Musicdrome username |
-| Password | your Musicdrome password |
+## What it will never suggest
 
-Leave the path empty — clients append `/rest` themselves. Both auth styles work:
-legacy `p=` (plaintext or `enc:` hex) and the salted `t=`/`s=` token. Set
-`SUBSONIC_REQUIRE_TOKEN_AUTH=true` to reject clients that send the password in
-cleartext.
+A track is excluded if any of these is true:
 
-> **Why the server keeps a reversible copy of your password**
->
-> Subsonic token auth is `md5(password + salt)`, and the *server* has to compute
-> it — which means the server must be able to recover the password. A one-way
-> hash cannot satisfy that. Musicdrome therefore stores two copies: an
-> **argon2id** hash used for web sign-in, and a **Fernet-encrypted** copy used
-> only to answer Subsonic token auth. The encrypted copy is worthless without
-> `CREDENTIAL_ENCRYPTION_KEY`, which is why that key is required and why it
-> should not live in the same backup as the database.
->
-> This is the same tradeoff Navidrome and Airsonic make. It is inherent to the
-> protocol, not a shortcut.
+- it is anywhere in your scrobble history
+- Musicdrome already downloaded it
+- you dismissed it with ✕
+- it was found in `EXCLUDE_MUSIC_DIR`
 
----
+That last one is an existing library you point at. It is mounted read-only, and
+only artist and title tags are read from it — no library database is built,
+nothing is moved, nothing is written. Set it if you have a collection that
+predates Musicdrome.
+
+Matching is done on normalised keys, so "The Beatles" and "Beatles", or
+"Karma Police" and "Karma Police (Remastered 2016)", are recognised as the same
+thing rather than suggested back to you.
 
 ## Configuration
 
-Every setting is an environment variable read from `.env`. Nothing is configured
-in code, and nothing needs a rebuild to change. `.env.example` is the complete
-annotated reference; the tables below group the same variables.
+`.env` carries startup concerns only — keys, usernames, paths, port. Every value
+has a working default, so a `.env` with your Last.fm key and an AI credential is
+a complete configuration. See [`.env.example`](.env.example).
 
-<details>
-<summary><b>Core server</b></summary>
+Everything you would want to change while using it lives in the **Settings** tab
+and applies immediately, no restart:
 
-| Variable | Default | Description |
+| Setting | Default | |
 |---|---|---|
-| `MUSICDROME_PORT` | `4533` | HTTP port, used for both the container port and the published one |
-| `MUSICDROME_HOST` | `0.0.0.0` | Bind address |
-| `MUSICDROME_LOG_LEVEL` | `info` | `debug`/`info`/`warning`/`error` |
-| `MUSICDROME_BASE_URL` | – | Set only when serving under a sub-path behind a reverse proxy |
-| `MUSICDROME_SERVER_NAME` | `Musicdrome` | Name reported to Subsonic clients |
-| `MUSICDROME_CORS_ORIGINS` | `*` | Comma-separated browser origins |
-| `MUSICDROME_WORKERS` | `1` | Keep at 1 — SQLite and the scheduler are in-process |
-| `TZ` | `UTC` | Container timezone |
-| `PUID` / `PGID` | `1000` | User/group the process drops to, so written files match host ownership |
+| Schedule | Daily | Off, every 6 hours, daily or weekly |
+| Tracks per scan | 40 | 5–100, one AI call regardless |
+| Listening window | 90 days | How far back the taste profile reaches |
+| Auto-download | Off | Download anything above a match threshold |
+| Threshold / daily cap | 85% / 25 | The cap counts finished downloads in 24 hours |
+| Hide below | 0% | Display filter for the card grid |
+| Retention | 60 days | Un-actioned cards are purged; decisions are kept |
+| Taste summary | On | One AI call a day for the stats page |
 
-</details>
+## Downloads
 
-<details>
-<summary><b>Paths</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `MUSIC_DIR` | `./data/music` | Your library (mounted at `/music`) |
-| `MUSIC_READ_ONLY` | `false` | Stops Musicdrome writing into the library; acquisition imports refuse to run |
-| `MUSIC_MOUNT_MODE` | `rw` | Bind-mount mode compose uses. Set to `ro` alongside `MUSIC_READ_ONLY=true` for kernel-level enforcement |
-| `DATA_DIR` | `./data/config` | Database, cover-art cache, artist images, logs |
-| `CACHE_DIR` | `./data/cache` | Transcode cache — safe to delete at any time |
-| `PODCAST_DIR` | `./data/podcasts` | Downloaded episodes |
-| `DOWNLOAD_DIR` | `./data/downloads` | yt-dlp staging area before import |
-
-</details>
-
-<details>
-<summary><b>Security &amp; accounts</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `SECRET_KEY` | *generated* | **Set this.** Signs JWTs; an ephemeral key logs everyone out on restart |
-| `CREDENTIAL_ENCRYPTION_KEY` | *generated* | **Set this.** Fernet key for stored third-party credentials and the Subsonic password copy |
-| `JWT_ALGORITHM` | `HS256` | |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440` | |
-| `REFRESH_TOKEN_EXPIRE_DAYS` | `30` | |
-| `ALLOW_OPEN_REGISTRATION` | `false` | Self-service signup. Off by default — admins create accounts |
-| `DEFAULT_ADMIN_USERNAME` | `admin` | Bootstrap admin, created on first start only |
-| `DEFAULT_ADMIN_PASSWORD` | *generated* | Leave blank and one is generated and logged |
-| `SUBSONIC_REQUIRE_TOKEN_AUTH` | `false` | Reject Subsonic clients sending cleartext passwords |
-
-</details>
-
-<details>
-<summary><b>Library scanner</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `SCAN_ON_STARTUP` | `true` | Scan when the server boots |
-| `SCAN_INTERVAL_MINUTES` | `60` | Minutes between scheduled scans |
-| `SCAN_WATCH_FILESYSTEM` | `true` | Watch the library and pick up changes live (debounced) |
-| `SCAN_EXTENSIONS` | `mp3,flac,ogg,oga,opus,m4a,m4b,aac,wav,wma,aiff,aif,ape,mpc,wv` | Extensions to index |
-| `SCAN_IGNORE_PATTERNS` | `@eaDir,.AppleDouble,#recycle,.stfolder,lost+found` | Path fragments to skip |
-| `COVER_ART_NAMES` | `cover,folder,front,album,albumart,thumb` | Folder image basenames, searched in order |
-| `MULTIVALUE_SEPARATORS` | `;,/,feat.,ft.` | Separators for multi-value artist/genre tags |
-| `ALBUM_GROUPING` | `musicbrainz` | Group by MusicBrainz release ID when present, else artist+album |
-
-</details>
-
-<details>
-<summary><b>Transcoding</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `TRANSCODING_ENABLED` | `true` | Master switch. If ffmpeg is missing the server logs one warning and serves originals rather than failing |
-| `FFMPEG_PATH` | `/usr/bin/ffmpeg` | |
-| `FFPROBE_PATH` | `/usr/bin/ffprobe` | |
-| `DEFAULT_TRANSCODE_FORMAT` | `mp3` | Used when a client asks to transcode without naming a format |
-| `DEFAULT_MAX_BITRATE` | `320` | Ceiling in kbps applied to every stream; `0` = unlimited |
-| `TRANSCODE_CACHE_ENABLED` | `true` | Cache finished transcodes so repeat plays are free |
-| `TRANSCODE_CACHE_SIZE_MB` | `2048` | Cache budget; oldest entries evicted first |
-| `TRANSCODE_MAX_CONCURRENT` | `4` | Concurrent ffmpeg processes |
-
-</details>
-
-<details>
-<summary><b>Last.fm</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `LASTFM_ENABLED` | `true` | |
-| `LASTFM_API_KEY` / `LASTFM_API_SECRET` | – | From <https://www.last.fm/api/account/create> |
-| `LASTFM_SCROBBLE_ENABLED` | `true` | Each user links their own account under Settings → Scrobbling |
-| `LASTFM_FETCH_SIMILAR` | `true` | Pull similar-artist/track data to feed recommendations |
-| `LASTFM_LANGUAGE` | `en` | |
-
-</details>
-
-<details>
-<summary><b>ListenBrainz</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `LISTENBRAINZ_ENABLED` | `true` | |
-| `LISTENBRAINZ_API_URL` | `https://api.listenbrainz.org` | Point at your own instance if you run one |
-| `LISTENBRAINZ_SCROBBLE_ENABLED` | `true` | |
-| `LISTENBRAINZ_TOKEN` | – | Optional server-wide default; per-user tokens are set in the web UI |
-
-</details>
-
-<details>
-<summary><b>MusicBrainz</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `MUSICBRAINZ_ENABLED` | `true` | Metadata enrichment |
-| `MUSICBRAINZ_API_URL` | `https://musicbrainz.org/ws/2` | |
-| `MUSICBRAINZ_RATE_LIMIT` | `1.0` | Seconds between requests. Do not lower this against the public server |
-| `MUSICBRAINZ_USER_AGENT` | `Musicdrome/1.0.0 (…)` | Required by MusicBrainz; put your own contact URL here |
-| `MUSICBRAINZ_ENRICH_MODE` | `all` | `all` = look everything up; otherwise only tracks that already carry an MBID |
-
-</details>
-
-<details>
-<summary><b>AI</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `AI_ENABLED` | `true` | Master switch for curation and analytics. Inert until a provider is configured |
-| `AI_PROVIDER` | `anthropic` | `anthropic`, `ollama`, or `openai` (any OpenAI-compatible endpoint) |
-| `ANTHROPIC_API_KEY` | – | Required for the `anthropic` provider |
-| `ANTHROPIC_MODEL` | `claude-opus-5` | |
-| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | |
-| `ANTHROPIC_EFFORT` | `medium` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` |
-| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Your own Ollama, as reachable from inside the container |
-| `OLLAMA_MODEL` | `llama3.1` | |
-| `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` | `https://api.openai.com/v1`, –, `gpt-4o-mini` | For OpenAI, LM Studio, vLLM, OpenRouter … |
-| `AI_MAX_TOKENS` | `8192` | Response budget |
-| `AI_TEMPERATURE` | `0.7` | **ollama/openai only** — Claude models reject sampling parameters, so nothing is sent to Anthropic |
-| `AI_REQUEST_TIMEOUT` | `180` | Seconds |
-| `AI_PLAYLIST_REFRESH_HOURS` | `24` | How often AI playlists are regenerated |
-| `AI_ANALYTICS_REFRESH_HOURS` | `24` | How often the analytics report is rebuilt |
-| `AI_MIN_PLAYS_FOR_PROFILE` | `20` | Skip profiling users with less history than this |
-| `AI_CONTEXT_TRACK_LIMIT` | `300` | Candidate tracks handed to the model when curating |
-
-</details>
-
-<details>
-<summary><b>Playlist files (.m3u)</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `PLAYLIST_AUTO_IMPORT` | `true` | Import `.m3u` files found in the library |
-| `PLAYLIST_IMPORT_DIRS` | – | Extra folders to search, beyond `MUSIC_DIR`. Comma-separated *container* paths |
-| `PLAYLIST_IMPORT_EXTENSIONS` | `m3u,m3u8` | |
-| `PLAYLIST_IMPORT_OWNER` | – | Account that owns imported playlists. Blank = first admin |
-| `PLAYLIST_IMPORT_PUBLIC` | `true` | Make them visible to every user, not just the owner |
-| `PLAYLIST_IMPORT_INTERVAL_MINUTES` | `60` | Backstop sweep, for shares whose file events never arrive |
-| `PLAYLIST_IMPORT_PRUNE` | `true` | Delete the playlist when its `.m3u` is deleted |
-
-</details>
-
-<details>
-<summary><b>Smart playlists</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `SMART_PLAYLIST_ENABLED` | `true` | |
-| `SMART_PLAYLIST_REFRESH_MINUTES` | `60` | |
-| `SMART_PLAYLIST_MAX_TRACKS` | `100` | Default cap on generated length |
-| `SMART_PLAYLIST_SEED_DEFAULTS` | `true` | Create the starter set for each new user |
-
-</details>
-
-<details>
-<summary><b>Podcasts</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `PODCAST_ENABLED` | `true` | |
-| `PODCAST_REFRESH_HOURS` | `6` | Feed poll interval |
-| `PODCAST_AUTO_DOWNLOAD` | `false` | Download new episodes instead of streaming on demand |
-| `PODCAST_KEEP_EPISODES` | `10` | Retained downloads per channel; `0` = keep all |
-| `PODCAST_MAX_CONCURRENT_DOWNLOADS` | `2` | |
-
-</details>
-
-<details>
-<summary><b>Lidarr</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `LIDARR_ENABLED` | `false` | |
-| `LIDARR_URL` | `http://host.docker.internal:8686` | Your Lidarr, as reachable *from inside the container* — see below |
-| `LIDARR_API_KEY` | – | Lidarr → Settings → General |
-| `LIDARR_ROOT_FOLDER` | `/music` | The root folder *as Lidarr sees it*, which is probably not `/music` if Lidarr runs elsewhere |
-| `LIDARR_QUALITY_PROFILE_ID` | `1` | |
-| `LIDARR_METADATA_PROFILE_ID` | `1` | |
-| `LIDARR_MONITOR_MODE` | `all` | `all`/`future`/`missing`/`existing`/`latest`/`first`/`none` |
-| `LIDARR_SYNC_INTERVAL_MINUTES` | `30` | |
-| `LIDARR_PUSH_WANTED` | `true` | Push wanted artists/albums into Lidarr |
-| `LIDARR_PULL_IMPORTED` | `true` | Poll for imported releases and rescan those paths |
-| `LIDARR_SEARCH_ON_ADD` | `true` | Ask Lidarr to search indexers immediately on push |
-
-</details>
-
-<details>
-<summary><b>Acquisition (yt-dlp)</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `ACQUISITION_ENABLED` | `true` | |
-| `AUTO_DOWNLOAD` | `false` | `false` = recommendations queue as **Wanted** and wait for approval. `true` = anything above `ACQUISITION_MIN_CONFIDENCE` downloads unattended |
-| `ACQUISITION_MIN_CONFIDENCE` | `0.7` | Confidence gate for automatic downloads |
-| `ACQUISITION_MAX_PER_DAY` | `25` | Safety valve on unattended downloads |
-| `ACQUISITION_MAX_CONCURRENT` | `2` | |
-| `ACQUISITION_SEARCH_PREFIX` | `ytsearch5` | yt-dlp search expression |
-| `ACQUISITION_IMPORT_TEMPLATE` | `{artist}/{album}/{track:02d} - {title}.{ext}` | Layout under `MUSIC_DIR` |
-| `YTDLP_FORMAT` | `bestaudio/best` | |
-| `YTDLP_AUDIO_FORMAT` | `mp3` | Extracted codec |
-| `YTDLP_AUDIO_QUALITY` | `0` | 0 = best, 9 = worst |
-| `YTDLP_COOKIES_FILE` | – | Netscape-format cookies, path inside the container |
-| `YTDLP_PROXY` / `YTDLP_RATE_LIMIT` | – | |
-
-</details>
-
-<details>
-<summary><b>Recommendations</b></summary>
-
-| Variable | Default | Description |
-|---|---|---|
-| `RECOMMENDATIONS_ENABLED` | `true` | |
-| `RECOMMENDATION_REFRESH_HOURS` | `12` | |
-| `RECOMMENDATION_SOURCES` | `lastfm,listenbrainz,ai` | Any of `lastfm`, `listenbrainz`, `ai` |
-| `RECOMMENDATION_LIMIT` | `50` | Items kept per user |
-
-</details>
-
----
-
-## Architecture
+Always MP3 at 320 kbps — there is no format setting to get wrong. Files are
+tagged from MusicBrainz (artist, title, album, album artist, year, track number,
+recording MBID) with cover art embedded, and filed as:
 
 ```
-                        ┌──────────────────────────────┐
-   Subsonic clients ───▶│  /rest    Subsonic API       │
-   (DSub, Symfonium…)   │           v1.16.1 + OpenSub  │
-                        ├──────────────────────────────┤
-   Browser ────────────▶│  /        React SPA (dark)   │
-                        │  /api/v1  Native JSON API    │
-                        ├──────────────────────────────┤
-                        │  FastAPI  ·  SQLAlchemy      │
-                        │  APScheduler (in-process)    │
-                        └───────┬──────────────────────┘
-                                │
-        ┌───────────┬───────────┼───────────┬─────────────┐
-        ▼           ▼           ▼           ▼             ▼
-    ┌───────┐  ┌─────────┐  ┌────────┐  ┌────────┐  ┌───────────┐
-    │Scanner│  │Transcode│  │Scrobble│  │ Smart  │  │Acquisition│
-    │mutagen│  │ ffmpeg  │  │ queue  │  │playlist│  │  yt-dlp   │
-    │watchdog│ │  cache  │  │ retry  │  │ engine │  │ + Lidarr  │
-    └───┬───┘  └─────────┘  └───┬────┘  └───┬────┘  └─────┬─────┘
-        │                       │           │             │
-        ▼                       ▼           ▼             ▼
-    ┌────────────┐      ┌─────────────────────────────────────┐
-    │  SQLite    │      │ Last.fm · ListenBrainz · MusicBrainz │
-    │  (WAL)     │      │ Anthropic / Ollama / OpenAI · Lidarr │
-    └────────────┘      └─────────────────────────────────────┘
+/music/Radiohead/OK Computer/06 - Karma Police.mp3
+/music/_playlists/musicdrome-scan-0007.m3u
 ```
 
-One process, one container, one database file. No Redis, no Celery, no separate
-worker — background jobs run on APScheduler inside the app, which is the right
-size for a personal music server.
+Each scan writes an `.m3u` of its own batch with relative paths, so a discovery
+run can be played as a set and the folder can be moved without breaking it.
 
----
+Jellyfin, Navidrome, Plex and friends read this layout as-is — point them at the
+same directory.
 
-## Smart playlists
+## The stats tab
 
-Rule documents follow Navidrome's format. A rule is a JSON object with boolean
-combinators and optional `sort`/`order`/`limit`/`offset` keys:
+Computed straight from your scrobbles in SQLite, so it costs nothing to open and
+works with the AI switched off: top artists and tracks, plays per day, a
+listening clock in your own timezone, and how much of your listening is new
+versus familiar. The one AI touch is a short written summary of your taste,
+refreshed once a day and cacheable to zero calls by switching it off.
 
-```json
-{
-  "all": [
-    { "any": [
-        { "is": { "genre": "Jazz" } },
-        { "is": { "genre": "Blues" } }
-      ]
-    },
-    { "gt": { "playCount": 2 } },
-    { "inTheLast": { "lastPlayed": 90 } },
-    { "is": { "starred": true } }
-  ],
-  "sort":  "lastPlayed",
-  "order": "desc",
-  "limit": 100
-}
-```
+## Security
 
-**Track fields** — `title`, `album`, `artist`, `albumArtist`, `genre`, `year`,
-`trackNumber`, `discNumber`, `bitRate`, `duration`, `size`, `comment`, `bpm`,
-`filePath`, `fileType`, `dateAdded`, `dateModified`.
+Musicdrome has **no authentication**, by design — it is meant for a trusted home
+network. Put it behind a VPN or an authenticating reverse proxy if you need to
+reach it from outside.
 
-**Per-user fields** — `playCount`, `lastPlayed`, `rating`, `starred`, `loved`.
+## Notes
 
-Field names are matched case-insensitively and ignore underscores, so
-`albumArtist`, `albumartist` and `album_artist` are the same field.
+- MusicBrainz asks for one request per second per client and Musicdrome honours
+  it, so enriching a 40-track scan takes about a minute. It runs in the
+  background; you can keep using the UI.
+- If YouTube starts asking for a sign-in, point `YTDLP_COOKIES_FILE` at an
+  exported cookies file.
+- You are responsible for complying with copyright law and the terms of service
+  of the sources you download from, wherever you are.
 
-**Operators** — `is`/`eq`, `isNot`/`ne`, `gt`, `gte`, `lt`, `lte`, `contains`,
-`notContains`, `startsWith`, `endsWith`, `inTheRange` (`[min, max]`), `before`,
-`after`, `inTheLast` (days), `notInTheLast` (days), `isNull`, `isNotNull`, plus
-the combinators `all`, `any`, `not`.
+## License
 
-`inTheLast` and `notInTheLast` require a date field (`dateAdded`,
-`dateModified`, `lastPlayed`). `sort` accepts any field plus `random`.
-
-Six starter playlists are created for each new account — Recently Added, Most
-Played, Forgotten Gems, Never Played, Favourites, Top Rated — and are populated
-immediately rather than waiting for the first scheduled refresh. Set
-`SMART_PLAYLIST_SEED_DEFAULTS=false` to skip them.
-
----
-
-## Playlist files (.m3u)
-
-Any `.m3u` or `.m3u8` inside the library becomes a playlist, the way Navidrome
-does it. Point a downloader at your music folder and its playlists show up on
-their own — no button to press, nothing to configure.
-
-**Downtify**, which writes `<downloads>/Playlists/<name>.m3u` with the track
-paths relative to that file, works if its download folder *is* your `MUSIC_DIR`.
-If it writes somewhere else, mount that folder into the container and name it:
-
-```bash
-PLAYLIST_IMPORT_DIRS=/downloads/Playlists
-```
-
-spotDL, Soulseek clients, Picard, foobar2000 exports and hand-written files all
-work the same way.
-
-**When it runs.** Three moments, so nothing is missed:
-
-| | |
-|---|---|
-| **On write** | The filesystem watcher sees the file land and imports it within seconds. Audio is indexed first, so a playlist written in the same breath as its tracks still resolves them. |
-| **After every scan** | Startup and scheduled scans finish by importing playlist files. |
-| **On a timer** | `PLAYLIST_IMPORT_INTERVAL_MINUTES`, as a backstop for network shares whose inotify events never arrive. |
-
-Or on demand: **Playlists → Import M3U → Scan now**, or
-`docker compose exec musicdrome musicdrome import-playlists`.
-
-**Finding the track.** Each entry is resolved down a ladder, stopping at the
-first hit:
-
-1. the path as written, resolved against the playlist file's own folder
-2. the same, case-insensitively — for a library that came off a Windows share
-3. the trailing path segments, which survives the library being mounted at a
-   different root than it had when the file was written, and a differing
-   extension
-4. the `#EXTINF` artist and title
-
-Steps 3 and 4 only accept an unambiguous match. If two tracks would satisfy
-them the entry counts as missing rather than being guessed at.
-
-Percent-encoded `file://` URIs, Windows backslashes, CRLF line endings, byte
-order marks and Windows codepages are all handled; `http://` entries are
-skipped, since a remote stream is not a library track.
-
-**Entries you do not own** are skipped and counted — the playlist page shows how
-many. They are picked up automatically once the files land, so a playlist
-imported before its downloads finished fills itself in.
-
-**Staying in sync.** The file is the source of truth. Editing it re-imports the
-track list; deleting it deletes the playlist (`PLAYLIST_IMPORT_PRUNE=false` to
-keep it). Renaming the playlist in the web UI sticks — the name is only taken
-from the file the first time it is seen. Editing the *track list*, here or from
-a Subsonic client, hands the playlist over to you and it stops following the
-file.
-
-Imported playlists belong to the first administrator and are public, so every
-account sees them; `PLAYLIST_IMPORT_OWNER` and `PLAYLIST_IMPORT_PUBLIC` change
-that. If a configured import folder is not mounted, nothing is pruned — a
-missing volume must not read as "the user deleted everything".
-
-**Going the other way**, any playlist — manual, smart, AI or imported — exports
-as an extended M3U from its page, with paths relative to the music folder.
-
----
-
-## AI features
-
-With `AI_ENABLED=true` and a provider configured, three things become available.
-
-**AI-curated playlists.** The curator assembles a candidate pool from your
-library, play history, Last.fm similar-artist data and MusicBrainz relations,
-then hands the model a *numbered list of tracks it may choose from*. Any ID the
-model returns that is not in that list is discarded. The model picks and
-sequences; it cannot invent a track you do not own.
-
-**Analytics.** Every number in a report — play counts, unique artists, discovery
-rate, hour-of-day distribution — comes from SQL. The model writes the narrative
-around those figures. With AI disabled you still get the whole dashboard, just
-without the prose.
-
-**Recommendations.** Seeded from Last.fm and ListenBrainz, ranked against your
-history, feeding the acquisition queue.
-
-The provider is pluggable, and none of them are bundled — you point Musicdrome
-at one:
-
-```bash
-AI_PROVIDER=anthropic     # ANTHROPIC_API_KEY
-AI_PROVIDER=ollama        # OLLAMA_BASE_URL — your own instance, no API key,
-                          # nothing leaves your network
-AI_PROVIDER=openai        # OPENAI_BASE_URL + OPENAI_API_KEY, or any
-                          # OpenAI-compatible endpoint (LM Studio, vLLM, …)
-```
-
----
-
-## Acquisition and Lidarr
-
-```
-  Recommendation ──▶ Wanted item ──▶ [ approval queue ] ──▶ Fetch ──▶ Import
-   (Last.fm/LB/AI)                          │                 │          │
-                                            │           yt-dlp or     scanner
-                                  AUTO_DOWNLOAD=true       Lidarr    picks it up
-                                  skips this gate
-```
-
-With `AUTO_DOWNLOAD=false` (the default) nothing is downloaded until you approve
-it under **Discover → Wanted**. Set it to `true` and anything scoring above
-`ACQUISITION_MIN_CONFIDENCE` is fetched unattended, capped by
-`ACQUISITION_MAX_PER_DAY`.
-
-### Connecting Lidarr
-
-Musicdrome talks to a Lidarr you already run — it does not ship one. Set three
-values in `.env`:
-
-```bash
-LIDARR_ENABLED=true
-LIDARR_URL=http://host.docker.internal:8686
-LIDARR_API_KEY=...                 # Lidarr → Settings → General → API Key
-LIDARR_ROOT_FOLDER=/music          # the library path as *Lidarr* sees it
-```
-
-`LIDARR_URL` must be reachable **from inside the Musicdrome container**, which
-is the one thing that trips people up:
-
-| Where Lidarr runs | Use |
-|---|---|
-| On the Docker host | `http://host.docker.internal:8686` — compose maps this to the host gateway, so it works on Linux too, not just Docker Desktop |
-| Elsewhere on your LAN or a NAS | `http://192.168.1.20:8686` |
-| In a different compose stack | Attach Musicdrome to that stack's network, then use the service name: `http://lidarr:8686` |
-| Behind a reverse proxy | The external URL, e.g. `https://lidarr.example.com` |
-
-`http://localhost:8686` will **not** work — inside the container that is the
-container itself.
-
-`LIDARR_ROOT_FOLDER` is Lidarr's own path for the library, not Musicdrome's. If
-Musicdrome sees `/music` but Lidarr calls the same folder `/data/media/music`,
-use the latter. Both do need to be pointed at the same actual directory for
-imports to land somewhere Musicdrome will scan.
-
-Sync is two-way: approved wanted items are pushed as monitored artists/albums,
-and releases Lidarr finishes importing are pulled back and indexed.
-
-> Musicdrome downloads what you tell it to download. You are responsible for
-> having the right to obtain the material you queue, and for whatever your Lidarr
-> indexers are configured to reach. The approval queue is the default for exactly
-> this reason.
-
----
-
-## Running from source
-
-```bash
-# Backend
-cd backend
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python -m musicdrome.cli scan
-uvicorn musicdrome.main:app --reload --port 4533
-```
-
-```bash
-# Frontend, in a second shell
-cd frontend
-npm install
-npm run dev          # proxies /api and /rest to :4533
-```
-
-For a production-shaped run, `npm run build` and set
-`MUSICDROME_STATIC_DIR=/path/to/frontend/dist` — the backend then serves the SPA
-itself, exactly as it does in the container.
-
-### CLI
-
-```bash
-docker compose exec musicdrome musicdrome <command>
-```
-
-| Command | Purpose |
-|---|---|
-| `scan [--full]` | Index the library; `--full` re-reads tags for unchanged files |
-| `import-playlists [--force]` | Import `.m3u` files found in the library; `--force` re-reads unchanged ones |
-| `create-user NAME [--password P] [--admin]` | Add an account; prompts if no password given |
-| `set-password NAME [--password P]` | Reset a password (writes both stored copies) |
-| `list-users` | Show accounts and roles |
-| `config` | Print the effective configuration with secrets masked |
-| `refresh {playlists,recommendations,podcasts,metadata}` | Run a maintenance task now |
-
----
-
-## Testing
-
-Playwright drives both suites — the browser UI and the Subsonic API at the
-request level.
-
-```bash
-cd frontend && npm install && npm run build    # the E2E specs need a built UI
-cd ../tests && npm install && npm test
-```
-
-The runner starts a throwaway server on port 4599, synthesises a 19-track
-library from scratch (no audio binaries in the repo), scans it, and runs 106
-specs covering auth and multiuser separation, browsing and search, real audio
-playback, playlists, discovery, podcasts, admin, dark mode, and Subsonic
-conformance — both auth mechanisms, XML/JSON/JSONP envelopes and the Subsonic
-error codes.
-
-To test a server that is already running — your compose stack, a dev server —
-point the suite at it instead:
-
-```bash
-E2E_BASE_URL=http://localhost:4533 npm test
-```
-
-That path writes to the target (accounts, playlists, play counts) and the
-browsing specs assert counts from the seeded library, so aim it at a throwaway
-instance rather than your real one. See [`tests/README.md`](tests/README.md).
-
----
-
-## Troubleshooting
-
-**Everyone is logged out after a restart.** `SECRET_KEY` is blank, so a new one
-is generated each boot. Set it in `.env`.
-
-**Subsonic clients cannot log in but the web UI works.** The account predates
-`CREDENTIAL_ENCRYPTION_KEY` being set, or the key changed. Reset the password
-with `musicdrome set-password NAME` — that writes both stored copies.
-
-**The scan finds nothing.** Check the library is readable inside the container
-(`docker compose exec musicdrome ls /music`) and that your files' extensions are
-listed in `SCAN_EXTENSIONS`.
-
-**Playback works but transcoding does not.** If ffmpeg is unavailable the server
-logs one warning and serves original files rather than erroring. Verify with
-`docker compose exec musicdrome ffmpeg -version` and check `FFMPEG_PATH`.
-
-**Scrobbles are not appearing.** They queue and retry. A per-user Last.fm link
-or ListenBrainz token is required in **Settings → Scrobbling** in addition to
-the server-level API key.
-
-**Files land with the wrong owner.** Set `PUID`/`PGID` to match your host user.
-
-**Acquisition imports fail.** Check `MUSIC_READ_ONLY` is `false` and, if you set
-`MUSIC_MOUNT_MODE=ro`, that the mount is writable.
-
----
-
-## Project layout
-
-```
-backend/musicdrome/
-  main.py            app, lifespan, admin bootstrap, SPA serving
-  config.py          every setting, read from .env
-  models.py          SQLAlchemy models
-  security.py        argon2id, Fernet, Subsonic token, JWT
-  subsonic/          /rest — system, browsing, media, playlists
-  api/               /api/v1 — auth, library, playlists, discovery,
-                     podcasts, admin
-  services/          scanner, tags, watcher, transcode, scrobble,
-                     lastfm, listenbrainz, musicbrainz, smartplaylist,
-                     playlists, playlistfile, podcasts, lidarr,
-                     acquisition, recommendations, jobs
-  services/ai/       provider abstraction, curator, analytics
-frontend/src/        React SPA — pages, components, stores
-backend/tests/       pytest — M3U parsing, resolution, import lifecycle
-tests/               Playwright E2E + Subsonic conformance
-docker/              entrypoint
-.github/workflows/   image build and publish to ghcr.io
-```
-
----
-
-## Credits
-
-Built as a drop-in alternative to [Navidrome](https://github.com/navidrome/navidrome),
-whose Subsonic behaviour and smart-playlist rule format it deliberately matches.
-Lidarr integration targets [Lidarr](https://github.com/lidarr/lidarr). Track
-acquisition uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), in the spirit of
-[Downtify](https://github.com/henriquesebastiao/downtify). Metadata from
-[MusicBrainz](https://musicbrainz.org) and [Last.fm](https://www.last.fm);
-listening history to [ListenBrainz](https://listenbrainz.org).
+GPL-3.0.
