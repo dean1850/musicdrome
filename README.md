@@ -47,11 +47,11 @@ the published image isn't reachable — layer the build override on top:
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-> **`unauthorized` when pulling?** GHCR packages are **private by default, even
-> for a public repository** — publishing the image does not publish the package.
-> On GitHub go to your profile → **Packages** → `musicdrome` → **Package
-> settings** → **Change visibility** → **Public**. Until then, build from source
-> with the command above.
+> **If you fork this and pulling gives `unauthorized`:** GHCR packages are
+> private by default even when the repository is public, so a successful build
+> doesn't publish the package. Set it to public under your profile →
+> **Packages** → `musicdrome` → **Package settings** → **Change visibility**,
+> or build from source with the command above.
 
 ## What you need
 
