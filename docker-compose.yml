@@ -15,7 +15,9 @@
 
 services:
   musicdrome:
-    image: "${MUSICDROME_IMAGE:-ghcr.io/dean1850/musicdrome}:${MUSICDROME_TAG:-latest}"
+    # To pin a build instead of tracking latest, replace the tag with a
+    # version (:v2.0.0) or a commit (:sha-abc1234). Both are published.
+    image: ghcr.io/dean1850/musicdrome:latest
     container_name: musicdrome
     restart: unless-stopped
     env_file:
