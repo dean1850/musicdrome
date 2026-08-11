@@ -1,0 +1,89 @@
+"""ListenBrainz — listening history.
+
+Reads only. A token is optional and needed just for a profile that is not
+public; the listens endpoint is open otherwise.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Iterator
+
+import httpx
+
+from .. import config
+
+log = logging.getLogger(__name__)
+
+TIMEOUT = 20.0
+PAGE_SIZE = 100  # the endpoint's documented maximum
+
+
+class ListenBrainzError(RuntimeError):
+    pass
+
+
+def configured() -> bool:
+    return bool(config.LISTENBRAINZ_USER)
+
+
+def _get(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    url = f"{config.LISTENBRAINZ_API_URL.rstrip('/')}/{path.lstrip('/')}"
+    headers = (
+        {"Authorization": f"Token {config.LISTENBRAINZ_TOKEN}"}
+        if config.LISTENBRAINZ_TOKEN
+        else {}
+    )
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.get(url, params=params, headers=headers)
+    except httpx.HTTPError as exc:
+        raise ListenBrainzError(f"network error: {exc}") from exc
+
+    if response.status_code >= 400:
+        raise ListenBrainzError(f"HTTP {response.status_code}: {response.text[:200]}")
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ListenBrainzError("invalid response") from exc
+
+
+def recent_tracks(since: int = 0, max_pages: int = 25) -> Iterator[dict[str, Any]]:
+    """Yield plays newer than ``since`` (unix seconds).
+
+    ListenBrainz pages backwards from newest, so this walks down with
+    ``max_ts`` until it reaches ``since`` or runs out of pages.
+    """
+    max_ts = 0
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"count": PAGE_SIZE}
+        if max_ts:
+            params["max_ts"] = max_ts
+        if since:
+            params["min_ts"] = since
+
+        data = _get(f"1/user/{config.LISTENBRAINZ_USER}/listens", params)
+        listens = (data.get("payload") or {}).get("listens") or []
+        if not listens:
+            return
+
+        oldest = None
+        for listen in listens:
+            played_at = int(listen.get("listened_at") or 0)
+            metadata = listen.get("track_metadata") or {}
+            artist = (metadata.get("artist_name") or "").strip()
+            title = (metadata.get("track_name") or "").strip()
+            if not played_at or not artist or not title:
+                continue
+            oldest = played_at if oldest is None else min(oldest, played_at)
+            yield {
+                "artist": artist,
+                "title": title,
+                "album": (metadata.get("release_name") or "").strip(),
+                "played_at": played_at,
+                "source": "listenbrainz",
+            }
+
+        if oldest is None or len(listens) < PAGE_SIZE:
+            return
+        max_ts = oldest  # exclusive upper bound for the next page

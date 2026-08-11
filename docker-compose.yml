@@ -1,0 +1,47 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Musicdrome
+#
+#    docker compose up -d
+#
+#  Runs the published image — no clone, no build. Update with:
+#
+#    docker compose pull && docker compose up -d
+#
+#  One container, one SQLite file. Ollama, if you use it, is something you
+#  already run; Musicdrome talks to it over HTTP.
+#
+#  Every value below comes from .env — see .env.example.
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+  musicdrome:
+    image: "${MUSICDROME_IMAGE:-ghcr.io/dean1850/musicdrome}:${MUSICDROME_TAG:-latest}"
+    container_name: musicdrome
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MUSICDROME_MUSIC_DIR: /music
+      MUSICDROME_DATA_DIR: /config
+      EXCLUDE_MUSIC_DIR: "${EXCLUDE_MUSIC_DIR:+/library}"
+    ports:
+      - "${MUSICDROME_PORT:-3046}:${MUSICDROME_PORT:-3046}"
+    volumes:
+      # Where downloads are filed as Artist/Album/01 - Title.mp3
+      - "${MUSIC_DIR:-./data/music}:/music"
+      # The SQLite database
+      - "${DATA_DIR:-./data/config}:/config"
+      # Optional: an existing library, mounted read-only, read for artist and
+      # title tags only so its tracks are never suggested to you.
+      - "${EXCLUDE_MUSIC_DIR:-/dev/null}:/library:ro"
+    # Lets http://host.docker.internal:<port> reach Ollama on the Docker host.
+    # Docker Desktop provides this name already; the mapping is what makes it
+    # work on Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${MUSICDROME_PORT:-3046}/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

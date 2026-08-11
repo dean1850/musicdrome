@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Musicdrome</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127911;</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <h1>Musicdrome</h1>
+  </div>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab is-active" data-tab="discover" role="tab">Discover</button>
+    <button class="tab" data-tab="downloads" role="tab">Downloads</button>
+    <button class="tab" data-tab="stats" role="tab">Stats</button>
+    <button class="tab" data-tab="settings" role="tab">Settings</button>
+  </nav>
+
+  <div class="topbar-actions">
+    <span id="scan-state" class="scan-state"></span>
+    <button id="scan-now" class="btn btn-primary">Scan now</button>
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<main>
+
+  <!-- ─── Discover ─────────────────────────────────────────────────── -->
+  <section id="tab-discover" class="panel is-active">
+    <div class="filters">
+      <div class="filter-group">
+        <label for="f-status">Show</label>
+        <select id="f-status">
+          <option value="new">New</option>
+          <option value="saved">Saved</option>
+          <option value="hidden">Hidden</option>
+          <option value="downloaded">Downloaded</option>
+          <option value="failed">Failed</option>
+          <option value="all">Everything</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label for="f-match">Min match <output id="f-match-value">0%</output></label>
+        <input type="range" id="f-match" min="0" max="100" step="5" value="0">
+      </div>
+
+      <div class="filter-group">
+        <label for="f-sort">Sort</label>
+        <select id="f-sort">
+          <option value="match">Match</option>
+          <option value="newest">Newest</option>
+          <option value="artist">Artist</option>
+        </select>
+      </div>
+
+      <div class="filter-group grow">
+        <label>Genre</label>
+        <div id="f-tags" class="chips"></div>
+      </div>
+
+      <button id="download-visible" class="btn">Download all shown</button>
+    </div>
+
+    <div id="cards" class="cards"></div>
+    <div id="discover-empty" class="empty" hidden></div>
+  </section>
+
+  <!-- ─── Downloads ────────────────────────────────────────────────── -->
+  <section id="tab-downloads" class="panel">
+    <div class="filters">
+      <div class="filter-group">
+        <label for="d-status">Show</label>
+        <select id="d-status">
+          <option value="all">Everything</option>
+          <option value="done">Completed</option>
+          <option value="queued">Queued</option>
+          <option value="downloading">In progress</option>
+          <option value="failed">Failed</option>
+        </select>
+      </div>
+      <div id="download-summary" class="muted"></div>
+    </div>
+
+    <div class="table-scroll">
+      <table id="downloads-table" class="table">
+        <thead>
+          <tr>
+            <th>Track</th><th>Album</th><th class="num">Match</th>
+            <th>Status</th><th>File</th><th class="num">Size</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="downloads-empty" class="empty" hidden>Nothing downloaded yet.</div>
+  </section>
+
+  <!-- ─── Stats ────────────────────────────────────────────────────── -->
+  <section id="tab-stats" class="panel">
+    <div class="filters">
+      <div class="filter-group">
+        <label for="s-days">Period</label>
+        <select id="s-days">
+          <option value="7">Last 7 days</option>
+          <option value="30">Last 30 days</option>
+          <option value="90" selected>Last 90 days</option>
+          <option value="365">Last year</option>
+          <option value="3650">All time</option>
+        </select>
+      </div>
+      <button id="refresh-summary" class="btn">Regenerate summary</button>
+    </div>
+
+    <div id="taste" class="taste" hidden></div>
+    <div id="stat-tiles" class="tiles"></div>
+
+    <div class="stat-grid">
+      <div class="card-block">
+        <h2>Plays per day</h2>
+        <div id="chart-daily" class="chart"></div>
+      </div>
+      <div class="card-block">
+        <h2>Listening clock</h2>
+        <div id="chart-clock" class="chart chart-clock"></div>
+      </div>
+      <div class="card-block">
+        <h2>Top artists</h2>
+        <ol id="top-artists" class="ranked"></ol>
+      </div>
+      <div class="card-block">
+        <h2>Top tracks</h2>
+        <ol id="top-tracks" class="ranked"></ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── Settings ─────────────────────────────────────────────────── -->
+  <section id="tab-settings" class="panel">
+    <div class="settings-grid">
+
+      <div class="card-block">
+        <h2>Scanning</h2>
+        <label class="field">
+          <span>Schedule</span>
+          <select data-setting="schedule">
+            <option value="off">Off — manual only</option>
+            <option value="6h">Every 6 hours</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Tracks per scan <output data-output="batch_size"></output></span>
+          <input type="range" data-setting="batch_size" min="5" max="100" step="5">
+        </label>
+        <label class="field">
+          <span>Listening window <output data-output="history_days"></output> days</span>
+          <input type="range" data-setting="history_days" min="30" max="720" step="30">
+        </label>
+        <p class="hint">One AI call per scan. A wider window describes your taste
+          more fully; a narrower one follows what you are into right now.</p>
+      </div>
+
+      <div class="card-block">
+        <h2>Downloading</h2>
+        <label class="field field-row">
+          <input type="checkbox" data-setting="auto_download">
+          <span>Download high matches automatically</span>
+        </label>
+        <label class="field">
+          <span>Auto-download above <output data-output="auto_download_threshold"></output>%</span>
+          <input type="range" data-setting="auto_download_threshold" min="50" max="100" step="1">
+        </label>
+        <label class="field">
+          <span>Daily cap <output data-output="daily_download_cap"></output> tracks</span>
+          <input type="range" data-setting="daily_download_cap" min="0" max="200" step="5">
+        </label>
+        <p class="hint">Everything is MP3 at 320 kbps, tagged from MusicBrainz and
+          filed as <code>Artist/Album/01 - Title.mp3</code>.</p>
+      </div>
+
+      <div class="card-block">
+        <h2>Display</h2>
+        <label class="field">
+          <span>Hide cards below <output data-output="min_match"></output>%</span>
+          <input type="range" data-setting="min_match" min="0" max="100" step="5">
+        </label>
+        <label class="field">
+          <span>Default sort</span>
+          <select data-setting="sort">
+            <option value="match">Match</option>
+            <option value="newest">Newest</option>
+            <option value="artist">Artist</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Keep un-actioned cards for <output data-output="retention_days"></output> days</span>
+          <input type="range" data-setting="retention_days" min="7" max="365" step="1">
+        </label>
+        <label class="field field-row">
+          <input type="checkbox" data-setting="taste_summary">
+          <span>AI taste summary on the stats page</span>
+        </label>
+      </div>
+
+      <div class="card-block">
+        <h2>Connections</h2>
+        <dl id="connections" class="connections"></dl>
+        <p class="hint">These come from <code>.env</code> and need a restart to
+          change. Everything above applies immediately.</p>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

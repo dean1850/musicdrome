@@ -1,0 +1,358 @@
+"""The discovery pipeline.
+
+One scan is: pull new scrobbles, work out what you have been listening to, ask
+the AI once for tracks you would like next, resolve each answer against
+MusicBrainz, throw away anything you already have, and store the rest as cards.
+
+It is one AI call per scan, not one per track. Forty recommendations for the
+price of a single request is what makes a local 8B model on Ollama a reasonable
+choice here rather than a compromise.
+
+A scan runs on a background thread. :data:`_state` is what the UI polls to draw
+the progress line, and :data:`_lock` is what stops two of them overlapping.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Any
+
+from . import ai, config, db, exclude, history
+from .norm import artist_key, track_key
+from .sources import lastfm, musicbrainz
+
+log = logging.getLogger(__name__)
+
+_lock = threading.Lock()
+_state: dict[str, Any] = {"running": False, "step": "", "done": 0, "total": 0, "scan_id": None}
+
+SYSTEM_PROMPT = """You are a music recommender for one listener's personal collection.
+
+You are given that listener's recent scrobbles: their most-played artists, their
+most-played tracks, and the artists they discovered most recently. Recommend
+individual studio tracks they do not yet have but would plausibly love.
+
+Rules:
+- Recommend real, released, individually downloadable studio recordings. Never
+  invent a song, and never recommend a track you are not confident exists.
+- Give the artist exactly as credited on the release, and the track title
+  without any "(Remastered)", "(Live)" or featured-artist suffix.
+- Do not recommend anything in the EXCLUDE list, and do not recommend a track
+  that merely renames something in it.
+- Aim for range: roughly half from artists adjacent to what they already play,
+  and half genuine sideways steps into neighbouring scenes, eras or genres.
+- At most two tracks by any one artist.
+- "match" is your confidence, 0-100, that this specific listener will like this
+  specific track. Use the whole range honestly — a speculative pick belongs in
+  the 50s, and 90+ should mean you would be surprised if they disliked it.
+- "reason" is one short sentence in second person, naming what in their history
+  led you here. "seed" is the single artist from their history it came from.
+"""
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recommendations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "artist": {"type": "string"},
+                    "title": {"type": "string"},
+                    "album": {"type": "string"},
+                    "match": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "reason": {"type": "string"},
+                    "seed": {"type": "string"},
+                },
+                "required": ["artist", "title", "match", "reason"],
+            },
+        }
+    },
+    "required": ["recommendations"],
+}
+
+
+def state() -> dict[str, Any]:
+    return dict(_state)
+
+
+def build_prompt(profile: dict[str, Any], excluded_titles: list[str], batch_size: int) -> str:
+    """The user turn: the listener's profile plus what not to suggest.
+
+    The exclusion list is truncated because a library of 20,000 tracks does not
+    fit in a prompt and would drown the profile if it did. The full set is still
+    applied in code after the model answers — this is a hint, not the guarantee.
+    """
+    lines = [
+        f"Listening window: the last {profile['days']} days "
+        f"({profile['plays']} plays across {profile['artists']} artists).",
+        "",
+        "MOST PLAYED ARTISTS:",
+    ]
+    lines += [f"  {a['artist']} ({a['plays']})" for a in profile["top_artists"][:30]] or ["  (none)"]
+
+    lines += ["", "MOST PLAYED TRACKS:"]
+    lines += [f"  {t['artist']} — {t['title']} ({t['plays']})" for t in profile["top_tracks"][:30]] or ["  (none)"]
+
+    if profile["recent_discoveries"]:
+        lines += ["", "RECENTLY DISCOVERED ARTISTS (newest first):"]
+        lines += [f"  {d['artist']}" for d in profile["recent_discoveries"][:15]]
+
+    if excluded_titles:
+        lines += ["", f"EXCLUDE — already owned, played or dismissed ({len(excluded_titles)} shown):"]
+        lines += [f"  {t}" for t in excluded_titles]
+
+    lines += [
+        "",
+        f"Return exactly {batch_size} recommendations, ordered by match descending.",
+    ]
+    return "\n".join(lines)
+
+
+def _excluded_sample(limit: int = 300) -> list[str]:
+    """A readable sample of the exclusion set for the prompt."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT artist, title, COUNT(*) AS plays FROM plays "
+            "GROUP BY track_key ORDER BY plays DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [f"{row['artist']} — {row['title']}" for row in rows]
+
+
+# ─── Enrichment ────────────────────────────────────────────────────────────
+
+
+def enrich(item: dict[str, Any]) -> dict[str, Any]:
+    """Resolve one recommendation against MusicBrainz, then Last.fm.
+
+    MusicBrainz is authoritative for names, year and length; Last.fm supplies
+    cover art and genre tags. Either can be down or unconfigured — a suggestion
+    with no artwork is still a usable suggestion, so failures are absorbed.
+    """
+    artist = str(item.get("artist", "")).strip()
+    title = str(item.get("title", "")).strip()
+    album = str(item.get("album", "")).strip()
+
+    enriched = {
+        "artist": artist,
+        "title": title,
+        "album": album,
+        "year": "",
+        "track_no": 0,
+        "duration": 0,
+        "recording_mbid": "",
+        "cover_url": "",
+        "tags": [],
+    }
+
+    resolved = musicbrainz.resolve_track(artist, title, album)
+    if resolved:
+        enriched.update(
+            artist=resolved["artist"] or artist,
+            title=resolved["title"] or title,
+            album=resolved["album"] or album,
+            year=resolved["year"],
+            track_no=resolved["track"],
+            duration=resolved["duration"],
+            recording_mbid=resolved["recording_mbid"],
+            cover_url=musicbrainz.cover_url(resolved["release_mbid"]),
+        )
+
+    if lastfm.configured():
+        info = lastfm.track_info(enriched["artist"], enriched["title"])
+        if info:
+            enriched["tags"] = info["tags"]
+            if info["cover_url"]:
+                enriched["cover_url"] = info["cover_url"]
+            if not enriched["duration"] and info["duration"]:
+                enriched["duration"] = info["duration"]
+            if not enriched["album"] and info["album"]:
+                enriched["album"] = info["album"]
+        if not enriched["tags"]:
+            enriched["tags"] = lastfm.artist_tags(enriched["artist"])
+
+    return enriched
+
+
+# ─── The scan ──────────────────────────────────────────────────────────────
+
+
+def run(trigger: str = "manual") -> dict[str, Any]:
+    """Run one full scan. Raises rather than swallowing a configuration error."""
+    if not _lock.acquire(blocking=False):
+        raise RuntimeError("a scan is already running")
+
+    settings = db.get_settings()
+    batch_size = int(settings["batch_size"])
+    scan_id = None
+
+    try:
+        _state.update(running=True, step="starting", done=0, total=batch_size, scan_id=None)
+
+        with db.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO scans (started_at, trigger, provider, model, requested) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (db.now(), trigger, ai.provider(), ai.model(), batch_size),
+            )
+            scan_id = cursor.lastrowid
+        _state["scan_id"] = scan_id
+
+        if not ai.available():
+            raise RuntimeError(
+                f"the {ai.provider()} backend is not configured — set its API key in .env"
+            )
+        if not config.history_sources():
+            raise RuntimeError(
+                "no listening history configured — set LASTFM_API_KEY and LASTFM_USER, "
+                "or LISTENBRAINZ_USER, in .env"
+            )
+
+        _state["step"] = "reading scrobbles"
+        history.sync()
+
+        _state["step"] = "indexing your library"
+        exclude.scan_library()
+
+        _state["step"] = "building your profile"
+        profile = history.profile(days=int(settings["history_days"]))
+        if profile["plays"] == 0:
+            raise RuntimeError(
+                f"no plays in the last {settings['history_days']} days — "
+                "widen the history window in Settings, or check your Last.fm username"
+            )
+
+        excluded = exclude.build()
+
+        _state["step"] = f"asking {ai.model()}"
+        prompt = build_prompt(profile, _excluded_sample(), batch_size)
+        answer = ai.complete_json(SYSTEM_PROMPT, prompt, schema=SCHEMA)
+        items = _recommendations(answer)
+        log.info("scan %s: model returned %d recommendations", scan_id, len(items))
+
+        _state.update(step="checking against your library", total=len(items) or batch_size)
+        kept = _store(scan_id, items, excluded)
+
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE scans SET finished_at = ?, status = 'ok', returned = ?, kept = ? "
+                "WHERE id = ?",
+                (db.now(), len(items), kept, scan_id),
+            )
+
+        _purge(int(settings["retention_days"]))
+        log.info("scan %s finished: %d of %d kept", scan_id, kept, len(items))
+        return {"scan_id": scan_id, "returned": len(items), "kept": kept}
+
+    except Exception as exc:
+        if scan_id is not None:
+            with db.connect() as conn:
+                conn.execute(
+                    "UPDATE scans SET finished_at = ?, status = 'failed', error = ? WHERE id = ?",
+                    (db.now(), str(exc)[:500], scan_id),
+                )
+        log.warning("scan failed: %s", exc)
+        raise
+    finally:
+        _state.update(running=False, step="")
+        _lock.release()
+
+
+def _recommendations(answer: Any) -> list[dict[str, Any]]:
+    """Accept the shapes models actually return, not just the one we asked for."""
+    if isinstance(answer, dict):
+        for key in ("recommendations", "tracks", "results", "items"):
+            if isinstance(answer.get(key), list):
+                return answer[key]
+        return []
+    return answer if isinstance(answer, list) else []
+
+
+def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int:
+    """Enrich and insert, skipping anything excluded before or after enrichment."""
+    kept = 0
+    seen: set[str] = set()
+    per_artist: dict[str, int] = {}
+
+    for index, item in enumerate(items):
+        _state["done"] = index
+        artist = str(item.get("artist", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if not artist or not title:
+            continue
+
+        key = track_key(artist, title)
+        if key in excluded or key in seen:
+            continue
+
+        # The prompt asks for at most two per artist; enforce it rather than trust it.
+        akey = artist_key(artist)
+        if per_artist.get(akey, 0) >= 2:
+            continue
+
+        enriched = enrich(item)
+        canonical = track_key(enriched["artist"], enriched["title"])
+        if canonical in excluded or (canonical != key and canonical in seen):
+            continue
+
+        seen.update({key, canonical})
+        per_artist[akey] = per_artist.get(akey, 0) + 1
+
+        try:
+            match = max(0, min(100, int(float(item.get("match", 0)))))
+        except (TypeError, ValueError):
+            match = 0
+
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO suggestions (scan_id, track_key, artist, title, album, year, "
+                "track_no, match, reason, seed, tags, cover_url, duration, recording_mbid, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (track_key) DO UPDATE SET "
+                "  scan_id = excluded.scan_id, match = excluded.match, "
+                "  reason = excluded.reason, seed = excluded.seed, "
+                "  created_at = excluded.created_at "
+                "WHERE suggestions.status = 'new'",
+                (
+                    scan_id, canonical, enriched["artist"], enriched["title"],
+                    enriched["album"], enriched["year"], enriched["track_no"], match,
+                    str(item.get("reason", ""))[:400], str(item.get("seed", ""))[:120],
+                    ",".join(enriched["tags"]), enriched["cover_url"],
+                    enriched["duration"], enriched["recording_mbid"], db.now(),
+                ),
+            )
+        kept += 1
+
+    _state["done"] = len(items)
+    return kept
+
+
+def _purge(retention_days: int) -> None:
+    """Drop un-actioned suggestions past the retention window.
+
+    Saved, hidden and downloaded cards are kept: they are decisions, and a
+    decision you made is worth more than the disk row it costs.
+    """
+    cutoff = db.now() - retention_days * 86400
+    with db.connect() as conn:
+        conn.execute("DELETE FROM suggestions WHERE status = 'new' AND created_at < ?", (cutoff,))
+
+
+def run_in_background(trigger: str = "manual") -> bool:
+    """Start a scan on its own thread. False if one is already running."""
+    if _state["running"]:
+        return False
+
+    def target() -> None:
+        try:
+            result = run(trigger)
+        except Exception:
+            return  # already logged and recorded on the scan row
+        from . import download
+
+        download.auto_enqueue(result["scan_id"])
+
+    threading.Thread(target=target, name="musicdrome-scan", daemon=True).start()
+    return True

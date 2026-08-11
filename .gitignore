@@ -1,0 +1,27 @@
+# Environment
+.env
+
+# Runtime data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Browser tests
+node_modules/
+test-results/
+playwright-report/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
