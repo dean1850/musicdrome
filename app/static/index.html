@@ -27,6 +27,10 @@
     <span id="scan-state" class="scan-state"></span>
     <button id="scan-now" class="btn btn-primary">Scan now</button>
   </div>
+
+  <!-- Fills the width of the header while a scan runs. Indeterminate until the
+       model answers, since there is nothing to count until then. -->
+  <div id="scan-progress" class="scan-progress" hidden><i></i></div>
 </header>
 
 <div id="banner" class="banner" hidden></div>
@@ -77,6 +81,15 @@
   <!-- ─── Downloads ────────────────────────────────────────────────── -->
   <section id="tab-downloads" class="panel">
     <div class="filters">
+      <div class="filter-group grow">
+        <label for="paste-url">Download a track by link</label>
+        <form id="paste-form" class="paste">
+          <input type="url" id="paste-url" placeholder="Spotify, YouTube Music or YouTube track URL"
+                 autocomplete="off" spellcheck="false">
+          <button type="submit" class="btn btn-primary">Get it</button>
+        </form>
+      </div>
+
       <div class="filter-group">
         <label for="d-status">Show</label>
         <select id="d-status">
@@ -87,6 +100,8 @@
           <option value="failed">Failed</option>
         </select>
       </div>
+
+      <button id="retry-failed" class="btn" hidden>Retry all failed</button>
       <div id="download-summary" class="muted"></div>
     </div>
 

@@ -33,11 +33,16 @@ def build() -> set[str]:
     """Every track key that must not be suggested."""
     keys: set[str] = set()
     with db.connect() as conn:
-        for table, column in (
-            ("plays", "track_key"),
-            ("downloads", "track_key"),
-        ):
-            keys.update(row[0] for row in conn.execute(f"SELECT DISTINCT {column} FROM {table}"))
+        keys.update(row[0] for row in conn.execute("SELECT DISTINCT track_key FROM plays"))
+        # Completed downloads only. A *failed* download must not exclude the
+        # track — the failure is usually about YouTube, not about the music,
+        # and counting it would silently blacklist the track forever.
+        keys.update(
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT track_key FROM downloads WHERE status = 'done'"
+            )
+        )
         keys.update(
             row[0]
             for row in conn.execute(
