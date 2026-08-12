@@ -7,7 +7,10 @@ httpx==0.28.1
 
 # ── Track matching and download ─────────────────────────
 ytmusicapi==1.9.0
-yt-dlp==2025.1.15
+# A floor, not a pin. YouTube breaks extractors every few months and a fix
+# usually ships within days, so the image also upgrades yt-dlp at boot unless
+# YTDLP_AUTO_UPDATE=false — see docker/entrypoint.sh.
+yt-dlp>=2026.7.4
 mutagen==1.47.0
 
 # ── Scan schedule ───────────────────────────────────────

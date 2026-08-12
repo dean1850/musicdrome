@@ -108,6 +108,34 @@ test('the stats tab computes from the seeded plays', async ({ page }) => {
   expect(tallest).toBeGreaterThan(10);
 });
 
+test('the paste box rejects a link it cannot use, and says why', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+
+  await page.locator('#paste-url').fill('https://open.spotify.com/album/4cOdK2wGLETKBW3PvgPWqT');
+  await page.locator('#paste-form button').click();
+
+  await expect(page.locator('#toast')).toContainText('paste a track link');
+  // The input keeps its value so the user can correct it rather than retype.
+  await expect(page.locator('#paste-url')).toHaveValue(/spotify\.com/);
+});
+
+test('retry all failed is hidden until something has failed', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#retry-failed')).toBeHidden();
+});
+
+test('the scan progress bar appears only while a scan runs', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#scan-progress')).toBeHidden();
+
+  // The seeded instance has no AI backend, so the scan fails fast — enough to
+  // prove the bar is driven by scan state rather than always painted.
+  await page.locator('#scan-now').click();
+  await expect(page.locator('#scan-progress')).toBeVisible({ timeout: 5000 });
+});
+
 test('settings persist across a reload', async ({ page }) => {
   await page.goto('/');
   await page.locator('.tab[data-tab="settings"]').click();

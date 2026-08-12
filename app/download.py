@@ -1,14 +1,22 @@
-"""Finding the audio for a suggested track, and filing it.
+"""Finding the audio for a track, and filing it.
 
 Two searches, in order. YouTube Music first, through ``ytmusicapi``: it returns
 a real catalogue with artist, album and duration as structured fields, so a
 candidate can be checked rather than guessed at. Plain YouTube second, through
-yt-dlp, for the tracks YouTube Music does not carry — that path has only a title
-string to go on, so it leans on keyword scoring and is trusted less.
+yt-dlp, for the tracks YouTube Music does not carry — that path has only a
+title string to go on, so it leans on keyword scoring and is trusted less.
 
-Nothing is downloaded on a weak match. A card that cannot be matched confidently
-is marked failed with the reason, which is a better outcome than quietly filing
-a karaoke version into the library.
+Nothing is downloaded on a weak match. A card that cannot be matched
+confidently is marked failed with the reason, which is a better outcome than
+quietly filing a karaoke version into the library.
+
+**On player clients.** YouTube's `web` client needs a JavaScript runtime to
+solve its signature and n-challenges. There is no JS runtime in this container,
+so that client returns a player response containing no audio formats — which
+yt-dlp reports as "Requested format is not available" or "The page needs to be
+reloaded". Neither message mentions the real cause. ``ios`` and ``android``
+still serve audio without a JS runtime, so :data:`app.config.YTDLP_PLAYER_CLIENTS`
+puts them first and yt-dlp falls through the rest only if they fail.
 
 Downloads run on a small pool of worker threads draining the ``downloads``
 table, so the queue survives a restart: anything left mid-flight is requeued at
@@ -23,6 +31,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +54,20 @@ NEGATIVE = re.compile(
 MIN_SCORE = 0.50   # below this, no download is attempted at all
 GOOD_SCORE = 0.75  # above this on YouTube Music, plain YouTube is not consulted
 
+# yt-dlp warnings that are expected and harmless: they mean one format source
+# was skipped while other clients still served usable audio. Left unsuppressed
+# they bury the warnings that do matter.
+_QUIET_WARNINGS = (
+    "GVS PO Token which was not provided",
+    "Some tv client https formats have been skipped as they are DRM",
+    "Signature solving failed: Some formats may be missing",
+    "n challenge solving failed: Some formats may be missing",
+    "Some web client https formats have been skipped",
+)
+
+# FFmpegExtractAudio names its output after the codec, except Vorbis.
+_EXTENSIONS = {"vorbis": "ogg"}
+
 _queue: "queue.Queue[int]" = queue.Queue()
 _workers: list[threading.Thread] = []
 _progress: dict[int, int] = {}
@@ -65,6 +88,32 @@ class Candidate:
     duration: int = 0
     source: str = "youtube"
     score: float = field(default=0.0)
+
+
+def audio_extension() -> str:
+    fmt = config.AUDIO_FORMAT or "mp3"
+    return _EXTENSIONS.get(fmt, fmt)
+
+
+class _YtdlpLogger:
+    """Routes yt-dlp's own output into our logger, minus the known noise."""
+
+    @staticmethod
+    def debug(message: str) -> None:
+        pass
+
+    @staticmethod
+    def info(message: str) -> None:
+        pass
+
+    @staticmethod
+    def warning(message: str) -> None:
+        if not any(fragment in message for fragment in _QUIET_WARNINGS):
+            log.warning("yt-dlp: %s", message)
+
+    @staticmethod
+    def error(message: str) -> None:
+        log.debug("yt-dlp: %s", message)  # the caller reports the failure itself
 
 
 # ─── Candidate scoring ─────────────────────────────────────────────────────
@@ -158,22 +207,45 @@ def search_ytmusic(artist: str, title: str, limit: int = 8) -> list[Candidate]:
 
 def _ydl_options(**overrides) -> dict[str, Any]:
     options: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
         "format": "bestaudio/best",
-        "retries": 3,
+        "quiet": True,
+        "no_warnings": False,  # warnings go through _YtdlpLogger, which filters
+        "noprogress": True,
+        "logger": _YtdlpLogger(),
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "overwrites": True,
+        # googlevideo CDN hosts are short-lived shards; a single transient
+        # timeout used to abort a whole download.
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
         "socket_timeout": 30,
+        # Which YouTube clients may be tried, in order — see the module
+        # docstring. Without this, the default client returns no audio formats.
+        "extractor_args": {"youtube": {"player_client": config.player_clients()}},
+        # Light pacing so back-to-back downloads do not trigger a 429.
+        "sleep_interval_requests": 1,
     }
+
+    tokens = config.po_tokens()
+    if tokens:
+        options["extractor_args"]["youtube"]["po_token"] = tokens
+    if config.YTDLP_FORCE_IPV4:
+        options["source_address"] = "0.0.0.0"
     if config.YTDLP_PROXY:
         options["proxy"] = config.YTDLP_PROXY
     if config.YTDLP_COOKIES_FILE:
         options["cookiefile"] = config.YTDLP_COOKIES_FILE
+    if config.YTDLP_COOKIES_FROM_BROWSER:
+        parts = config.YTDLP_COOKIES_FROM_BROWSER.split(":", 1)
+        options["cookiesfrombrowser"] = tuple(parts)
     if config.YTDLP_RATE_LIMIT:
         try:
             options["ratelimit"] = int(config.YTDLP_RATE_LIMIT)
         except ValueError:
             pass
+
     options.update(overrides)
     return options
 
@@ -246,19 +318,13 @@ def _fetch_cover(url: str) -> bytes:
     return b""
 
 
-def tag(path: Path, meta: dict[str, Any]) -> None:
-    """Write ID3 tags and embed the cover art."""
-    from mutagen.easyid3 import EasyID3
-    from mutagen.id3 import APIC, ID3, ID3NoHeaderError
-    from mutagen.mp3 import MP3
+def _cover_mime(cover: bytes) -> str:
+    return "image/png" if cover[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
 
-    try:
-        audio = EasyID3(path)
-    except ID3NoHeaderError:
-        mp3 = MP3(path)
-        mp3.add_tags()
-        mp3.save()
-        audio = EasyID3(path)
+
+def tag(path: Path, meta: dict[str, Any]) -> None:
+    """Write tags and embed cover art, in whichever container we produced."""
+    import mutagen
 
     fields = {
         "artist": meta.get("artist", ""),
@@ -273,25 +339,77 @@ def tag(path: Path, meta: dict[str, Any]) -> None:
     if meta.get("recording_mbid"):
         fields["musicbrainz_trackid"] = meta["recording_mbid"]
 
-    for key, value in fields.items():
-        if value:
-            audio[key] = str(value)
-    audio.save()
-
+    suffix = path.suffix.lower()
     cover = _fetch_cover(meta.get("cover_url", ""))
-    if cover:
-        try:
-            id3 = ID3(path)
-            mime = "image/png" if cover[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
-            id3.delall("APIC")
-            id3.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover))
-            id3.save(path)
-        except Exception as exc:
-            log.debug("could not embed cover art in %s: %s", path, exc)
+
+    try:
+        if suffix == ".mp3":
+            from mutagen.easyid3 import EasyID3
+            from mutagen.id3 import APIC, ID3, ID3NoHeaderError
+            from mutagen.mp3 import MP3
+
+            try:
+                audio = EasyID3(path)
+            except ID3NoHeaderError:
+                mp3 = MP3(path)
+                mp3.add_tags()
+                mp3.save()
+                audio = EasyID3(path)
+            for key, value in fields.items():
+                if value:
+                    audio[key] = str(value)
+            audio.save()
+
+            if cover:
+                id3 = ID3(path)
+                id3.delall("APIC")
+                id3.add(APIC(encoding=3, mime=_cover_mime(cover), type=3,
+                             desc="Cover", data=cover))
+                id3.save(path)
+            return
+
+        audio = mutagen.File(path, easy=True)
+        if audio is None:
+            return
+        if audio.tags is None:
+            audio.add_tags()
+        for key, value in fields.items():
+            if value:
+                try:
+                    audio[key] = str(value)
+                except (KeyError, ValueError):
+                    pass  # this container has no such field
+        audio.save()
+
+        if not cover:
+            return
+
+        if suffix == ".flac":
+            from mutagen.flac import FLAC, Picture
+
+            picture = Picture()
+            picture.data, picture.type, picture.mime = cover, 3, _cover_mime(cover)
+            flac = FLAC(path)
+            flac.clear_pictures()
+            flac.add_picture(picture)
+            flac.save()
+        elif suffix in {".m4a", ".mp4"}:
+            from mutagen.mp4 import MP4, MP4Cover
+
+            fmt = MP4Cover.FORMAT_PNG if _cover_mime(cover) == "image/png" else MP4Cover.FORMAT_JPEG
+            mp4 = MP4(path)
+            mp4["covr"] = [MP4Cover(cover, imageformat=fmt)]
+            mp4.save()
+        else:
+            log.debug("no cover-art support for %s files", suffix)
+    except Exception as exc:
+        log.warning("could not fully tag %s: %s", path, exc)
 
 
-def target_path(artist: str, album: str, title: str, track_no: int = 0) -> Path:
+def target_path(artist: str, album: str, title: str, track_no: int = 0,
+                extension: str | None = None) -> Path:
     """``MUSIC_DIR/Artist/Album/01 - Title.mp3``, never overwriting."""
+    suffix = extension or audio_extension()
     artist_part = safe_filename(artist, "Unknown Artist")
     album_part = safe_filename(album, "Singles")
     title_part = safe_filename(title, "Untitled")
@@ -300,11 +418,11 @@ def target_path(artist: str, album: str, title: str, track_no: int = 0) -> Path:
     directory = config.MUSIC_DIR / artist_part / album_part
     directory.mkdir(parents=True, exist_ok=True)
 
-    target = directory / f"{prefix}{title_part}.mp3"
+    target = directory / f"{prefix}{title_part}.{suffix}"
     if not target.exists():
         return target
     for index in range(2, 100):
-        alternative = directory / f"{prefix}{title_part} ({index}).mp3"
+        alternative = directory / f"{prefix}{title_part} ({index}).{suffix}"
         if not alternative.exists():
             return alternative
     raise DownloadError(f"too many files named {title_part} in {directory}")
@@ -339,6 +457,37 @@ def append_to_playlist(scan_id: int | None, path: Path, meta: dict[str, Any]) ->
     return str(playlist)
 
 
+# ─── Temporary files ───────────────────────────────────────────────────────
+
+
+def sweep_temp(max_age: int = 3600) -> int:
+    """Delete scratch directories left behind by an interrupted download.
+
+    The normal path removes its own workdir in a ``finally``, but a container
+    killed mid-download never runs it. Anything older than ``max_age`` cannot
+    belong to a live download, so it is safe to remove at boot.
+    """
+    removed = 0
+    if not config.TMP_DIR.is_dir():
+        return removed
+
+    cutoff = time.time() - max_age
+    for entry in config.TMP_DIR.iterdir():
+        if not entry.name.startswith("musicdrome-"):
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink()
+            removed += 1
+        except OSError:
+            continue
+
+    if removed:
+        log.info("swept %d stale download scratch directories", removed)
+    return removed
+
+
 # ─── Fetching ──────────────────────────────────────────────────────────────
 
 
@@ -363,9 +512,20 @@ def fetch(download_id: int) -> None:
         if not config.MUSIC_DIR.exists():
             raise DownloadError(f"MUSIC_DIR {config.MUSIC_DIR} does not exist")
 
-        candidate = best_match(meta["artist"], meta["title"], int(meta["want_duration"] or 0))
-        if candidate is None:
-            raise DownloadError("no confident match on YouTube Music or YouTube")
+        # A row that already carries a source URL came from a pasted link —
+        # the user named the exact recording, so there is nothing to match.
+        if meta.get("source_url"):
+            candidate = Candidate(
+                url=meta["source_url"],
+                title=meta["title"],
+                artist=meta["artist"],
+                source=meta.get("source") or "url",
+                score=1.0,
+            )
+        else:
+            candidate = best_match(meta["artist"], meta["title"], int(meta["want_duration"] or 0))
+            if candidate is None:
+                raise DownloadError("no confident match on YouTube Music or YouTube")
 
         log.info(
             "downloading %s — %s from %s (score %.2f)",
@@ -412,17 +572,22 @@ def fetch(download_id: int) -> None:
 
 
 def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]) -> Path:
-    """yt-dlp into a temp dir, transcode to 320 kbps MP3, tag, then file it."""
+    """yt-dlp into a scratch dir, transcode, tag, then file it."""
     import yt_dlp
 
     def hook(status: dict) -> None:
+        if status.get("status") == "finished":
+            _progress[download_id] = 97  # ffmpeg is converting
+            return
         if status.get("status") != "downloading":
             return
         total = status.get("total_bytes") or status.get("total_bytes_estimate") or 0
         if total:
-            _progress[download_id] = min(99, int(status.get("downloaded_bytes", 0) * 100 / total))
+            _progress[download_id] = min(95, int(status.get("downloaded_bytes", 0) * 95 / total))
 
-    workdir = Path(tempfile.mkdtemp(prefix="musicdrome-", dir=config.DATA_DIR))
+    config.TMP_DIR.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="musicdrome-", dir=config.TMP_DIR))
+    extension = audio_extension()
     try:
         options = _ydl_options(
             outtmpl=str(workdir / "%(id)s.%(ext)s"),
@@ -430,8 +595,9 @@ def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]
             postprocessors=[
                 {
                     "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    # Not 0-9, so yt-dlp passes this to ffmpeg as -b:a 320k.
+                    "preferredcodec": config.AUDIO_FORMAT,
+                    # Not a 0-9 VBR value, so yt-dlp passes this to ffmpeg as
+                    # -b:a <n>k. Ignored for lossless codecs.
                     "preferredquality": config.AUDIO_BITRATE,
                 }
             ],
@@ -441,18 +607,21 @@ def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]
             ydl.extract_info(candidate.url, download=True)
 
         produced = sorted(
-            (p for p in workdir.iterdir() if p.is_file() and p.suffix.lower() == ".mp3"),
+            (p for p in workdir.iterdir()
+             if p.is_file() and p.suffix.lower() == f".{extension}"),
             key=lambda p: p.stat().st_size,
             reverse=True,
         )
         if not produced:
-            raise DownloadError("yt-dlp produced no MP3 — is ffmpeg installed?")
+            raise DownloadError(
+                f"yt-dlp produced no {extension.upper()} — is ffmpeg installed?"
+            )
 
         source = produced[0]
         tag(source, meta)
 
         target = target_path(
-            meta["artist"], meta["album"], meta["title"], int(meta["track_no"] or 0)
+            meta["artist"], meta["album"], meta["title"], int(meta["track_no"] or 0), extension
         )
         shutil.move(str(source), str(target))
         return target
@@ -505,6 +674,25 @@ def enqueue(suggestion_id: int) -> int | None:
             "UPDATE suggestions SET status = 'queued', error = '', decided_at = ? WHERE id = ?",
             (db.now(), suggestion_id),
         )
+
+    _queue.put(download_id)
+    return download_id
+
+
+def enqueue_direct(*, artist: str, title: str, album: str = "", url: str = "",
+                   source: str = "url") -> int:
+    """Queue a track the user named directly, by pasted link or by hand.
+
+    When ``url`` is set the download skips matching entirely — the link already
+    identifies the exact recording, so second-guessing it would be wrong.
+    """
+    with db.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO downloads (track_key, artist, title, album, source_url, source, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (track_key(artist, title), artist, title, album, url, source, db.now()),
+        )
+        download_id = cursor.lastrowid
 
     _queue.put(download_id)
     return download_id
@@ -566,9 +754,11 @@ def _worker() -> None:
 
 
 def start_workers() -> None:
-    """Start the pool and requeue anything interrupted by a restart."""
+    """Start the pool, sweep old scratch files and requeue interrupted work."""
     if _workers:
         return
+
+    sweep_temp()
 
     with db.connect() as conn:
         conn.execute("UPDATE downloads SET status = 'queued' WHERE status = 'downloading'")
@@ -594,18 +784,44 @@ def retry(download_id: int) -> bool:
         row = conn.execute("SELECT * FROM downloads WHERE id = ?", (download_id,)).fetchone()
         if row is None or row["status"] not in {"failed", "done"}:
             return False
-        conn.execute(
-            "UPDATE downloads SET status = 'queued', error = '', progress = 0, finished_at = NULL "
-            "WHERE id = ?",
-            (download_id,),
-        )
-        if row["suggestion_id"]:
-            conn.execute(
-                "UPDATE suggestions SET status = 'queued', error = '' WHERE id = ?",
-                (row["suggestion_id"],),
-            )
+        _reset(conn, row)
     _queue.put(download_id)
     return True
+
+
+def retry_all_failed() -> int:
+    """Requeue every failed download. Returns how many were requeued.
+
+    Worth having as one action: failures usually share a cause — a stale
+    yt-dlp, a YouTube change, a network blip — so when the cause is fixed they
+    all become downloadable at the same moment.
+    """
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM downloads WHERE status = 'failed' ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            _reset(conn, row)
+
+    for row in rows:
+        _queue.put(row["id"])
+    if rows:
+        log.info("requeued %d failed downloads", len(rows))
+    return len(rows)
+
+
+def _reset(conn, row) -> None:
+    """Return one download row, and its suggestion, to the queued state."""
+    conn.execute(
+        "UPDATE downloads SET status = 'queued', error = '', progress = 0, finished_at = NULL "
+        "WHERE id = ?",
+        (row["id"],),
+    )
+    if row["suggestion_id"]:
+        conn.execute(
+            "UPDATE suggestions SET status = 'queued', error = '' WHERE id = ?",
+            (row["suggestion_id"],),
+        )
 
 
 def remove(download_id: int, delete_file: bool = False) -> bool:

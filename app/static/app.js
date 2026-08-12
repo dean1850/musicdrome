@@ -22,6 +22,7 @@ const state = {
   settings: {},
   scanning: false,
   fastPoll: null,
+  statusPoll: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -215,9 +216,13 @@ async function loadDownloads() {
   empty.hidden = data.downloads.length > 0;
 
   const done = data.downloads.filter((row) => row.status === 'done');
+  const failed = data.downloads.filter((row) => row.status === 'failed');
   const total = done.reduce((sum, row) => sum + (row.bytes || 0), 0);
   $('#download-summary').textContent =
-    `${done.length} downloaded · ${bytes(total)}${data.active.length ? ` · ${data.active.length} in flight` : ''}`;
+    `${done.length} downloaded · ${bytes(total)}`
+    + (failed.length ? ` · ${failed.length} failed` : '')
+    + (data.active.length ? ` · ${data.active.length} in flight` : '');
+  $('#retry-failed').hidden = failed.length === 0;
 
   body.innerHTML = data.downloads.map((row) => {
     const live = active.get(row.id);
@@ -398,10 +403,19 @@ async function refreshStatus() {
   state.scanning = status.scan.running;
 
   const label = $('#scan-state');
+  const bar = $('#scan-progress');
   label.classList.toggle('is-running', state.scanning);
+  bar.hidden = !state.scanning;
+
   if (state.scanning) {
     const { step, done, total } = status.scan;
-    label.textContent = total && done ? `${step} — ${done}/${total}` : step;
+    // Only the enrichment phase has a countable unit of work. Everything
+    // before it (syncing, indexing, waiting on the model) has no meaningful
+    // percentage, so the bar sweeps rather than inventing one.
+    const countable = total > 0 && done > 0;
+    bar.classList.toggle('is-indeterminate', !countable);
+    bar.firstElementChild.style.width = countable ? `${Math.round((done / total) * 100)}%` : '';
+    label.textContent = countable ? `${step} — ${done}/${total}` : step;
   } else if (status.scan.last) {
     const last = status.scan.last;
     label.textContent = last.status === 'failed'
@@ -420,6 +434,13 @@ async function refreshStatus() {
     toast('Scan finished');
     if (state.tab === 'discover') loadDiscover();
   }
+  if (wasScanning !== state.scanning) setStatusPoll();
+}
+
+/** Poll quickly while a scan runs so the bar moves, slowly when idle. */
+function setStatusPoll() {
+  clearInterval(state.statusPoll);
+  state.statusPoll = setInterval(refreshStatus, state.scanning ? 1500 : 5000);
 }
 
 function showSetupBanner(status) {
@@ -497,6 +518,39 @@ function init() {
   };
 
   $('#d-status').onchange = (event) => { state.downloadStatus = event.target.value; loadDownloads(); };
+
+  $('#paste-form').onsubmit = async (event) => {
+    event.preventDefault();
+    const input = $('#paste-url');
+    const url = input.value.trim();
+    if (!url) return;
+
+    const button = event.target.querySelector('button');
+    button.disabled = true;
+    try {
+      const data = await api('/downloads/url', {
+        method: 'POST',
+        body: JSON.stringify({ url }),
+      });
+      input.value = '';
+      toast(data.matched
+        ? `Queued ${data.artist} — ${data.title}`
+        : `Queued ${data.artist} — ${data.title}, finding it on YouTube Music`);
+      startFastPoll();
+      loadDownloads();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  };
+
+  $('#retry-failed').onclick = async () => {
+    const data = await api('/downloads/retry-failed', { method: 'POST' });
+    toast(data.queued ? `Requeued ${data.queued} downloads` : 'Nothing to retry');
+    startFastPoll();
+    loadDownloads();
+  };
   $('#s-days').onchange = (event) => { state.days = Number(event.target.value); loadStats(); };
   $('#refresh-summary').onclick = () => loadSummary(true);
 
@@ -507,7 +561,7 @@ function init() {
 
   refreshStatus();
   showTab('discover');
-  setInterval(refreshStatus, 5000);
+  setStatusPoll();
 }
 
 document.addEventListener('DOMContentLoaded', init);

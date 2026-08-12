@@ -13,7 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from . import ai, config, db, download, history, scan, stats
+from . import ai, config, db, download, history, links, scan, stats
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +198,40 @@ def list_downloads(
 @router.get("/downloads/active")
 def active_downloads() -> dict[str, Any]:
     return {"active": download.active()}
+
+
+@router.post("/downloads/url")
+def download_from_url(url: str = Body("", embed=True)) -> dict[str, Any]:
+    """Queue a track from a pasted Spotify, YouTube Music or YouTube link."""
+    try:
+        resolved = links.resolve(url)
+    except links.LinkError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if download.track_is_downloaded(resolved["artist"], resolved["title"]):
+        raise HTTPException(409, f"{resolved['artist']} — {resolved['title']} is already downloaded")
+
+    download_id = download.enqueue_direct(
+        artist=resolved["artist"],
+        title=resolved["title"],
+        album=resolved.get("album", ""),
+        url=resolved.get("url", ""),
+        source=resolved.get("source", "url"),
+    )
+    return {
+        "queued": True,
+        "download_id": download_id,
+        "artist": resolved["artist"],
+        "title": resolved["title"],
+        # A Spotify link carries no downloadable audio, so it still has to be
+        # matched on YouTube Music — worth saying so in the UI.
+        "matched": bool(resolved.get("url")),
+    }
+
+
+@router.post("/downloads/retry-failed")
+def retry_failed_downloads() -> dict[str, int]:
+    return {"queued": download.retry_all_failed()}
 
 
 @router.post("/downloads/{download_id}/retry")

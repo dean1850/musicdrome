@@ -62,6 +62,10 @@ EXCLUDE_MUSIC_DIR = _env("EXCLUDE_MUSIC_DIR")
 
 DB_PATH = DATA_DIR / "musicdrome.db"
 PLAYLIST_DIR = MUSIC_DIR / "_playlists"
+# Scratch space for in-flight downloads. Kept out of DATA_DIR's top level so
+# multi-megabyte partial audio never sits beside the database, and swept at
+# boot in case a container was killed mid-download.
+TMP_DIR = DATA_DIR / "tmp"
 
 # ─── Listening history ─────────────────────────────────────────────────────
 
@@ -98,15 +102,45 @@ AI_REQUEST_TIMEOUT = _int("AI_REQUEST_TIMEOUT", 300)
 
 # ─── Downloads ─────────────────────────────────────────────────────────────
 
-# Format is deliberately not configurable: MP3 at 320 kbps, always.
-AUDIO_BITRATE = "320"
+# MP3 at 320 kbps by default. Worth knowing what the tradeoff is before
+# changing it: YouTube serves Opus at around 160 kbps, so "mp3"/"320" makes a
+# file about twice the size that is fractionally *worse* than the source,
+# bought in exchange for playing on absolutely everything. "opus" or "m4a"
+# keeps the original bytes with no second encode.
+AUDIO_FORMAT = _env("AUDIO_FORMAT", default="mp3").lower()
+AUDIO_BITRATE = _env("AUDIO_BITRATE", default="320")
 FFMPEG_PATH = _env("FFMPEG_PATH", default="/usr/bin/ffmpeg")
 
-# Escape hatches for networks and rate limits, not everyday settings.
+# Which YouTube player clients yt-dlp may use, in order. This is the single
+# most important download setting: YouTube's `web` client now needs a
+# JavaScript runtime to solve its signature and n-challenges, and there isn't
+# one in this container — so it returns a player response with no audio
+# formats at all, which surfaces as "Requested format is not available" or
+# "The page needs to be reloaded". `ios` and `android` still serve audio
+# without a JS runtime, so they lead.
+YTDLP_PLAYER_CLIENTS = _env(
+    "YTDLP_PLAYER_CLIENTS", default="ios,android,web_embedded,mweb,web,tv"
+)
+
+# Escape hatches for networks, rate limits and bot checks — not everyday
+# settings. PO tokens look like "<client>.<context>+<token>", comma separated.
+YTDLP_PO_TOKEN = _env("YTDLP_PO_TOKEN")
 YTDLP_COOKIES_FILE = _env("YTDLP_COOKIES_FILE")
+YTDLP_COOKIES_FROM_BROWSER = _env("YTDLP_COOKIES_FROM_BROWSER")
 YTDLP_PROXY = _env("YTDLP_PROXY")
 YTDLP_RATE_LIMIT = _env("YTDLP_RATE_LIMIT")
+# Some container hosts advertise IPv6 but cannot route to googlevideo.com,
+# which shows up as EAI_AGAIN on the AAAA lookup. This binds yt-dlp to IPv4.
+YTDLP_FORCE_IPV4 = _env("YTDLP_FORCE_IPV4").lower() in {"1", "true", "yes"}
 DOWNLOAD_CONCURRENCY = _int("DOWNLOAD_CONCURRENCY", 2)
+
+
+def player_clients() -> list[str]:
+    return [c.strip() for c in YTDLP_PLAYER_CLIENTS.split(",") if c.strip()]
+
+
+def po_tokens() -> list[str]:
+    return [t.strip() for t in YTDLP_PO_TOKEN.split(",") if t.strip()]
 
 TESTING = _env("MUSICDROME_TESTING").lower() in {"1", "true", "yes"}
 
@@ -114,6 +148,7 @@ TESTING = _env("MUSICDROME_TESTING").lower() in {"1", "true", "yes"}
 def ensure_directories() -> None:
     """Create the directories we own. MUSIC_DIR may be a read-only mount."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
     for path in (MUSIC_DIR, PLAYLIST_DIR):
         try:
             path.mkdir(parents=True, exist_ok=True)
