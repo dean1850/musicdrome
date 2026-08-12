@@ -20,13 +20,21 @@ ENV PYTHONUNBUFFERED=1 \
     MUSICDROME_DATA_DIR=/config
 
 # ffmpeg does the 320 kbps encode; tini reaps the yt-dlp and ffmpeg children;
-# gosu drops to PUID/PGID so downloaded files are not owned by root.
+# gosu drops to PUID/PGID when those are not root.
+#
+# nodejs is what lets YouTube downloads work at all. The clients that still
+# serve plain HTTPS format URLs need a JavaScript runtime to solve YouTube's
+# signature and n-challenges; without one, yt-dlp is left with SABR-only
+# clients and reports "formats have been skipped as they are missing a URL"
+# (yt-dlp/yt-dlp#12482). yt-dlp prefers deno, but deno is not packaged for
+# Debian and Node is, so Node it is.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         tini \
         gosu \
         curl \
         ca-certificates \
+        nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

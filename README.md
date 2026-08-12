@@ -119,6 +119,7 @@ and applies immediately, no restart:
 
 | Setting | Default | |
 |---|---|---|
+| Listeners | One | Who lives here, and their scrobble accounts |
 | Schedule | Daily | Off, every 6 hours, daily or weekly |
 | Tracks per scan | 40 | 5–100, one AI call regardless |
 | Listening window | 90 days | How far back the taste profile reaches |
@@ -127,6 +128,49 @@ and applies immediately, no restart:
 | Hide below | 0% | Display filter for the card grid |
 | Retention | 60 days | Un-actioned cards are purged; decisions are kept |
 | Taste summary | On | One AI call a day for the stats page |
+
+## Listeners
+
+A household is rarely one set of ears. Musicdrome keeps a list of **listeners**,
+each with their own Last.fm and ListenBrainz accounts, and everything that is a
+matter of taste is kept per person: their scrobble history, their recommendation
+cards, their saved and hidden decisions, their stats page.
+
+What is shared is the music. One library on disk, one download queue — because a
+house has one record collection. Hiding a card never removes it from someone
+else's grid, and the same track can be recommended to two people independently.
+
+There are no passwords. A listener is a taste profile, not an account, and the
+picker in the header works the way a streaming box asks who is watching. Put
+Musicdrome behind a VPN or an authenticating proxy if it needs to be reachable
+from outside — see [Security](#security).
+
+Add people in **Settings → Listeners**. Scans run for whoever is selected;
+scheduled scans run for every active listener in turn, so everyone's grid is
+fresh in the morning. Deactivate someone to keep their history but skip them.
+
+### Importing from Navidrome
+
+If you already run [Navidrome](https://github.com/navidrome/navidrome), it knows
+who lives here. Set the admin credentials in `.env`:
+
+```bash
+NAVIDROME_URL=http://192.168.1.5:4533
+NAVIDROME_USER=admin
+NAVIDROME_PASSWORD=...
+```
+
+and **Import from Navidrome** appears in Settings. It brings across the account
+names and mail addresses. Nothing is ever written back.
+
+**It cannot import anyone's Last.fm account, and no integration could.**
+Navidrome's Subsonic `getUsers` returns usernames, mail addresses and role flags
+only; each user's linked scrobble session is kept private and is never exposed
+over the API, not even to an admin. So the roster arrives automatically and the
+scrobble usernames are filled in once per person, by hand, in Settings.
+
+Listing users is admin-only, which is why the credentials above have to be an
+admin's. The password is never sent — Subsonic's salted-token scheme is used.
 
 ## Downloads
 
@@ -170,11 +214,58 @@ docker compose exec musicdrome pip install --no-cache-dir --pre --upgrade yt-dlp
 docker compose restart musicdrome
 ```
 
+## When downloads fail
+
+Two failures account for almost all of it, and neither says what it means.
+
+### "Permission denied: /music/&lt;Artist&gt;"
+
+The library is not writable by the container. This is the nastiest one to
+diagnose unaided, because everything else works perfectly: the app boots, scans
+run, matches are found, yt-dlp downloads the audio and ffmpeg encodes it — and
+then the very last step, creating the artist folder, fails. The bandwidth is
+already spent.
+
+Musicdrome now checks this at boot and again before each download, and says
+which uid it is running as and which owns the directory. The container runs as
+**root by default** precisely so this does not happen; if you have set
+`PUID`/`PGID` to a normal user, make sure that user can write to `MUSIC_DIR`:
+
+| Mount | Fix |
+|---|---|
+| Local disk, ZFS, unRAID | `sudo chown -R 1000:1000 /path/to/music` |
+| CIFS/SMB | Mount with `uid=1000,gid=1000,file_mode=0664,dir_mode=0775` — `chown` does not work on CIFS |
+| NFS | Match the uid on the server, or map it with `anonuid` |
+
+### "formats have been skipped as they are missing a URL"
+
+This is [yt-dlp#12482](https://github.com/yt-dlp/yt-dlp/issues/12482) — YouTube
+moving a client onto SABR, where the player response carries no format URLs at
+all. It is a **warning, not a failure**: yt-dlp says it while falling through to
+a client that does work, and it is filtered out of the log.
+
+It becomes a real failure only if every client is SABR-only, which is what
+happens when the client list is pinned to a stale set. So don't pin it —
+`YTDLP_PLAYER_CLIENTS` is empty by default and yt-dlp's own defaults track
+YouTube as it changes. The clients that still serve real URLs need a JavaScript
+runtime to solve YouTube's signature challenges; the image ships Node and lets
+yt-dlp fetch its external JS components (`YTDLP_JS_RUNTIMES`,
+`YTDLP_REMOTE_COMPONENTS`).
+
+### "no confident match on YouTube Music or YouTube"
+
+Not a download failure — nothing was downloaded because nothing credible was
+found. Musicdrome refuses to file a track it cannot attribute to the right
+artist, on the grounds that a tribute band in your library is worse than a gap.
+If it happens constantly, the AI is probably recommending obscure or misspelled
+titles; a narrower listening window tends to help.
+
 ## Security
 
 Musicdrome has **no authentication**, by design — it is meant for a trusted home
-network. Put it behind a VPN or an authenticating reverse proxy if you need to
-reach it from outside.
+network. Listeners are taste profiles, not accounts: picking a different one is
+not a login and is not a security boundary. Put it behind a VPN or an
+authenticating reverse proxy if you need to reach it from outside.
 
 ## Notes
 

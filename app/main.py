@@ -77,6 +77,14 @@ async def lifespan(app: FastAPI):
 
     db.init()
 
+    # Said once, loudly, at boot. An unwritable music directory is the one
+    # misconfiguration that leaves everything else looking healthy: the app
+    # serves, scans and matches perfectly, and every download dies at the last
+    # step having already spent the bandwidth and the encode.
+    problem = config.music_dir_problem()
+    if problem:
+        log.error("music library is not writable — downloads will fail: %s", problem)
+
     if not config.TESTING:
         download.start_workers()
         scheduler.start()

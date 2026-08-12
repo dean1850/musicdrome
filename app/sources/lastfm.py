@@ -25,8 +25,13 @@ class LastFmError(RuntimeError):
     pass
 
 
-def configured() -> bool:
-    return bool(config.LASTFM_API_KEY and config.LASTFM_USER)
+def configured(user: str = "") -> bool:
+    """Whether history can be read for ``user``, or for the environment's user.
+
+    The API key is shared by the whole household — it authenticates Musicdrome,
+    not a person — so only the username varies per user.
+    """
+    return bool(config.LASTFM_API_KEY and (user or config.LASTFM_USER))
 
 
 def _get(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -64,8 +69,11 @@ def _largest_image(images: list[dict] | None) -> str:
 # ─── Listening history ─────────────────────────────────────────────────────
 
 
-def recent_tracks(since: int = 0, max_pages: int = 25) -> Iterator[dict[str, Any]]:
+def recent_tracks(since: int = 0, max_pages: int = 25, user: str = "") -> Iterator[dict[str, Any]]:
     """Yield plays newer than ``since`` (unix seconds), oldest page last.
+
+    ``user`` names whose profile to read, falling back to the environment's so
+    a single-user install keeps working with no user rows at all.
 
     ``max_pages`` caps a first sync against a very old profile so the initial
     boot cannot spend ten minutes paging; the next scan picks up where this one
@@ -76,7 +84,7 @@ def recent_tracks(since: int = 0, max_pages: int = 25) -> Iterator[dict[str, Any
         data = _get(
             "user.getRecentTracks",
             {
-                "user": config.LASTFM_USER,
+                "user": user or config.LASTFM_USER,
                 "limit": PAGE_SIZE,
                 "page": page,
                 # `from` is a lower bound on the scrobble timestamp. Passing the

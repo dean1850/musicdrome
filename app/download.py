@@ -10,13 +10,18 @@ Nothing is downloaded on a weak match. A card that cannot be matched
 confidently is marked failed with the reason, which is a better outcome than
 quietly filing a karaoke version into the library.
 
-**On player clients.** YouTube's `web` client needs a JavaScript runtime to
-solve its signature and n-challenges. There is no JS runtime in this container,
-so that client returns a player response containing no audio formats — which
-yt-dlp reports as "Requested format is not available" or "The page needs to be
-reloaded". Neither message mentions the real cause. ``ios`` and ``android``
-still serve audio without a JS runtime, so :data:`app.config.YTDLP_PLAYER_CLIENTS`
-puts them first and yt-dlp falls through the rest only if they fail.
+**On player clients and SABR.** YouTube serves different clients differently,
+and which ones still hand out plain HTTPS format URLs changes every few months.
+Clients it has moved onto SABR return a player response with no format URLs at
+all, which yt-dlp reports as "Some <client> client https formats have been
+skipped as they are missing a URL" (yt-dlp/yt-dlp#12482). The clients that do
+still carry URLs need a JavaScript runtime to solve YouTube's signature and
+n-challenges, so the image ships Node and lets yt-dlp fetch its external JS
+components on demand — see :data:`app.config.YTDLP_JS_RUNTIMES`.
+
+The client list itself is deliberately *not* pinned. yt-dlp's own defaults move
+with YouTube; a list written down here does not, and a stale pin is worse than
+no pin because it puts known-broken clients first.
 
 Downloads run on a small pool of worker threads draining the ``downloads``
 table, so the queue survives a restart: anything left mid-flight is requeued at
@@ -63,6 +68,13 @@ _QUIET_WARNINGS = (
     "Signature solving failed: Some formats may be missing",
     "n challenge solving failed: Some formats may be missing",
     "Some web client https formats have been skipped",
+    # SABR. yt-dlp emits this once per client per video whenever it tries a
+    # client YouTube has moved off plain HTTPS formats, then falls through to
+    # one that works. It is a running commentary on yt-dlp's fallback order,
+    # not a failure of ours, and at one line per candidate it drowns out
+    # everything else. A download that genuinely finds no usable format fails
+    # with its own error, which is not filtered.
+    "formats have been skipped as they are missing a URL",
 )
 
 # FFmpegExtractAudio names its output after the codec, except Vorbis.
@@ -221,12 +233,22 @@ def _ydl_options(**overrides) -> dict[str, Any]:
         "fragment_retries": 10,
         "extractor_retries": 3,
         "socket_timeout": 30,
-        # Which YouTube clients may be tried, in order — see the module
-        # docstring. Without this, the default client returns no audio formats.
-        "extractor_args": {"youtube": {"player_client": config.player_clients()}},
+        "extractor_args": {"youtube": {}},
+        # A JS runtime plus yt-dlp's external JS components, which is what the
+        # clients that still serve real format URLs require — see the module
+        # docstring. Without these, every client is either SABR-only or
+        # unsolvable and nothing downloads.
+        "js_runtimes": config.js_runtimes(),
+        "remote_components": config.remote_components(),
         # Light pacing so back-to-back downloads do not trigger a 429.
         "sleep_interval_requests": 1,
     }
+
+    # Only ever sent when explicitly configured. Left unset, yt-dlp chooses,
+    # and its choice tracks YouTube's current behaviour.
+    clients = config.player_clients()
+    if clients:
+        options["extractor_args"]["youtube"]["player_client"] = clients
 
     tokens = config.po_tokens()
     if tokens:
@@ -251,11 +273,19 @@ def _ydl_options(**overrides) -> dict[str, Any]:
 
 
 def search_youtube(artist: str, title: str, limit: int = 5) -> list[Candidate]:
-    """Fall back to a plain YouTube search."""
+    """Fall back to a plain YouTube search.
+
+    Flat extraction matters here. Resolving each hit in full means a complete
+    player round-trip per result — five of them, to pick one — which is both
+    the bulk of a search's wall time and the reason a single failed match used
+    to emit a screenful of client warnings. The search page already carries the
+    title, duration and channel that scoring needs; formats are only resolved
+    for the one candidate that actually wins.
+    """
     import yt_dlp
 
     try:
-        with yt_dlp.YoutubeDL(_ydl_options(skip_download=True, extract_flat=False)) as ydl:
+        with yt_dlp.YoutubeDL(_ydl_options(skip_download=True, extract_flat="in_playlist")) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{artist} {title} audio", download=False)
     except Exception as exc:
         log.warning("YouTube search failed for %s - %s: %s", artist, title, exc)
@@ -271,13 +301,27 @@ def search_youtube(artist: str, title: str, limit: int = 5) -> list[Candidate]:
             Candidate(
                 url=url,
                 title=entry.get("title", ""),
-                artist=entry.get("artist") or entry.get("uploader") or "",
+                artist=_channel_artist(entry),
                 album=entry.get("album") or "",
                 duration=int(entry.get("duration") or 0),
                 source="youtube",
             )
         )
     return candidates
+
+
+def _channel_artist(entry: dict[str, Any]) -> str:
+    """The artist to credit a plain-YouTube hit to.
+
+    YouTube auto-generates a channel per artist for label-delivered music and
+    names it "<Artist> - Topic". Those are the closest thing a plain YouTube
+    search has to catalogue metadata, so the suffix is stripped and what is
+    left is treated as the artist. Scoring refuses to download anything it
+    cannot attribute, so recovering this is the difference between a Topic
+    upload matching and being thrown away as unattributable.
+    """
+    name = (entry.get("artist") or entry.get("channel") or entry.get("uploader") or "").strip()
+    return re.sub(r"\s*-\s*Topic$", "", name, flags=re.IGNORECASE).strip()
 
 
 def best_match(artist: str, title: str, expected: int = 0) -> Candidate | None:
@@ -509,8 +553,14 @@ def fetch(download_id: int) -> None:
     _progress[download_id] = 0
 
     try:
-        if not config.MUSIC_DIR.exists():
-            raise DownloadError(f"MUSIC_DIR {config.MUSIC_DIR} does not exist")
+        # Checked before the download rather than after it. The old check only
+        # asked whether the directory existed, which an unwritable mount does,
+        # so the failure landed at the final mkdir — having already spent the
+        # search, the transfer and the encode on a file that could never be
+        # filed. Failing here costs nothing and says what to fix.
+        problem = config.music_dir_problem()
+        if problem:
+            raise DownloadError(problem)
 
         # A row that already carries a source URL came from a pasted link —
         # the user named the exact recording, so there is nothing to match.
@@ -662,10 +712,10 @@ def enqueue(suggestion_id: int) -> int | None:
             return existing["id"]
 
         cursor = conn.execute(
-            "INSERT INTO downloads (suggestion_id, track_key, artist, title, album, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO downloads (suggestion_id, user_id, track_key, artist, title, album, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
-                suggestion_id, row["track_key"], row["artist"], row["title"],
+                suggestion_id, row["user_id"], row["track_key"], row["artist"], row["title"],
                 row["album"], db.now(),
             ),
         )
@@ -680,7 +730,7 @@ def enqueue(suggestion_id: int) -> int | None:
 
 
 def enqueue_direct(*, artist: str, title: str, album: str = "", url: str = "",
-                   source: str = "url") -> int:
+                   source: str = "url", user_id: int | None = None) -> int:
     """Queue a track the user named directly, by pasted link or by hand.
 
     When ``url`` is set the download skips matching entirely — the link already
@@ -688,9 +738,9 @@ def enqueue_direct(*, artist: str, title: str, album: str = "", url: str = "",
     """
     with db.connect() as conn:
         cursor = conn.execute(
-            "INSERT INTO downloads (track_key, artist, title, album, source_url, source, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (track_key(artist, title), artist, title, album, url, source, db.now()),
+            "INSERT INTO downloads (user_id, track_key, artist, title, album, source_url, source, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, track_key(artist, title), artist, title, album, url, source, db.now()),
         )
         download_id = cursor.lastrowid
 
@@ -698,7 +748,7 @@ def enqueue_direct(*, artist: str, title: str, album: str = "", url: str = "",
     return download_id
 
 
-def auto_enqueue(scan_id: int | None = None) -> int:
+def auto_enqueue(scan_id: int | None = None, user_id: int | None = None) -> int:
     """Queue high-confidence suggestions, if auto-download is switched on.
 
     The daily cap counts finished downloads in the last 24 hours, so a runaway
@@ -716,11 +766,14 @@ def auto_enqueue(scan_id: int | None = None) -> int:
     query = (
         "SELECT id FROM suggestions WHERE status = 'new' AND match >= ? "
         + ("AND scan_id = ? " if scan_id else "")
+        + ("AND user_id = ? " if user_id else "")
         + "ORDER BY match DESC LIMIT ?"
     )
     params: list[Any] = [int(settings["auto_download_threshold"])]
     if scan_id:
         params.append(scan_id)
+    if user_id:
+        params.append(user_id)
     params.append(remaining)
 
     with db.connect() as conn:
