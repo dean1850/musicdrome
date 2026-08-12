@@ -24,7 +24,7 @@ def test_listenbrainz_never_sends_max_ts_and_min_ts_together(monkeypatch):
     """The endpoint accepts one bound or the other, never both in one call."""
     calls = []
 
-    def fake_get(path, params):
+    def fake_get(path, params, **kw):
         calls.append(params)
         if len(calls) > 3:
             return {"payload": {"listens": []}}
@@ -43,7 +43,7 @@ def test_listenbrainz_never_sends_max_ts_and_min_ts_together(monkeypatch):
 
 
 def test_listenbrainz_first_page_is_unbounded(monkeypatch):
-    monkeypatch.setattr(listenbrainz, "_get", lambda p, params: {"payload": {"listens": []}})
+    monkeypatch.setattr(listenbrainz, "_get", lambda p, params, **kw: {"payload": {"listens": []}})
     monkeypatch.setattr(listenbrainz.config, "LISTENBRAINZ_USER", "someone")
 
     list(listenbrainz.recent_tracks(since=1_000))
@@ -52,7 +52,7 @@ def test_listenbrainz_first_page_is_unbounded(monkeypatch):
 
 def test_listenbrainz_stops_at_the_cursor(monkeypatch):
     page = [listen(1_200), listen(1_100), listen(900), listen(800)]
-    monkeypatch.setattr(listenbrainz, "_get", lambda p, params: {"payload": {"listens": page}})
+    monkeypatch.setattr(listenbrainz, "_get", lambda p, params, **kw: {"payload": {"listens": page}})
     monkeypatch.setattr(listenbrainz.config, "LISTENBRAINZ_USER", "someone")
 
     plays = list(listenbrainz.recent_tracks(since=1_000))
@@ -66,7 +66,7 @@ def test_listenbrainz_walks_backwards_with_max_ts(monkeypatch):
     ]
     seen = []
 
-    def fake_get(path, params):
+    def fake_get(path, params, **kw):
         seen.append(params.get("max_ts"))
         return {"payload": {"listens": pages[len(seen) - 1] if len(seen) <= len(pages) else []}}
 
@@ -81,7 +81,7 @@ def test_listenbrainz_walks_backwards_with_max_ts(monkeypatch):
 
 def test_listenbrainz_ignores_entries_without_a_timestamp(monkeypatch):
     page = [{"listened_at": 0, "track_metadata": {"artist_name": "A", "track_name": "B"}}]
-    monkeypatch.setattr(listenbrainz, "_get", lambda p, params: {"payload": {"listens": page}})
+    monkeypatch.setattr(listenbrainz, "_get", lambda p, params, **kw: {"payload": {"listens": page}})
     monkeypatch.setattr(listenbrainz.config, "LISTENBRAINZ_USER", "someone")
 
     assert list(listenbrainz.recent_tracks()) == []

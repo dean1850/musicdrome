@@ -16,8 +16,11 @@ work without duplicating the file.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,6 +79,21 @@ LISTENBRAINZ_USER = _env("LISTENBRAINZ_USER")
 LISTENBRAINZ_TOKEN = _env("LISTENBRAINZ_TOKEN")
 LISTENBRAINZ_API_URL = _env("LISTENBRAINZ_API_URL", default="https://api.listenbrainz.org")
 
+# ─── Navidrome ─────────────────────────────────────────────────────────────
+# Optional, and only ever read: Musicdrome asks Navidrome for the list of
+# accounts on the server so a household does not have to be typed in by hand.
+#
+# What it cannot do is discover who those people are on Last.fm. Navidrome's
+# Subsonic `getUsers` returns username, email and roles — it deliberately never
+# exposes a user's linked Last.fm or ListenBrainz account, even to an admin. So
+# the roster arrives automatically and the scrobble usernames are filled in
+# once, per person, in Settings.
+#
+# Listing users is an admin-only call, so these must be admin credentials.
+NAVIDROME_URL = _env("NAVIDROME_URL").rstrip("/")
+NAVIDROME_USER = _env("NAVIDROME_USER")
+NAVIDROME_PASSWORD = _env("NAVIDROME_PASSWORD")
+
 MUSICBRAINZ_API_URL = _env("MUSICBRAINZ_API_URL", default="https://musicbrainz.org/ws/2")
 MUSICBRAINZ_USER_AGENT = _env(
     "MUSICBRAINZ_USER_AGENT",
@@ -111,16 +129,30 @@ AUDIO_FORMAT = _env("AUDIO_FORMAT", default="mp3").lower()
 AUDIO_BITRATE = _env("AUDIO_BITRATE", default="320")
 FFMPEG_PATH = _env("FFMPEG_PATH", default="/usr/bin/ffmpeg")
 
-# Which YouTube player clients yt-dlp may use, in order. This is the single
-# most important download setting: YouTube's `web` client now needs a
-# JavaScript runtime to solve its signature and n-challenges, and there isn't
-# one in this container — so it returns a player response with no audio
-# formats at all, which surfaces as "Requested format is not available" or
-# "The page needs to be reloaded". `ios` and `android` still serve audio
-# without a JS runtime, so they lead.
-YTDLP_PLAYER_CLIENTS = _env(
-    "YTDLP_PLAYER_CLIENTS", default="ios,android,web_embedded,mweb,web,tv"
-)
+# Which YouTube player clients yt-dlp may use, in order. Empty is the right
+# answer and the default: yt-dlp picks its own, and those defaults move every
+# time YouTube changes something. Pinning a list here freezes that decision at
+# the moment the list was written, which is how this setting previously ended
+# up leading with `ios` and `android` — the two clients YouTube has since moved
+# to SABR-only delivery, where the player response carries no format URLs at
+# all. That is what fills the log with "Some android client https formats have
+# been skipped as they are missing a URL" and yt-dlp/yt-dlp#12482.
+#
+# Set this only to work around a specific, current breakage, and clear it again
+# afterwards. yt-dlp's own defaults track upstream; a pin here does not.
+YTDLP_PLAYER_CLIENTS = _env("YTDLP_PLAYER_CLIENTS")
+
+# The clients that do still carry format URLs need a JavaScript runtime to
+# solve YouTube's signature and n-challenges, plus yt-dlp's external JS
+# components ("EJS") which are fetched on demand rather than bundled. Without
+# both, every remaining client is either SABR-only or unsolvable and downloads
+# fail with messages that never mention the real cause.
+#
+# The image installs Node for this. `deno` is yt-dlp's own default and is
+# faster, but it is not in Debian and would mean pulling a binary from GitHub
+# at build time.
+YTDLP_JS_RUNTIMES = _env("YTDLP_JS_RUNTIMES", default="node")
+YTDLP_REMOTE_COMPONENTS = _env("YTDLP_REMOTE_COMPONENTS", default="ejs:github")
 
 # Escape hatches for networks, rate limits and bot checks — not everyday
 # settings. PO tokens look like "<client>.<context>+<token>", comma separated.
@@ -142,18 +174,63 @@ def player_clients() -> list[str]:
 def po_tokens() -> list[str]:
     return [t.strip() for t in YTDLP_PO_TOKEN.split(",") if t.strip()]
 
+
+def js_runtimes() -> dict[str, dict]:
+    """yt-dlp's ``js_runtimes`` option: ``{"node": {}}``, or empty to disable."""
+    return {name.strip().lower(): {} for name in YTDLP_JS_RUNTIMES.split(",") if name.strip()}
+
+
+def remote_components() -> list[str]:
+    return [c.strip() for c in YTDLP_REMOTE_COMPONENTS.split(",") if c.strip()]
+
 TESTING = _env("MUSICDROME_TESTING").lower() in {"1", "true", "yes"}
 
 
+def music_dir_problem() -> str:
+    """Why MUSIC_DIR cannot be written to, or ``""`` if it can.
+
+    ``exists()`` is not the question — an unwritable mount exists perfectly
+    happily, which is how a container can boot looking healthy and then fail
+    every download at the final ``mkdir``, after the audio has already been
+    fetched and encoded. So this actually creates and removes a file.
+
+    The message names the uid and gid we are running as and the ones that own
+    the directory, because the fix is always to reconcile those two.
+    """
+    if not MUSIC_DIR.exists():
+        return f"{MUSIC_DIR} does not exist — check the volume mount"
+    if not MUSIC_DIR.is_dir():
+        return f"{MUSIC_DIR} is not a directory"
+
+    probe = MUSIC_DIR / ".musicdrome-write-test"
+    try:
+        probe.touch()
+        probe.unlink()
+        return ""
+    except OSError as exc:
+        try:
+            stat = MUSIC_DIR.stat()
+            owner = f"owned by {stat.st_uid}:{stat.st_gid}"
+        except OSError:
+            owner = "owner unknown"
+        return (
+            f"{MUSIC_DIR} is not writable ({exc.strerror}). Running as "
+            f"{os.getuid()}:{os.getgid()}, directory is {owner}. Set PUID/PGID "
+            f"in .env to a user that can write there, or fix the mount."
+        )
+
+
 def ensure_directories() -> None:
-    """Create the directories we own. MUSIC_DIR may be a read-only mount."""
+    """Create the directories we own, reporting anything we could not."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     for path in (MUSIC_DIR, PLAYLIST_DIR):
         try:
             path.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass  # read-only mount — downloads will report the failure
+        except OSError as exc:
+            # Not fatal — the app still serves suggestions and stats — but it
+            # must never be silent, which is what it used to be.
+            log.warning("could not create %s: %s", path, exc)
 
 
 def history_sources() -> list[str]:

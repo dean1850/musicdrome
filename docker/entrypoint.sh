@@ -2,8 +2,18 @@
 # Boot sequence: refresh yt-dlp, drop to PUID/PGID, start the server.
 set -e
 
-PUID="${PUID:-1000}"
-PGID="${PGID:-1000}"
+# Root by default, because the common case for MUSIC_DIR is a network share or
+# a media directory owned by root, which a dropped-privilege process cannot
+# write to — and that failure lands at the very end of a download, after the
+# audio has been fetched and encoded.
+#
+# The tradeoff is real: downloaded files end up owned by root. UMASK keeps them
+# readable by everyone else, so Plex, Navidrome or Jellyfin can still serve
+# them. Set PUID/PGID to your own id in .env if you would rather not run as
+# root — see .env.example.
+PUID="${PUID:-0}"
+PGID="${PGID:-0}"
+umask "${UMASK:-022}"
 
 start() {
     exec uvicorn app.main:app \
@@ -36,6 +46,7 @@ if [ "${YTDLP_AUTO_UPDATE:-true}" = "true" ]; then
 fi
 
 if [ "$(id -u)" != "0" ] || [ "$PUID" = "0" ]; then
+    echo "Musicdrome running as $(id -u):$(id -g) (umask ${UMASK:-022})"
     start
 fi
 

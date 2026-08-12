@@ -1,8 +1,8 @@
 """yt-dlp configuration, format handling, temp sweeping and retry-all.
 
-The yt-dlp option tests are the important ones: the player-client list is what
-makes downloads work at all, and its absence fails with messages that name
-neither yt-dlp nor the client ("Requested format is not available").
+The yt-dlp option tests are the important ones: whether downloads work at all
+comes down to the JS runtime and to *not* pinning a stale player-client list,
+and both fail with messages that name neither yt-dlp nor the real cause.
 """
 
 import time
@@ -15,17 +15,32 @@ from app import config, db, download
 # ─── yt-dlp options ────────────────────────────────────────────────────────
 
 
-def test_player_clients_are_always_set_and_ios_leads():
-    clients = download._ydl_options()["extractor_args"]["youtube"]["player_client"]
-    assert clients[:2] == ["ios", "android"], (
-        "ios/android must lead: they serve audio without a JS runtime, "
-        "which the container does not have"
-    )
+def test_player_clients_are_left_to_yt_dlp_by_default():
+    """A pin here freezes yt-dlp's choice at the moment it was written.
+
+    This is the regression that produced yt-dlp/yt-dlp#12482 in the logs: the
+    list led with ios/android long after YouTube moved both to SABR-only, so
+    every video tried two dead clients first.
+    """
+    youtube = download._ydl_options()["extractor_args"]["youtube"]
+    assert "player_client" not in youtube
 
 
 def test_player_clients_are_overridable(monkeypatch):
     monkeypatch.setattr(config, "YTDLP_PLAYER_CLIENTS", "tv,web")
     assert download._ydl_options()["extractor_args"]["youtube"]["player_client"] == ["tv", "web"]
+
+
+def test_a_js_runtime_and_ejs_components_are_enabled():
+    """Without both, every client is either SABR-only or unsolvable."""
+    options = download._ydl_options()
+    assert options["js_runtimes"] == {"node": {}}
+    assert "ejs:github" in options["remote_components"]
+
+
+def test_js_runtime_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_JS_RUNTIMES", "")
+    assert download._ydl_options()["js_runtimes"] == {}
 
 
 def test_retries_are_generous_enough_for_a_flaky_cdn():
@@ -74,10 +89,74 @@ def test_known_harmless_warnings_are_swallowed(caplog):
     assert not caplog.records
 
 
+def test_the_sabr_warning_is_swallowed(caplog):
+    """One line per client per video, on a scan of forty tracks. It buried
+    everything that actually mattered — including the permission error that was
+    the real reason nothing was being filed."""
+    download._YtdlpLogger.warning(
+        "[youtube] p8YifQtbed4: Some android client https formats have been skipped as "
+        "they are missing a URL. YouTube may have enabled the SABR-only streaming "
+        "experiment for the current session. See  "
+        "https://github.com/yt-dlp/yt-dlp/issues/12482  for more details"
+    )
+    assert not caplog.records
+
+
 def test_real_warnings_still_surface(caplog):
     with caplog.at_level("WARNING"):
         download._YtdlpLogger.warning("something genuinely wrong")
     assert any("something genuinely wrong" in r.message for r in caplog.records)
+
+
+# ─── Search ────────────────────────────────────────────────────────────────
+
+
+def test_search_is_flat_so_one_match_is_not_five_extractions(monkeypatch):
+    """Resolving every hit in full is what made a search take fifteen seconds
+    and emit a screenful of client warnings."""
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, *a, **k):
+            return {"entries": []}
+
+    import sys
+    import types
+
+    fake = types.ModuleType("yt_dlp")
+    fake.YoutubeDL = FakeYDL
+    monkeypatch.setitem(sys.modules, "yt_dlp", fake)
+
+    download.search_youtube("Radiohead", "Karma Police")
+    assert captured["extract_flat"] == "in_playlist"
+
+
+@pytest.mark.parametrize(
+    "entry,expected",
+    [
+        ({"uploader": "MEDUZA - Topic"}, "MEDUZA"),
+        ({"uploader": "Tinlicker - topic"}, "Tinlicker"),
+        ({"channel": "BUNT. - Topic"}, "BUNT."),
+        ({"artist": "Portishead", "uploader": "Some Reuploader"}, "Portishead"),
+        ({"uploader": "Topic Records"}, "Topic Records"),
+        ({}, ""),
+    ],
+)
+def test_topic_channels_are_credited_to_the_artist(entry, expected):
+    """YouTube's auto-generated "<Artist> - Topic" channels are the only
+    catalogue metadata a plain search has. Scoring refuses to download anything
+    it cannot attribute, so throwing this away turned real matches into
+    "no confident match"."""
+    assert download._channel_artist(entry) == expected
 
 
 # ─── Audio format ──────────────────────────────────────────────────────────

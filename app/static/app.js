@@ -23,7 +23,18 @@ const state = {
   scanning: false,
   fastPoll: null,
   statusPoll: null,
+  // Who is looking. Remembered across reloads so a household does not have to
+  // re-pick on every visit; the server treats an unknown id as "the default
+  // user" rather than an error, so a stale value here is harmless.
+  userId: Number(localStorage.getItem('musicdrome.userId')) || null,
+  users: [],
 };
+
+/** Append the selected user to a query string, when one is selected. */
+function withUser(params) {
+  if (state.userId) params.set('user_id', String(state.userId));
+  return params;
+}
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -93,7 +104,7 @@ async function loadDiscover() {
   });
   if (state.tag) query.set('tag', state.tag);
 
-  const data = await api(`/suggestions?${query}`);
+  const data = await api(`/suggestions?${withUser(query)}`);
   renderTags(data.tags);
   renderCards(data.suggestions);
 }
@@ -207,7 +218,8 @@ async function act(id, action, button) {
 // ─── Downloads ──────────────────────────────────────────────────────────
 
 async function loadDownloads() {
-  const data = await api(`/downloads?status=${state.downloadStatus}`);
+  const data = await api(`/downloads?${withUser(
+    new URLSearchParams({ status: state.downloadStatus }))}`);
   const active = new Map(data.active.map((item) => [item.id, item]));
   const body = $('#downloads-table tbody');
   const empty = $('#downloads-empty');
@@ -268,7 +280,7 @@ async function loadDownloads() {
 // ─── Stats ──────────────────────────────────────────────────────────────
 
 async function loadStats() {
-  const data = await api(`/stats?days=${state.days}`);
+  const data = await api(`/stats?${withUser(new URLSearchParams({ days: state.days }))}`);
 
   $('#stat-tiles').innerHTML = [
     ['Plays', data.plays.toLocaleString()],
@@ -325,7 +337,8 @@ async function loadSummary(refresh) {
   panel.hidden = false;
 
   try {
-    const data = await api(`/stats/summary?days=${state.days}&refresh=${refresh}`);
+    const data = await api(`/stats/summary?${withUser(
+      new URLSearchParams({ days: state.days, refresh }))}`);
     if (!data.enabled) { panel.hidden = true; return; }
     panel.innerHTML = `<span class="label">Your taste</span>${
       escapeHtml(data.text || data.error || 'No summary yet.')}`;
@@ -393,7 +406,7 @@ function renderConnections(status) {
 async function refreshStatus() {
   let status;
   try {
-    status = await api('/status');
+    status = await api(`/status?${withUser(new URLSearchParams())}`);
   } catch {
     $('#scan-state').textContent = 'offline';
     return;
@@ -427,6 +440,7 @@ async function refreshStatus() {
 
   $('#scan-now').disabled = state.scanning;
   renderSettings(status.settings);
+  renderUserPicker(status);
   renderConnections(status);
   showSetupBanner(status);
 
@@ -447,8 +461,13 @@ function showSetupBanner(status) {
   const banner = $('#banner');
   const problems = [];
 
+  // First, because it is the one that silently wastes a whole scan: everything
+  // else works and every download dies on the final write.
+  if (status.music_dir_problem) {
+    problems.push(`Downloads cannot be saved. ${status.music_dir_problem}`);
+  }
   if (!status.history.sources.some((source) => source.configured)) {
-    problems.push('No listening history configured — set LASTFM_API_KEY and LASTFM_USER, or LISTENBRAINZ_USER, in .env.');
+    problems.push('No listening history configured — set a Last.fm or ListenBrainz username for a listener in Settings.');
   }
   if (!status.ai.available) {
     problems.push(`The ${status.ai.provider} backend is not configured — set its key or URL in .env.`);
@@ -456,6 +475,105 @@ function showSetupBanner(status) {
 
   banner.hidden = !problems.length;
   banner.textContent = problems.join(' ');
+}
+
+// ─── Listeners ──────────────────────────────────────────────────────────
+
+function renderUserPicker(status) {
+  state.users = status.users || [];
+  // The server decides who the default is; mirror it so the first request
+  // after a reload and every one after it agree on the same person.
+  if (!state.userId && status.user_id) state.userId = status.user_id;
+
+  const picker = $('#user-picker');
+  const select = $('#f-user');
+  const active = state.users.filter((user) => user.active);
+
+  // A one-person household should not see a chooser at all.
+  picker.hidden = active.length < 2;
+
+  select.innerHTML = active
+    .map((user) => `<option value="${user.id}" ${user.id === state.userId ? 'selected' : ''}>
+        ${escapeHtml(user.name)}</option>`)
+    .join('');
+
+  $('#navidrome-row').hidden = !status.navidrome;
+  renderUsersList();
+}
+
+function renderUsersList() {
+  const container = $('#users-list');
+  if (!container) return;
+
+  container.innerHTML = state.users.map((user) => `
+    <div class="user-row ${user.active ? '' : 'is-off'}" data-user="${user.id}">
+      <div class="user-name">
+        ${escapeHtml(user.name)}
+        ${user.source === 'navidrome' ? '<span class="pill">Navidrome</span>' : ''}
+      </div>
+      <input type="text" data-field="lastfm_user" placeholder="Last.fm username"
+             value="${escapeHtml(user.lastfm_user)}">
+      <input type="text" data-field="listenbrainz_user" placeholder="ListenBrainz username"
+             value="${escapeHtml(user.listenbrainz_user)}">
+      <input type="password" data-field="listenbrainz_token"
+             placeholder="${user.has_listenbrainz_token ? '•••••• (set)' : 'ListenBrainz token (optional)'}">
+      <label class="user-active" title="Include in scheduled scans">
+        <input type="checkbox" data-field="active" ${user.active ? 'checked' : ''}>
+        <span>Active</span>
+      </label>
+      <button class="btn btn-icon" data-remove-user="${user.id}" title="Remove listener">✕</button>
+    </div>`).join('') || '<p class="muted">No listeners yet.</p>';
+
+  container.querySelectorAll('.user-row').forEach((row) => {
+    const id = Number(row.dataset.user);
+    row.querySelectorAll('[data-field]').forEach((input) => {
+      input.onchange = async () => {
+        const value = input.type === 'checkbox' ? input.checked : input.value.trim();
+        try {
+          await api(`/users/${id}`, {
+            method: 'PUT',
+            body: JSON.stringify({ [input.dataset.field]: value }),
+          });
+          toast('Saved');
+          if (input.dataset.field === 'listenbrainz_token') input.value = '';
+          refreshStatus();
+        } catch (error) {
+          toast(error.message, true);
+        }
+      };
+    });
+  });
+
+  container.querySelectorAll('[data-remove-user]').forEach((button) => {
+    button.onclick = async () => {
+      const id = Number(button.dataset.removeUser);
+      const user = state.users.find((candidate) => candidate.id === id);
+      if (!confirm(`Remove ${user ? user.name : 'this listener'}? Their listening history and suggestions go too. Downloaded files are kept.`)) return;
+      try {
+        await api(`/users/${id}`, { method: 'DELETE' });
+        if (state.userId === id) {
+          state.userId = null;
+          localStorage.removeItem('musicdrome.userId');
+        }
+        toast('Listener removed');
+        refreshStatus();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    };
+  });
+}
+
+function selectUser(userId) {
+  state.userId = userId;
+  localStorage.setItem('musicdrome.userId', String(userId));
+  refreshStatus();
+  ({
+    discover: loadDiscover,
+    downloads: loadDownloads,
+    stats: loadStats,
+    settings: () => {},
+  }[state.tab])();
 }
 
 function startFastPoll() {
@@ -491,13 +609,51 @@ function init() {
 
   $('#scan-now').onclick = async () => {
     try {
-      await api('/scan', { method: 'POST' });
+      await api('/scan', { method: 'POST', body: JSON.stringify({ user_id: state.userId }) });
       state.scanning = true;
       $('#scan-now').disabled = true;
       toast('Scan started');
       refreshStatus();
     } catch (error) {
       toast(error.message, true);
+    }
+  };
+
+  $('#f-user').onchange = (event) => selectUser(Number(event.target.value));
+
+  $('#user-add').onsubmit = async (event) => {
+    event.preventDefault();
+    const name = $('#user-name').value.trim();
+    if (!name) return;
+    try {
+      await api('/users', {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          lastfm_user: $('#user-lastfm').value.trim(),
+          listenbrainz_user: $('#user-listenbrainz').value.trim(),
+        }),
+      });
+      event.target.reset();
+      toast(`Added ${name}`);
+      refreshStatus();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  };
+
+  $('#discover-users').onclick = async (event) => {
+    event.target.disabled = true;
+    try {
+      const data = await api('/users/discover', { method: 'POST' });
+      toast(data.added.length
+        ? `Imported ${data.added.join(', ')}`
+        : 'No new listeners on Navidrome');
+      refreshStatus();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      event.target.disabled = false;
     }
   };
 
@@ -510,7 +666,7 @@ function init() {
     if (!confirm(`Queue every new track at ${state.minMatch}% or above?`)) return;
     const data = await api('/suggestions/download-all', {
       method: 'POST',
-      body: JSON.stringify({ min_match: state.minMatch }),
+      body: JSON.stringify({ min_match: state.minMatch, user_id: state.userId }),
     });
     toast(`Queued ${data.queued} downloads`);
     startFastPoll();
@@ -530,7 +686,7 @@ function init() {
     try {
       const data = await api('/downloads/url', {
         method: 'POST',
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, user_id: state.userId }),
       });
       input.value = '';
       toast(data.matched

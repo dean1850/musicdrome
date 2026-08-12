@@ -24,6 +24,12 @@
   </nav>
 
   <div class="topbar-actions">
+    <!-- Who is looking. Hidden entirely while the household has one member,
+         so a single-user install never sees a control it does not need. -->
+    <label id="user-picker" class="user-picker" hidden>
+      <span class="sr-only">Listener</span>
+      <select id="f-user" title="Whose recommendations to show"></select>
+    </label>
     <span id="scan-state" class="scan-state"></span>
     <button id="scan-now" class="btn btn-primary">Scan now</button>
   </div>
@@ -161,6 +167,29 @@
   <!-- ─── Settings ─────────────────────────────────────────────────── -->
   <section id="tab-settings" class="panel">
     <div class="settings-grid">
+
+      <div class="card-block card-block-wide">
+        <h2>Listeners</h2>
+        <p class="hint">Everyone in the house gets their own recommendations, from
+          their own scrobbles. The music library and the download queue are shared —
+          one collection, several tastes.</p>
+
+        <div id="users-list" class="users-list"></div>
+
+        <form id="user-add" class="user-add">
+          <input type="text" id="user-name" placeholder="Name" required>
+          <input type="text" id="user-lastfm" placeholder="Last.fm username">
+          <input type="text" id="user-listenbrainz" placeholder="ListenBrainz username">
+          <button type="submit" class="btn">Add listener</button>
+        </form>
+
+        <div id="navidrome-row" class="navidrome-row" hidden>
+          <button id="discover-users" class="btn">Import from Navidrome</button>
+          <span class="hint">Brings across the account names on your Navidrome
+            server. Their Last.fm and ListenBrainz usernames still have to be
+            filled in here — Navidrome never exposes those.</span>
+        </div>
+      </div>
 
       <div class="card-block">
         <h2>Scanning</h2>

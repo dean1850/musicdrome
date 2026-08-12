@@ -18,14 +18,25 @@ import logging
 import threading
 from typing import Any
 
-from . import ai, config, db, exclude, history
+from . import ai, db, exclude, history, users
 from .norm import artist_key, track_key
 from .sources import lastfm, musicbrainz
 
 log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_state: dict[str, Any] = {"running": False, "step": "", "done": 0, "total": 0, "scan_id": None}
+_state: dict[str, Any] = {
+    "running": False, "step": "", "done": 0, "total": 0, "scan_id": None,
+    "user_id": None, "user": "",
+}
+
+
+def _history_configured(user_id: int) -> bool:
+    """Whether this user has at least one usable scrobble identity."""
+    return any(
+        is_configured(history._identity(users.get(user_id) or {}, name).get("user", ""))
+        for name, (is_configured, _) in history.SOURCES.items()
+    )
 
 SYSTEM_PROMPT = """You are a music recommender for one listener's personal collection.
 
@@ -179,8 +190,16 @@ def enrich(item: dict[str, Any]) -> dict[str, Any]:
 # ─── The scan ──────────────────────────────────────────────────────────────
 
 
-def run(trigger: str = "manual") -> dict[str, Any]:
-    """Run one full scan. Raises rather than swallowing a configuration error."""
+def run(trigger: str = "manual", user_id: int | None = None) -> dict[str, Any]:
+    """Run one full scan, for one user. Raises rather than swallowing a
+    configuration error.
+
+    A scan belongs to exactly one person: it reads their scrobbles, builds their
+    profile and files the cards under their name. Scanning "the household" is
+    :func:`run_for_everyone`, which is this in a loop — averaging two people's
+    taste into one prompt would produce recommendations for a listener who does
+    not exist.
+    """
     if not _lock.acquire(blocking=False):
         raise RuntimeError("a scan is already running")
 
@@ -189,13 +208,21 @@ def run(trigger: str = "manual") -> dict[str, Any]:
     scan_id = None
 
     try:
-        _state.update(running=True, step="starting", done=0, total=batch_size, scan_id=None)
+        user_id = users.resolve(user_id)
+        if user_id is None:
+            raise RuntimeError("no users configured — add one in Settings")
+        user = users.get(user_id) or {}
+
+        _state.update(
+            running=True, step="starting", done=0, total=batch_size, scan_id=None,
+            user_id=user_id, user=user.get("name", ""),
+        )
 
         with db.connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO scans (started_at, trigger, provider, model, requested) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (db.now(), trigger, ai.provider(), ai.model(), batch_size),
+                "INSERT INTO scans (started_at, trigger, provider, model, requested, user_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (db.now(), trigger, ai.provider(), ai.model(), batch_size, user_id),
             )
             scan_id = cursor.lastrowid
         _state["scan_id"] = scan_id
@@ -204,24 +231,25 @@ def run(trigger: str = "manual") -> dict[str, Any]:
             raise RuntimeError(
                 f"the {ai.provider()} backend is not configured — set its API key in .env"
             )
-        if not config.history_sources():
+        if not _history_configured(user_id):
             raise RuntimeError(
-                "no listening history configured — set LASTFM_API_KEY and LASTFM_USER, "
-                "or LISTENBRAINZ_USER, in .env"
+                f"no listening history configured for {user.get('name', 'this user')} — "
+                "set their Last.fm or ListenBrainz username in Settings"
             )
 
         _state["step"] = "reading scrobbles"
-        history.sync()
+        history.sync(user_id)
 
         _state["step"] = "indexing your library"
         exclude.scan_library()
 
         _state["step"] = "building your profile"
-        profile = history.profile(days=int(settings["history_days"]))
+        profile = history.profile(days=int(settings["history_days"]), user_id=user_id)
         if profile["plays"] == 0:
             raise RuntimeError(
-                f"no plays in the last {settings['history_days']} days — "
-                "widen the history window in Settings, or check your Last.fm username"
+                f"no plays for {user.get('name', 'this user')} in the last "
+                f"{settings['history_days']} days — widen the history window in "
+                "Settings, or check their scrobble username"
             )
 
         excluded = exclude.build()
@@ -233,7 +261,7 @@ def run(trigger: str = "manual") -> dict[str, Any]:
         log.info("scan %s: model returned %d recommendations", scan_id, len(items))
 
         _state.update(step="checking against your library", total=len(items) or batch_size)
-        kept = _store(scan_id, items, excluded)
+        kept = _store(scan_id, items, excluded, user_id)
 
         with db.connect() as conn:
             conn.execute(
@@ -270,7 +298,9 @@ def _recommendations(answer: Any) -> list[dict[str, Any]]:
     return answer if isinstance(answer, list) else []
 
 
-def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int:
+def _store(
+    scan_id: int, items: list[dict[str, Any]], excluded: set[str], user_id: int | None = None
+) -> int:
     """Enrich and insert, skipping anything excluded before or after enrichment."""
     kept = 0
     seen: set[str] = set()
@@ -307,16 +337,18 @@ def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int
 
         with db.connect() as conn:
             conn.execute(
-                "INSERT INTO suggestions (scan_id, track_key, artist, title, album, year, "
+                "INSERT INTO suggestions (scan_id, user_id, track_key, artist, title, album, year, "
                 "track_no, match, reason, seed, tags, cover_url, duration, recording_mbid, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT (track_key) DO UPDATE SET "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                # Scoped to the user, so re-suggesting a track refreshes that
+                # person's card and leaves anyone else's alone.
+                "ON CONFLICT (user_id, track_key) DO UPDATE SET "
                 "  scan_id = excluded.scan_id, match = excluded.match, "
                 "  reason = excluded.reason, seed = excluded.seed, "
                 "  created_at = excluded.created_at "
                 "WHERE suggestions.status = 'new'",
                 (
-                    scan_id, canonical, enriched["artist"], enriched["title"],
+                    scan_id, user_id, canonical, enriched["artist"], enriched["title"],
                     enriched["album"], enriched["year"], enriched["track_no"], match,
                     str(item.get("reason", ""))[:400], str(item.get("seed", ""))[:120],
                     ",".join(enriched["tags"]), enriched["cover_url"],
@@ -340,19 +372,32 @@ def _purge(retention_days: int) -> None:
         conn.execute("DELETE FROM suggestions WHERE status = 'new' AND created_at < ?", (cutoff,))
 
 
-def run_in_background(trigger: str = "manual") -> bool:
-    """Start a scan on its own thread. False if one is already running."""
+def run_in_background(trigger: str = "manual", user_id: int | None = None) -> bool:
+    """Start a scan on its own thread. False if one is already running.
+
+    ``user_id`` of None means every active user, one after another — which is
+    what a scheduled scan wants, so that everybody's grid refreshes overnight
+    rather than only whoever happened to be selected in the UI last.
+    """
     if _state["running"]:
         return False
 
+    targets = [user_id] if user_id else [person["id"] for person in users.active_users()]
+    if not targets:
+        log.warning("scan requested but no users are configured")
+        return False
+
     def target() -> None:
-        try:
-            result = run(trigger)
-        except Exception:
-            return  # already logged and recorded on the scan row
         from . import download
 
-        download.auto_enqueue(result["scan_id"])
+        for index, person_id in enumerate(targets):
+            try:
+                result = run(trigger, person_id)
+            except Exception:
+                continue  # already logged and recorded on that user's scan row
+            download.auto_enqueue(result["scan_id"])
+            if index + 1 < len(targets):
+                log.info("scanning next user (%d of %d)", index + 2, len(targets))
 
     threading.Thread(target=target, name="musicdrome-scan", daemon=True).start()
     return True
