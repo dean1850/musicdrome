@@ -237,6 +237,21 @@ which uid it is running as and which owns the directory. The container runs as
 | CIFS/SMB | Mount with `uid=1000,gid=1000,file_mode=0664,dir_mode=0775` — `chown` does not work on CIFS |
 | NFS | Match the uid on the server, or map it with `anonuid` |
 
+**Read the errno before you chown anything.** The message ends in the reason
+the write failed, and only `Permission denied` / `Read-only file system` are
+about permissions at all. `No such file or directory` or `Stale file handle`
+means the mount behind `MUSIC_DIR` has gone away underneath the container,
+which no amount of `chown` will fix — check the share is still connected.
+Musicdrome words those two cases differently for that reason, and only the
+permissions one mentions `PUID`/`PGID`.
+
+One tell is worth knowing: if the message names the **same uid** for the
+process and the directory — "Running as 0:0, directory is owned by 0:0" — it
+was never a permissions problem. Versions before this fix could report that
+spuriously when two downloads were requeued at the same moment, because the
+concurrent write probes raced to clean up after each other. Fixed; if you see
+it on an older image, the mount is fine and the download is worth retrying.
+
 ### "formats have been skipped as they are missing a URL"
 
 This is [yt-dlp#12482](https://github.com/yt-dlp/yt-dlp/issues/12482) — YouTube
@@ -248,9 +263,30 @@ It becomes a real failure only if every client is SABR-only, which is what
 happens when the client list is pinned to a stale set. So don't pin it —
 `YTDLP_PLAYER_CLIENTS` is empty by default and yt-dlp's own defaults track
 YouTube as it changes. The clients that still serve real URLs need a JavaScript
-runtime to solve YouTube's signature challenges; the image ships Node and lets
-yt-dlp fetch its external JS components (`YTDLP_JS_RUNTIMES`,
-`YTDLP_REMOTE_COMPONENTS`).
+runtime to solve YouTube's signature challenges; the image ships Deno for that,
+plus yt-dlp's solver scripts (`YTDLP_JS_RUNTIMES`, `YTDLP_REMOTE_COMPONENTS`).
+
+### "No supported JavaScript runtime could be found", or HTTP 403
+
+The same root cause, one step earlier. yt-dlp needs an external JavaScript
+runtime to answer YouTube's challenges, and when it cannot find a usable one it
+does not stop — it falls back to clients that need no JavaScript, and YouTube
+answers those with `HTTP Error 403: Forbidden` partway through the download.
+
+**A runtime that is installed but too old counts as missing.** yt-dlp requires
+Deno ≥ 2.3, Node ≥ 22, or QuickJS ≥ 2023-12-9, and anything below the floor is
+ignored exactly as if it were absent. Images built before this fix installed
+Debian's `nodejs` — 18 on bookworm, 20 on trixie — so the runtime was present,
+rejected and never once used. The image now ships Deno, which is yt-dlp's own
+recommended runtime, and Musicdrome logs which runtime it found at boot:
+
+```
+INFO  app.download: javascript: deno 2.9.5
+```
+
+If that line is missing, or an error follows it, downloads will 403. Pull the
+current image; `YTDLP_JS_RUNTIMES` only needs setting if you are running
+outside the image and want to name a runtime of your own.
 
 ### "no confident match on YouTube Music or YouTube"
 

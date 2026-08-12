@@ -34,8 +34,116 @@ def test_player_clients_are_overridable(monkeypatch):
 def test_a_js_runtime_and_ejs_components_are_enabled():
     """Without both, every client is either SABR-only or unsolvable."""
     options = download._ydl_options()
-    assert options["js_runtimes"] == {"node": {}}
+    assert options["js_runtimes"] == {"deno": {}}
     assert "ejs:github" in options["remote_components"]
+
+
+def test_the_default_runtime_is_one_yt_dlp_actually_accepts():
+    """The bug this pins down: Debian's Node is below yt-dlp's floor of 22.
+
+    Naming a runtime is not the same as having a usable one. yt-dlp treats a
+    version below its minimum exactly as it treats a missing binary — it drops
+    to the JS-less clients and YouTube answers those with 403 — so the image
+    shipped `nodejs` for months without a single download ever using it.
+    """
+    yt_dlp = pytest.importorskip("yt_dlp")
+
+    minimums = {
+        name: runtime.MIN_SUPPORTED_VERSION
+        for name, runtime in yt_dlp.globals.supported_js_runtimes.value.items()
+    }
+    for name in config.js_runtimes():
+        assert name in minimums, f"{name} is not a runtime yt-dlp supports"
+
+
+# ─── JS runtime health ─────────────────────────────────────────────────────
+
+
+def _fake_ydl(monkeypatch, runtimes):
+    """Stand in for yt_dlp.YoutubeDL, reporting the runtimes we hand it."""
+    import yt_dlp
+
+    class FakeYDL:
+        def __init__(self, params):
+            self.params = params
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        @property
+        def _js_runtimes(self):
+            return runtimes
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+
+
+def _runtime(name, version, supported):
+    from types import SimpleNamespace
+
+    info = SimpleNamespace(name=name, version=version, supported=supported)
+    return SimpleNamespace(info=info)
+
+
+def test_a_working_runtime_reports_no_problem(monkeypatch):
+    _fake_ydl(monkeypatch, {"deno": _runtime("deno", "2.9.5", True)})
+    assert download.js_runtime_problem() == ""
+
+
+def test_a_runtime_below_the_minimum_is_reported(monkeypatch):
+    """Debian bookworm's Node 18, precisely — present, detected, useless."""
+    _fake_ydl(monkeypatch, {"node": _runtime("node", "18.20.4", False)})
+
+    problem = download.js_runtime_problem()
+    assert "18.20.4" in problem
+    assert "older than yt-dlp accepts" in problem
+    assert "403" in problem, "the message must connect to the symptom people see"
+
+
+def test_a_missing_runtime_is_reported(monkeypatch):
+    _fake_ydl(monkeypatch, {"deno": None})
+
+    problem = download.js_runtime_problem()
+    assert "deno was not found" in problem
+
+
+def test_one_working_runtime_is_enough(monkeypatch):
+    _fake_ydl(monkeypatch, {
+        "deno": _runtime("deno", "2.9.5", True),
+        "node": _runtime("node", "18.20.4", False),
+    })
+    assert download.js_runtime_problem() == ""
+
+
+def test_an_unrecognised_runtime_name_is_named_back(monkeypatch):
+    """"nodejs" is not "node", and yt-dlp says so by silently dropping it.
+
+    It drops unknown names by popping them out of the dict it was handed, so
+    reading that dict afterwards to build the message reports nothing at all.
+    """
+    monkeypatch.setattr(config, "YTDLP_JS_RUNTIMES", "nodejs")
+    _fake_ydl(monkeypatch, {})
+
+    problem = download.js_runtime_problem()
+    assert "nodejs" in problem, "the message must name what was configured"
+
+
+def test_deliberately_disabling_the_runtime_is_not_a_problem(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_JS_RUNTIMES", "")
+    assert download.js_runtime_problem() == ""
+
+
+def test_the_check_never_takes_the_app_down(monkeypatch):
+    """It reads a private yt-dlp attribute, which is allowed to disappear."""
+    import yt_dlp
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("yt-dlp changed shape")
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", explode)
+    assert download.js_runtime_problem() == ""
 
 
 def test_js_runtime_can_be_disabled(monkeypatch):

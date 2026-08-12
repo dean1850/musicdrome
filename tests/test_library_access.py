@@ -7,7 +7,10 @@ and then the very last step, creating the artist folder, raised EACCES. The
 bandwidth was already spent and the log said only "Permission denied".
 """
 
+import errno
 import os
+import tempfile
+import threading
 
 import pytest
 
@@ -50,6 +53,56 @@ def test_an_unwritable_directory_names_the_uids(music_dir):
     assert "not writable" in problem
     assert "PUID/PGID" in problem, "the message must say how to fix it"
     assert str(os.getuid()) in problem, "the message must name the uid we are running as"
+
+
+def test_concurrent_checks_do_not_invent_a_permissions_problem(music_dir):
+    """Seen in the wild, and it cost an evening of chowning a healthy mount.
+
+    Two download workers requeued at the same instant both probed /music, both
+    wrote the one fixed probe name, and the second to unlink it got ENOENT.
+    That surfaced as "/music is not writable (No such file or directory).
+    Running as 0:0, directory is owned by 0:0" — a message that names the same
+    uid twice and is therefore self-evidently not about permissions.
+    """
+    failures: list[str] = []
+    start = threading.Barrier(4)
+
+    def hammer():
+        start.wait()
+        for _ in range(50):
+            problem = config.music_dir_problem()
+            if problem:
+                failures.append(problem)
+
+    threads = [threading.Thread(target=hammer) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == [], "a writable directory must never report a problem"
+
+
+def test_the_probe_cleans_up_after_itself(music_dir):
+    config.music_dir_problem()
+    assert list(music_dir.iterdir()) == [], "the write probe must not be left behind"
+
+
+def test_a_vanished_mount_is_not_blamed_on_PUID(music_dir, monkeypatch):
+    """ENOENT and ESTALE mean the share dropped, not that the uid is wrong.
+
+    Telling someone to reconcile PUID/PGID when the mount has gone sends them
+    off to chown a directory that was never the problem.
+    """
+    def gone(*args, **kwargs):
+        raise OSError(errno.ESTALE, "Stale file handle")
+
+    monkeypatch.setattr(tempfile, "mkstemp", gone)
+    problem = config.music_dir_problem()
+
+    assert "Stale file handle" in problem
+    assert "not a permissions error" in problem
+    assert "PUID/PGID" not in problem, "the fix here is the mount, not the uid"
 
 
 @pytest.mark.skipif(os.getuid() == 0, reason="root can write to anything")

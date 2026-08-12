@@ -10,7 +10,12 @@ ytmusicapi==1.9.0
 # A floor, not a pin. YouTube breaks extractors every few months and a fix
 # usually ships within days, so the image also upgrades yt-dlp at boot unless
 # YTDLP_AUTO_UPDATE=false — see docker/entrypoint.sh.
-yt-dlp>=2026.7.4
+#
+# The [default] extra is what pulls in yt-dlp-ejs, the challenge-solver scripts
+# the JavaScript runtime executes. Without it they are fetched from GitHub on
+# first use (YTDLP_REMOTE_COMPONENTS), which turns every boot into a network
+# dependency on a host that may well have none.
+yt-dlp[default]>=2026.7.4
 mutagen==1.47.0
 
 # ── Scan schedule ───────────────────────────────────────
