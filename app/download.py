@@ -16,8 +16,8 @@ Clients it has moved onto SABR return a player response with no format URLs at
 all, which yt-dlp reports as "Some <client> client https formats have been
 skipped as they are missing a URL" (yt-dlp/yt-dlp#12482). The clients that do
 still carry URLs need a JavaScript runtime to solve YouTube's signature and
-n-challenges, so the image ships Node and lets yt-dlp fetch its external JS
-components on demand — see :data:`app.config.YTDLP_JS_RUNTIMES`.
+n-challenges, so the image ships Deno and the solver scripts that run on it —
+see :data:`app.config.YTDLP_JS_RUNTIMES`.
 
 The client list itself is deliberately *not* pinned. yt-dlp's own defaults move
 with YouTube; a list written down here does not, and a stale pin is worse than
@@ -126,6 +126,69 @@ class _YtdlpLogger:
     @staticmethod
     def error(message: str) -> None:
         log.debug("yt-dlp: %s", message)  # the caller reports the failure itself
+
+
+def js_runtime_problem() -> str:
+    """Why YouTube downloads will be degraded, or ``""`` if a runtime is usable.
+
+    Worth a check of its own because the failure is silent. yt-dlp does not
+    refuse to start when the configured runtime is missing or too old — it
+    drops to its JS-less clients and carries on, and the first sign anything is
+    wrong is HTTP 403 partway through a download, or a match that finds no
+    formats. Debian's Node is below yt-dlp's minimum, which is exactly how this
+    image shipped a runtime that was never once used.
+
+    Reports the state, never enforces it: a runtime yt-dlp will not touch is a
+    reason to say so loudly at boot, not a reason to refuse to run.
+    """
+    wanted = config.js_runtimes()
+    if not wanted:
+        return ""  # explicitly disabled — the operator already knows
+
+    # Snapshot the names first: yt-dlp drops the ones it does not recognise by
+    # popping them out of the very dict it is handed, so reading them back
+    # afterwards reports nothing at all.
+    names = ", ".join(sorted(wanted))
+
+    import yt_dlp
+
+    try:
+        with yt_dlp.YoutubeDL(
+            {"quiet": True, "logger": _YtdlpLogger(), "js_runtimes": dict(wanted)}
+        ) as ydl:
+            detected = ydl._js_runtimes
+    except Exception as exc:
+        # Private attribute, so it is allowed to disappear. Losing the warning
+        # is a fair price; failing to boot over it is not.
+        log.debug("could not inspect yt-dlp's JavaScript runtimes: %s", exc)
+        return ""
+
+    if not detected:
+        # yt-dlp drops names it does not know during construction, so an empty
+        # result means every name configured was a typo.
+        return (
+            f"yt-dlp recognises none of the runtimes in YTDLP_JS_RUNTIMES "
+            f"({names}) — YouTube downloads will fail with 403."
+        )
+
+    usable, problems = [], []
+    for name, runtime in sorted(detected.items()):
+        info = getattr(runtime, "info", None) if runtime is not None else None
+        if info is None:
+            problems.append(f"{name} was not found")
+        elif info.supported is False:
+            problems.append(f"{name} {info.version} is older than yt-dlp accepts")
+        else:
+            usable.append(f"{name} {info.version}")
+
+    if usable:
+        log.info("javascript: %s", ", ".join(usable))
+        return ""
+    return (
+        f"no usable JavaScript runtime ({'; '.join(problems)}) — YouTube downloads "
+        f"will fail with 403 or find no formats. Install one yt-dlp accepts "
+        f"(deno >= 2.3, node >= 22) or point YTDLP_JS_RUNTIMES at it."
+    )
 
 
 # ─── Candidate scoring ─────────────────────────────────────────────────────

@@ -37,8 +37,10 @@ if [ "${YTDLP_AUTO_UPDATE:-true}" = "true" ]; then
     echo "Updating yt-dlp (set YTDLP_AUTO_UPDATE=false to skip)"
     # Never fatal: an offline or rate-limited boot keeps the pinned version
     # rather than refusing to start.
+    # [default] keeps yt-dlp-ejs in step with yt-dlp itself; upgrading the one
+    # without the other is how you end up with a solver the extractor cannot use.
     if pip install --no-cache-dir --disable-pip-version-check --quiet \
-            --timeout 20 --retries 2 --upgrade yt-dlp; then
+            --timeout 20 --retries 2 --upgrade "yt-dlp[default]"; then
         echo "yt-dlp is now $(yt-dlp --version 2>/dev/null || echo unknown)"
     else
         echo "WARNING: could not update yt-dlp — continuing with the bundled version"

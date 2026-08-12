@@ -16,8 +16,10 @@ work without duplicating the file.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -148,10 +150,17 @@ YTDLP_PLAYER_CLIENTS = _env("YTDLP_PLAYER_CLIENTS")
 # both, every remaining client is either SABR-only or unsolvable and downloads
 # fail with messages that never mention the real cause.
 #
-# The image installs Node for this. `deno` is yt-dlp's own default and is
-# faster, but it is not in Debian and would mean pulling a binary from GitHub
-# at build time.
-YTDLP_JS_RUNTIMES = _env("YTDLP_JS_RUNTIMES", default="node")
+# The image installs Deno for this, which is yt-dlp's own default and the one
+# it recommends — it sandboxes the challenge scripts it runs.
+#
+# It used to install Debian's `nodejs` instead, on the grounds that Node was
+# packaged and Deno was not. That was wrong in a way nothing reported: yt-dlp
+# requires Node >= 22.0.0, Debian ships 18 on bookworm and 20 on trixie, and a
+# runtime below the minimum is treated as absent. yt-dlp then fell back to its
+# JS-less clients and YouTube answered those with HTTP 403 partway through the
+# download. Whatever is named here has to satisfy yt-dlp's minimum: deno 2.3,
+# node 22, quickjs 2023-12-9.
+YTDLP_JS_RUNTIMES = _env("YTDLP_JS_RUNTIMES", default="deno")
 YTDLP_REMOTE_COMPONENTS = _env("YTDLP_REMOTE_COMPONENTS", default="ejs:github")
 
 # Escape hatches for networks, rate limits and bot checks — not everyday
@@ -194,30 +203,60 @@ def music_dir_problem() -> str:
     every download at the final ``mkdir``, after the audio has already been
     fetched and encoded. So this actually creates and removes a file.
 
-    The message names the uid and gid we are running as and the ones that own
-    the directory, because the fix is always to reconcile those two.
+    The probe name has to be unique per call. Download workers run this
+    concurrently, and a shared, fixed name meant two of them raced to unlink
+    the same file: the loser's ``unlink`` raised ENOENT, which was reported as
+    an unwritable library on a mount that was working perfectly. ``mkstemp``
+    creates with ``O_EXCL`` under a name nobody else holds, so the probe now
+    only ever fails for the reason it is meant to detect.
     """
     if not MUSIC_DIR.exists():
         return f"{MUSIC_DIR} does not exist — check the volume mount"
     if not MUSIC_DIR.is_dir():
         return f"{MUSIC_DIR} is not a directory"
 
-    probe = MUSIC_DIR / ".musicdrome-write-test"
     try:
-        probe.touch()
-        probe.unlink()
-        return ""
+        handle, probe = tempfile.mkstemp(prefix=".musicdrome-write-test-", dir=MUSIC_DIR)
     except OSError as exc:
-        try:
-            stat = MUSIC_DIR.stat()
-            owner = f"owned by {stat.st_uid}:{stat.st_gid}"
-        except OSError:
-            owner = "owner unknown"
+        return _write_probe_failure(exc)
+
+    # Creating the file was the test. Failing to clean up after it is untidy,
+    # never a reason to refuse a download.
+    os.close(handle)
+    try:
+        os.unlink(probe)
+    except OSError as exc:
+        log.debug("could not remove the write probe %s: %s", probe, exc)
+    return ""
+
+
+def _write_probe_failure(exc: OSError) -> str:
+    """Turn a failed write probe into something worth acting on.
+
+    The uid and gid we run as and the ones owning the directory are named
+    because reconciling those two is the fix — but only for the errnos where
+    it *is* the fix. A share that has dropped out underneath the container
+    reports ENOENT or ESTALE, and sending someone to PUID/PGID for that is an
+    afternoon spent chowning a directory that was never the problem.
+    """
+    try:
+        stat = MUSIC_DIR.stat()
+        owner = f"owned by {stat.st_uid}:{stat.st_gid}"
+    except OSError:
+        owner = "owner unknown"
+
+    running_as = f"Running as {os.getuid()}:{os.getgid()}, directory is {owner}."
+
+    if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
         return (
-            f"{MUSIC_DIR} is not writable ({exc.strerror}). Running as "
-            f"{os.getuid()}:{os.getgid()}, directory is {owner}. Set PUID/PGID "
-            f"in .env to a user that can write there, or fix the mount."
+            f"{MUSIC_DIR} is not writable ({exc.strerror}). {running_as} "
+            f"Set PUID/PGID in .env to a user that can write there, or fix the mount."
         )
+    return (
+        f"{MUSIC_DIR} could not be written to ({exc.strerror}). {running_as} "
+        f"That is not a permissions error — check that the mount behind it is "
+        f"still connected and that the host path exists."
+    )
 
 
 def ensure_directories() -> None:

@@ -85,6 +85,13 @@ async def lifespan(app: FastAPI):
     if problem:
         log.error("music library is not writable — downloads will fail: %s", problem)
 
+    # The same argument, for the runtime that solves YouTube's challenges: when
+    # it is missing or too old nothing announces it, and the cost lands as 403s
+    # on individual downloads hours later.
+    problem = download.js_runtime_problem()
+    if problem:
+        log.error("youtube downloads will be degraded: %s", problem)
+
     if not config.TESTING:
         download.start_workers()
         scheduler.start()
