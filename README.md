@@ -153,6 +153,23 @@ listening clock in your own timezone, and how much of your listening is new
 versus familiar. The one AI touch is a short written summary of your taste,
 refreshed once a day and cacheable to zero calls by switching it off.
 
+## yt-dlp versions
+
+Will restarts pick up new yt-dlp versions? New stable releases, yes — they hit
+PyPI the moment they're tagged on GitHub, and your container upgrades on every
+boot (see `YTDLP_AUTO_UPDATE` in `.env.example`). Nightlies, no — pip skips
+pre-releases without `--pre`.
+
+### When YouTube breaks and stable is behind
+
+Stable is currently five weeks old while nightlies are eight days old, so this
+will come up. Escape hatch, no image rebuild:
+
+```bash
+docker compose exec musicdrome pip install --no-cache-dir --pre --upgrade yt-dlp
+docker compose restart musicdrome
+```
+
 ## Security
 
 Musicdrome has **no authentication**, by design — it is meant for a trusted home
