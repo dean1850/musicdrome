@@ -33,11 +33,11 @@ def status() -> dict[str, Any]:
     with db.connect() as conn:
         counts = {
             row["status"]: row["n"]
-            for row in conn.execute("SELECT status, COUNT(*) AS n FROM suggestions GROUP BY status")
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS n FROM suggestions GROUP BY status"
+            )
         }
-        last_scan = conn.execute(
-            "SELECT * FROM scans ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        last_scan = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
 
     return {
         "ai": ai.status(),
@@ -48,6 +48,11 @@ def status() -> dict[str, Any]:
         "settings": db.get_settings(),
         "music_dir": str(config.MUSIC_DIR),
         "exclude_dir": config.EXCLUDE_MUSIC_DIR,
+        # Empty unless the library cannot actually be written to. The UI shows
+        # this as a banner, because it is the one misconfiguration that lets
+        # everything else look healthy right up until a download finishes.
+        "music_dir_problem": config.music_dir_problem(),
+        "playlist": str(config.PLAYLIST_PATH),
     }
 
 
@@ -64,7 +69,10 @@ def start_scan() -> dict[str, Any]:
 @router.get("/scan")
 def scan_status() -> dict[str, Any]:
     with db.connect() as conn:
-        recent = [dict(row) for row in conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 10")]
+        recent = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 10")
+        ]
     return {"state": scan.state(), "recent": recent}
 
 
@@ -91,6 +99,12 @@ def list_suggestions(
     if status != "all":
         where.append("status = ?")
         params.append(status)
+
+    # The tag filter narrows the cards but not the counts, so a selected tag
+    # does not shrink every other count to zero.
+    count_clause = " AND ".join(where)
+    count_params = list(params)
+
     if tag:
         where.append("(',' || lower(tags) || ',') LIKE ?")
         params.append(f"%,{tag.lower()},%")
@@ -104,13 +118,8 @@ def list_suggestions(
                 [*params, limit],
             )
         ]
-        # Tag counts come from the same status filter but ignore the tag itself,
-        # so a selected tag does not shrink every other count to zero.
         tag_rows = conn.execute(
-            "SELECT tags FROM suggestions WHERE status = ? AND match >= ?",
-            (status, min_match),
-        ).fetchall() if status != "all" else conn.execute(
-            "SELECT tags FROM suggestions WHERE match >= ?", (min_match,)
+            f"SELECT tags FROM suggestions WHERE {count_clause}", count_params
         ).fetchall()
 
     counts: dict[str, int] = {}
@@ -167,7 +176,8 @@ def download_all(min_match: int = Body(0, embed=True)) -> dict[str, int]:
         ids = [
             row["id"]
             for row in conn.execute(
-                "SELECT id FROM suggestions WHERE status = 'new' AND match >= ? ORDER BY match DESC",
+                "SELECT id FROM suggestions WHERE status = 'new' AND match >= ? "
+                "ORDER BY match DESC",
                 (min_match,),
             )
         ]
@@ -179,16 +189,18 @@ def download_all(min_match: int = Body(0, embed=True)) -> dict[str, int]:
 
 @router.get("/downloads")
 def list_downloads(
-    status: str = Query("all"), limit: int = Query(200, ge=1, le=1000)
+    status: str = Query("all"),
+    limit: int = Query(200, ge=1, le=1000),
 ) -> dict[str, Any]:
-    where, params = ("", []) if status == "all" else ("WHERE d.status = ?", [status])
+    """The download list, newest first."""
+    clause, params = ("WHERE d.status = ?", [status]) if status != "all" else ("", [])
     with db.connect() as conn:
         rows = [
             dict(row)
             for row in conn.execute(
                 "SELECT d.*, s.match, s.cover_url, s.year FROM downloads d "
                 "LEFT JOIN suggestions s ON s.id = d.suggestion_id "
-                f"{where} ORDER BY d.created_at DESC, d.id DESC LIMIT ?",
+                f"{clause} ORDER BY d.created_at DESC, d.id DESC LIMIT ?",
                 [*params, limit],
             )
         ]

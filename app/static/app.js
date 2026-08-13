@@ -207,7 +207,8 @@ async function act(id, action, button) {
 // ─── Downloads ──────────────────────────────────────────────────────────
 
 async function loadDownloads() {
-  const data = await api(`/downloads?status=${state.downloadStatus}`);
+  const data = await api(
+    `/downloads?${new URLSearchParams({ status: state.downloadStatus })}`);
   const active = new Map(data.active.map((item) => [item.id, item]));
   const body = $('#downloads-table tbody');
   const empty = $('#downloads-empty');
@@ -268,7 +269,7 @@ async function loadDownloads() {
 // ─── Stats ──────────────────────────────────────────────────────────────
 
 async function loadStats() {
-  const data = await api(`/stats?days=${state.days}`);
+  const data = await api(`/stats?${new URLSearchParams({ days: state.days })}`);
 
   $('#stat-tiles').innerHTML = [
     ['Plays', data.plays.toLocaleString()],
@@ -325,7 +326,8 @@ async function loadSummary(refresh) {
   panel.hidden = false;
 
   try {
-    const data = await api(`/stats/summary?days=${state.days}&refresh=${refresh}`);
+    const data = await api(
+      `/stats/summary?${new URLSearchParams({ days: state.days, refresh })}`);
     if (!data.enabled) { panel.hidden = true; return; }
     panel.innerHTML = `<span class="label">Your taste</span>${
       escapeHtml(data.text || data.error || 'No summary yet.')}`;
@@ -447,8 +449,13 @@ function showSetupBanner(status) {
   const banner = $('#banner');
   const problems = [];
 
+  // First, because it is the one that silently wastes a whole scan: everything
+  // else works and every download dies on the final write.
+  if (status.music_dir_problem) {
+    problems.push(`Downloads cannot be saved. ${status.music_dir_problem}`);
+  }
   if (!status.history.sources.some((source) => source.configured)) {
-    problems.push('No listening history configured — set LASTFM_API_KEY and LASTFM_USER, or LISTENBRAINZ_USER, in .env.');
+    problems.push('No listening history configured — set LASTFM_USER or LISTENBRAINZ_USER in .env.');
   }
   if (!status.ai.available) {
     problems.push(`The ${status.ai.provider} backend is not configured — set its key or URL in .env.`);

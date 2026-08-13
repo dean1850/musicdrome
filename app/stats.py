@@ -32,13 +32,15 @@ artists back verbatim. No preamble, no headings.
 def overview(days: int = 90) -> dict[str, Any]:
     """Everything the stats page draws, in one query batch."""
     since = db.now() - days * 86400
+    # Reused by every windowed query below.
+    params: list[Any] = [since]
 
     with db.connect() as conn:
         totals = conn.execute(
             "SELECT COUNT(*) AS plays, COUNT(DISTINCT artist_key) AS artists, "
             "       COUNT(DISTINCT track_key) AS tracks "
             "FROM plays WHERE played_at >= ?",
-            (since,),
+            params,
         ).fetchone()
 
         top_artists = [
@@ -46,7 +48,7 @@ def overview(days: int = 90) -> dict[str, Any]:
             for row in conn.execute(
                 "SELECT artist, COUNT(*) AS plays FROM plays WHERE played_at >= ? "
                 "GROUP BY artist_key ORDER BY plays DESC, artist ASC LIMIT 15",
-                (since,),
+                params,
             )
         ]
 
@@ -55,7 +57,7 @@ def overview(days: int = 90) -> dict[str, Any]:
             for row in conn.execute(
                 "SELECT artist, title, COUNT(*) AS plays FROM plays WHERE played_at >= ? "
                 "GROUP BY track_key ORDER BY plays DESC, artist ASC LIMIT 15",
-                (since,),
+                params,
             )
         ]
 
@@ -64,7 +66,7 @@ def overview(days: int = 90) -> dict[str, Any]:
             for row in conn.execute(
                 "SELECT date(played_at, 'unixepoch', 'localtime') AS day, COUNT(*) AS plays "
                 "FROM plays WHERE played_at >= ? GROUP BY day ORDER BY day",
-                (since,),
+                params,
             )
         ]
 
@@ -74,7 +76,7 @@ def overview(days: int = 90) -> dict[str, Any]:
                 "SELECT CAST(strftime('%H', played_at, 'unixepoch', 'localtime') AS INTEGER) AS hour, "
                 "       COUNT(*) AS plays "
                 "FROM plays WHERE played_at >= ? GROUP BY hour",
-                (since,),
+                params,
             )
         }
 
@@ -93,7 +95,7 @@ def overview(days: int = 90) -> dict[str, Any]:
             for row in conn.execute(
                 "SELECT source, COUNT(*) AS plays FROM plays WHERE played_at >= ? "
                 "GROUP BY source ORDER BY plays DESC",
-                (since,),
+                params,
             )
         ]
 

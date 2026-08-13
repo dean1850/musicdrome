@@ -53,7 +53,7 @@ def client():
 
 
 @pytest.fixture
-def play(request):
+def play():
     """Insert a play. Usage: ``play("Radiohead", "Karma Police", at=...)``."""
     from app.norm import artist_key, track_key
 

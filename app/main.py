@@ -77,6 +77,29 @@ async def lifespan(app: FastAPI):
 
     db.init()
 
+    # Said once, loudly, at boot. An unwritable music directory is the one
+    # misconfiguration that leaves everything else looking healthy: the app
+    # serves, scans and matches perfectly, and every download dies at the last
+    # step having already spent the bandwidth and the encode.
+    problem = config.music_dir_problem()
+    if problem:
+        log.error("music library is not writable — downloads will fail: %s", problem)
+
+    # The same argument, for the runtime that solves YouTube's challenges: when
+    # it is missing or too old nothing announces it, and the cost lands as 403s
+    # on individual downloads hours later.
+    problem = download.js_runtime_problem()
+    if problem:
+        log.error("youtube downloads will be degraded: %s", problem)
+
+    # And for the TLS fingerprint, which decides whether YouTube answers the
+    # media fetch at all from a VPN or a datacenter address.
+    log.info("tls:     %s", download.impersonation_status())
+
+    # One playlist, not one per scan. Installs that predate that have their old
+    # per-scan files folded into it here, once.
+    download.consolidate_scan_playlists()
+
     if not config.TESTING:
         download.start_workers()
         scheduler.start()

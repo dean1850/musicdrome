@@ -8,6 +8,16 @@ from app import config, download
 from app.download import Candidate
 
 
+@pytest.fixture(autouse=True)
+def empty_playlist_dir():
+    """The music directory outlives a test; the playlists must not."""
+    import shutil
+
+    shutil.rmtree(config.PLAYLIST_DIR, ignore_errors=True)
+    yield
+    shutil.rmtree(config.PLAYLIST_DIR, ignore_errors=True)
+
+
 def candidate(**overrides) -> Candidate:
     base = dict(url="https://example.test/1", title="Karma Police",
                 artist="Radiohead", album="OK Computer", duration=264, source="ytmusic")
@@ -99,23 +109,92 @@ def test_an_existing_file_is_never_overwritten():
 # ─── Playlists ─────────────────────────────────────────────────────────────
 
 
-def test_a_scan_playlist_collects_its_batch_with_relative_paths():
-    meta = {"artist": "Radiohead", "title": "Karma Police", "duration": 264}
-    path = download.target_path("Radiohead", "OK Computer", "Karma Police", 6)
+def make_track(artist: str, album: str, title: str, track_no: int = 0) -> Path:
+    path = download.target_path(artist, album, title, track_no)
     path.write_bytes(b"")
+    return path
 
-    playlist = Path(download.append_to_playlist(7, path, meta))
-    download.append_to_playlist(7, path, meta)
 
+def test_downloads_collect_in_one_playlist_with_relative_paths():
+    first = make_track("Radiohead", "OK Computer", "Karma Police", 6)
+    second = make_track("Portishead", "Dummy", "Glory Box", 3)
+
+    playlist = Path(download.append_to_playlist(
+        first, {"artist": "Radiohead", "title": "Karma Police", "duration": 264}))
+    download.append_to_playlist(
+        second, {"artist": "Portishead", "title": "Glory Box", "duration": 301})
+
+    # One file for every scan, named after the app rather than a scan number.
+    assert playlist == config.PLAYLIST_PATH
     lines = playlist.read_text().splitlines()
     assert lines[0] == "#EXTM3U"
-    assert lines.count("#EXTM3U") == 1
     assert lines[1] == "#EXTINF:264,Radiohead - Karma Police"
     assert lines[2].startswith("../Radiohead/OK Computer/")
+    assert lines[3] == "#EXTINF:301,Portishead - Glory Box"
+    assert lines[4].startswith("../Portishead/Dummy/")
 
 
-def test_no_scan_means_no_playlist():
-    assert download.append_to_playlist(None, Path("/tmp/x.mp3"), {}) == ""
+def test_appending_the_same_track_twice_does_not_duplicate_it():
+    """A retry, or a re-download after a delete, must not double the entry."""
+    path = make_track("Radiohead", "OK Computer", "Karma Police", 6)
+    meta = {"artist": "Radiohead", "title": "Karma Police", "duration": 264}
+
+    playlist = Path(download.append_to_playlist(path, meta))
+    download.append_to_playlist(path, meta)
+
+    lines = playlist.read_text().splitlines()
+    assert lines.count("#EXTM3U") == 1
+    assert len([line for line in lines if not line.startswith("#")]) == 1
+
+
+def test_the_old_per_scan_playlists_are_merged_and_removed():
+    """Installs that predate the single playlist keep their tracks."""
+    config.PLAYLIST_DIR.mkdir(parents=True, exist_ok=True)
+    (config.PLAYLIST_DIR / "musicdrome-scan-0001.m3u").write_text(
+        "#EXTM3U\n#EXTINF:264,Radiohead - Karma Police\n../Radiohead/OK Computer/06 - Karma Police.mp3\n"
+    )
+    (config.PLAYLIST_DIR / "musicdrome-scan-0002.m3u").write_text(
+        "#EXTM3U\n#EXTINF:301,Portishead - Glory Box\n../Portishead/Dummy/03 - Glory Box.mp3\n"
+    )
+
+    assert download.consolidate_scan_playlists() == 2
+
+    lines = config.PLAYLIST_PATH.read_text().splitlines()
+    assert lines.count("#EXTM3U") == 1
+    assert "../Radiohead/OK Computer/06 - Karma Police.mp3" in lines
+    assert "../Portishead/Dummy/03 - Glory Box.mp3" in lines
+    assert not list(config.PLAYLIST_DIR.glob("musicdrome-scan-*.m3u"))
+
+
+def test_merging_runs_once_and_skips_tracks_already_listed():
+    config.PLAYLIST_DIR.mkdir(parents=True, exist_ok=True)
+    config.PLAYLIST_PATH.write_text(
+        "#EXTM3U\n#EXTINF:264,Radiohead - Karma Police\n../Radiohead/OK Computer/06 - Karma Police.mp3\n"
+    )
+    (config.PLAYLIST_DIR / "musicdrome-scan-0001.m3u").write_text(
+        "#EXTM3U\n#EXTINF:264,Radiohead - Karma Police\n../Radiohead/OK Computer/06 - Karma Police.mp3\n"
+    )
+
+    assert download.consolidate_scan_playlists() == 0
+    assert download.consolidate_scan_playlists() == 0  # nothing left to merge
+
+    lines = [line for line in config.PLAYLIST_PATH.read_text().splitlines()
+             if not line.startswith("#")]
+    assert lines == ["../Radiohead/OK Computer/06 - Karma Police.mp3"]
+
+
+def test_a_playlist_a_person_made_is_never_touched():
+    config.PLAYLIST_DIR.mkdir(parents=True, exist_ok=True)
+    mine = config.PLAYLIST_DIR / "Sunday morning.m3u"
+    mine.write_text("#EXTM3U\n../Nick Drake/Pink Moon/01 - Pink Moon.mp3\n")
+    (config.PLAYLIST_DIR / "musicdrome-scan-0001.m3u").write_text(
+        "#EXTM3U\n../Radiohead/OK Computer/06 - Karma Police.mp3\n"
+    )
+
+    download.consolidate_scan_playlists()
+
+    assert mine.exists()
+    assert "Pink Moon" not in config.PLAYLIST_PATH.read_text()
 
 
 # ─── Queue ─────────────────────────────────────────────────────────────────

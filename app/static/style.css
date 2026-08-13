@@ -383,6 +383,19 @@ input[type="checkbox"] { accent-color: var(--accent); width: 17px; height: 17px;
 .table tbody tr:hover { background: var(--surface); }
 .table .path { color: var(--faint); font-size: 0.8rem; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 
+/* Failure reasons are sentences, not labels — yt-dlp's run to a couple of
+   hundred characters. Inheriting the cells' `nowrap` stretched the table to
+   the width of the longest one and pushed every other column off-screen
+   behind a horizontal scrollbar, so the status of a download was unreadable
+   precisely when something had gone wrong with it. */
+.table .card-error {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 46ch;
+  line-height: 1.35;
+  margin-top: 0.2rem;
+}
+
 .pill {
   display: inline-block;
   padding: 0.1rem 0.5rem;

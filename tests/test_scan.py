@@ -41,9 +41,9 @@ def stub_ai(monkeypatch, items):
 
 def run_scan(monkeypatch, items, play):
     play("Radiohead", "Karma Police")
-    monkeypatch.setattr(scan.history, "sync", lambda: {"added": 0, "sources": {}})
+    monkeypatch.setattr(scan.history, "sync", lambda *a, **k: {"added": 0, "sources": {}})
     monkeypatch.setattr(scan.exclude, "scan_library", lambda *a, **k: {"seen": 0})
-    monkeypatch.setattr(scan.config, "history_sources", lambda: ["lastfm"])
+    monkeypatch.setattr(scan.history, "configured", lambda: True)
     stub_ai(monkeypatch, items)
     return scan.run("test")
 
@@ -157,7 +157,7 @@ def test_a_scan_without_an_ai_backend_fails_loudly(monkeypatch, play):
 
 def test_a_scan_without_history_fails_before_calling_the_model(monkeypatch):
     monkeypatch.setattr(scan.ai, "available", lambda: True)
-    monkeypatch.setattr(scan.config, "history_sources", lambda: [])
+    monkeypatch.setattr(scan.history, "configured", lambda: False)
 
     with pytest.raises(RuntimeError, match="no listening history"):
         scan.run("test")
@@ -165,9 +165,9 @@ def test_a_scan_without_history_fails_before_calling_the_model(monkeypatch):
 
 def test_a_scan_with_no_recent_plays_says_so(monkeypatch, play):
     play("Old", "Song", at=db.now() - 400 * 86400)
-    monkeypatch.setattr(scan.history, "sync", lambda: {})
+    monkeypatch.setattr(scan.history, "sync", lambda *a, **k: {})
     monkeypatch.setattr(scan.exclude, "scan_library", lambda *a, **k: {})
-    monkeypatch.setattr(scan.config, "history_sources", lambda: ["lastfm"])
+    monkeypatch.setattr(scan.history, "configured", lambda: True)
     monkeypatch.setattr(scan.ai, "available", lambda: True)
 
     with pytest.raises(RuntimeError, match="no plays"):
@@ -176,7 +176,7 @@ def test_a_scan_with_no_recent_plays_says_so(monkeypatch, play):
 
 def test_the_scan_lock_is_released_after_a_failure(monkeypatch):
     monkeypatch.setattr(scan.ai, "available", lambda: False)
-    monkeypatch.setattr(scan.config, "history_sources", lambda: ["lastfm"])
+    monkeypatch.setattr(scan.history, "configured", lambda: True)
 
     for _ in range(2):
         with pytest.raises(RuntimeError):

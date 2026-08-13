@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from . import config
+from . import config, net
 
 log = logging.getLogger(__name__)
 
@@ -91,9 +91,18 @@ def status() -> dict[str, Any]:
 
 
 def _post(url: str, *, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
-    try:
+    def send() -> httpx.Response:
         with httpx.Client(timeout=config.AI_REQUEST_TIMEOUT) as client:
-            response = client.post(url, headers=headers, json=payload)
+            return client.post(url, headers=headers, json=payload)
+
+    # connect_only, unlike the history sources: a scan is one large POST, and a
+    # request that timed out *waiting for the answer* may already have been
+    # received and billed. Failures that never reached the provider — a tunnel
+    # still coming up, a connection dropped before any response — cost nothing
+    # to repeat, and they are what turns a whole scan into "network error
+    # talking to anthropic: Server disconnected without sending a response".
+    try:
+        response = net.with_retry(send, what=f"{provider()} request", connect_only=True)
     except httpx.HTTPError as exc:
         raise AIError(f"network error talking to {provider()}: {exc}") from exc
 

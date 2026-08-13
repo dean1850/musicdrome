@@ -18,14 +18,17 @@ import logging
 import threading
 from typing import Any
 
-from . import ai, config, db, exclude, history
+from . import ai, db, exclude, history
 from .norm import artist_key, track_key
 from .sources import lastfm, musicbrainz
 
 log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_state: dict[str, Any] = {"running": False, "step": "", "done": 0, "total": 0, "scan_id": None}
+_state: dict[str, Any] = {
+    "running": False, "step": "", "done": 0, "total": 0, "scan_id": None,
+}
+
 
 SYSTEM_PROMPT = """You are a music recommender for one listener's personal collection.
 
@@ -189,7 +192,9 @@ def run(trigger: str = "manual") -> dict[str, Any]:
     scan_id = None
 
     try:
-        _state.update(running=True, step="starting", done=0, total=batch_size, scan_id=None)
+        _state.update(
+            running=True, step="starting", done=0, total=batch_size, scan_id=None
+        )
 
         with db.connect() as conn:
             cursor = conn.execute(
@@ -204,10 +209,10 @@ def run(trigger: str = "manual") -> dict[str, Any]:
             raise RuntimeError(
                 f"the {ai.provider()} backend is not configured — set its API key in .env"
             )
-        if not config.history_sources():
+        if not history.configured():
             raise RuntimeError(
-                "no listening history configured — set LASTFM_API_KEY and LASTFM_USER, "
-                "or LISTENBRAINZ_USER, in .env"
+                "no listening history configured — set LASTFM_USER or "
+                "LISTENBRAINZ_USER in .env"
             )
 
         _state["step"] = "reading scrobbles"
@@ -220,8 +225,8 @@ def run(trigger: str = "manual") -> dict[str, Any]:
         profile = history.profile(days=int(settings["history_days"]))
         if profile["plays"] == 0:
             raise RuntimeError(
-                f"no plays in the last {settings['history_days']} days — "
-                "widen the history window in Settings, or check your Last.fm username"
+                f"no plays in the last {settings['history_days']} days — widen the "
+                "history window in Settings, or check your scrobble username"
             )
 
         excluded = exclude.build()
@@ -310,6 +315,9 @@ def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int
                 "INSERT INTO suggestions (scan_id, track_key, artist, title, album, year, "
                 "track_no, match, reason, seed, tags, cover_url, duration, recording_mbid, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                # A re-suggested track refreshes the card it already has rather
+                # than making a second one, and only while it is still 'new' —
+                # so something you hid can never come back.
                 "ON CONFLICT (track_key) DO UPDATE SET "
                 "  scan_id = excluded.scan_id, match = excluded.match, "
                 "  reason = excluded.reason, seed = excluded.seed, "
@@ -346,12 +354,12 @@ def run_in_background(trigger: str = "manual") -> bool:
         return False
 
     def target() -> None:
+        from . import download
+
         try:
             result = run(trigger)
         except Exception:
-            return  # already logged and recorded on the scan row
-        from . import download
-
+            return  # already logged, and recorded on the scan row
         download.auto_enqueue(result["scan_id"])
 
     threading.Thread(target=target, name="musicdrome-scan", daemon=True).start()

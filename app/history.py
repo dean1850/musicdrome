@@ -1,13 +1,16 @@
 """Listening history: pulling scrobbles in, and turning them into a taste profile.
 
 Plays arrive from Last.fm and ListenBrainz and land in one table. Each source
-keeps its own cursor — the timestamp of the newest play successfully stored — so
-a sync only ever asks for what it has not seen, and adding a second source later
-back-fills without disturbing the first.
+keeps its own cursor — the timestamp of the newest play successfully stored —
+so a sync only ever asks for what it has not seen, and adding a second source
+later back-fills without disturbing the first.
 
 The cursor advances only after the rows are committed. A sync that dies halfway
 re-reads a page next time and the ``UNIQUE (track_key, played_at, source)``
 constraint absorbs the duplicates.
+
+Who you are comes from the environment: ``LASTFM_USER`` and
+``LISTENBRAINZ_USER``. There is one listener.
 """
 
 from __future__ import annotations
@@ -21,10 +24,25 @@ from .sources import lastfm, listenbrainz
 
 log = logging.getLogger(__name__)
 
-SOURCES: dict[str, tuple[Callable[[], bool], Callable[..., Iterator[dict]]]] = {
+SOURCES: dict[str, tuple[Callable[..., bool], Callable[..., Iterator[dict]]]] = {
     "lastfm": (lastfm.configured, lastfm.recent_tracks),
     "listenbrainz": (listenbrainz.configured, listenbrainz.recent_tracks),
 }
+
+
+def _identity(source: str) -> dict[str, str]:
+    """The arguments identifying the listener to one history source."""
+    if source == "lastfm":
+        return {"user": config.LASTFM_USER}
+    return {"user": config.LISTENBRAINZ_USER, "token": config.LISTENBRAINZ_TOKEN}
+
+
+def configured() -> bool:
+    """Whether at least one scrobble account is usable."""
+    return any(
+        is_configured(_identity(name).get("user", ""))
+        for name, (is_configured, _) in SOURCES.items()
+    )
 
 
 def _cursor(conn, source: str) -> int:
@@ -42,11 +60,12 @@ def _save_cursor(conn, source: str, cursor: int, error: str = "") -> None:
 
 
 def sync() -> dict[str, Any]:
-    """Pull new plays from every configured source."""
+    """Pull everything new from every configured source."""
     result: dict[str, Any] = {"added": 0, "sources": {}}
 
     for name, (is_configured, fetch) in SOURCES.items():
-        if not is_configured():
+        identity = _identity(name)
+        if not is_configured(identity.get("user", "")):
             continue
 
         with db.connect() as conn:
@@ -55,7 +74,7 @@ def sync() -> dict[str, Any]:
         added, newest, error = 0, since, ""
         try:
             batch: list[tuple] = []
-            for play in fetch(since=since):
+            for play in fetch(since=since, **identity):
                 batch.append(
                     (
                         play["artist"],
@@ -111,6 +130,7 @@ def profile(days: int = 90) -> dict[str, Any]:
     is currently moving — which is usually the most useful signal of the three.
     """
     since = db.now() - days * 86400
+
     with db.connect() as conn:
         top_artists = [
             dict(row)
@@ -133,8 +153,7 @@ def profile(days: int = 90) -> dict[str, Any]:
             dict(row)
             for row in conn.execute(
                 "SELECT artist, MIN(played_at) AS first_play, COUNT(*) AS plays FROM plays "
-                "GROUP BY artist_key HAVING first_play >= ? "
-                "ORDER BY first_play DESC LIMIT 20",
+                "GROUP BY artist_key HAVING first_play >= ? ORDER BY first_play DESC LIMIT 20",
                 (since,),
             )
         ]
@@ -156,16 +175,16 @@ def profile(days: int = 90) -> dict[str, Any]:
 
 def status() -> dict[str, Any]:
     """Per-source sync state, for the UI to show what is actually wired up."""
-    configured = config.history_sources()
     with db.connect() as conn:
         rows = {row["source"]: dict(row) for row in conn.execute("SELECT * FROM sync_state")}
         total = conn.execute("SELECT COUNT(*) AS n FROM plays").fetchone()["n"]
+
     return {
         "total_plays": total,
         "sources": [
             {
                 "name": name,
-                "configured": name in configured,
+                "configured": SOURCES[name][0](_identity(name).get("user", "")),
                 "synced_at": (rows.get(name) or {}).get("synced_at"),
                 "error": (rows.get(name) or {}).get("error", ""),
             }

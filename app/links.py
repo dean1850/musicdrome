@@ -71,12 +71,11 @@ def youtube_metadata(video_id: str) -> dict[str, Any]:
     """
     import yt_dlp
 
-    from .download import _ydl_options
+    from .download import _extract_info, _ydl_options
 
     url = f"https://music.youtube.com/watch?v={video_id}"
     try:
-        with yt_dlp.YoutubeDL(_ydl_options(skip_download=True)) as ydl:
-            info = ydl.extract_info(url, download=False) or {}
+        info = _extract_info(yt_dlp, _ydl_options(skip_download=True), url, download=False) or {}
     except Exception as exc:
         raise LinkError(f"could not read that YouTube link: {exc}") from exc
 
