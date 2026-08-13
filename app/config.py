@@ -4,6 +4,9 @@ Everything here comes from the environment, and therefore from ``.env``. Every
 value has a working default — a ``.env`` carrying only your Last.fm key and one
 AI credential is a complete configuration.
 
+Musicdrome listens to one person. The Last.fm and ListenBrainz names below are
+that person, and there is nothing else to configure about who you are.
+
 Only startup concerns live here: credentials, usernames, paths, the AI backend.
 Anything you would want to change without restarting the container (scan
 schedule, batch size, auto-download threshold, retention) is a runtime setting
@@ -67,6 +70,11 @@ EXCLUDE_MUSIC_DIR = _env("EXCLUDE_MUSIC_DIR")
 
 DB_PATH = DATA_DIR / "musicdrome.db"
 PLAYLIST_DIR = MUSIC_DIR / "_playlists"
+# One playlist, appended to for the life of the install. It used to be one file
+# per scan, which turned a library server's playlist list into a wall of
+# musicdrome-scan-0001, -0002, -0003 that nobody ever opened twice.
+PLAYLIST_NAME = _env("MUSICDROME_PLAYLIST_NAME", default="Musicdrome") or "Musicdrome"
+PLAYLIST_PATH = PLAYLIST_DIR / f"{PLAYLIST_NAME}.m3u"
 # Scratch space for in-flight downloads. Kept out of DATA_DIR's top level so
 # multi-megabyte partial audio never sits beside the database, and swept at
 # boot in case a container was killed mid-download.
@@ -80,21 +88,6 @@ LASTFM_USER = _env("LASTFM_USER")
 LISTENBRAINZ_USER = _env("LISTENBRAINZ_USER")
 LISTENBRAINZ_TOKEN = _env("LISTENBRAINZ_TOKEN")
 LISTENBRAINZ_API_URL = _env("LISTENBRAINZ_API_URL", default="https://api.listenbrainz.org")
-
-# ─── Navidrome ─────────────────────────────────────────────────────────────
-# Optional, and only ever read: Musicdrome asks Navidrome for the list of
-# accounts on the server so a household does not have to be typed in by hand.
-#
-# What it cannot do is discover who those people are on Last.fm. Navidrome's
-# Subsonic `getUsers` returns username, email and roles — it deliberately never
-# exposes a user's linked Last.fm or ListenBrainz account, even to an admin. So
-# the roster arrives automatically and the scrobble usernames are filled in
-# once, per person, in Settings.
-#
-# Listing users is an admin-only call, so these must be admin credentials.
-NAVIDROME_URL = _env("NAVIDROME_URL").rstrip("/")
-NAVIDROME_USER = _env("NAVIDROME_USER")
-NAVIDROME_PASSWORD = _env("NAVIDROME_PASSWORD")
 
 MUSICBRAINZ_API_URL = _env("MUSICBRAINZ_API_URL", default="https://musicbrainz.org/ws/2")
 MUSICBRAINZ_USER_AGENT = _env(
@@ -162,6 +155,34 @@ YTDLP_PLAYER_CLIENTS = _env("YTDLP_PLAYER_CLIENTS")
 # node 22, quickjs 2023-12-9.
 YTDLP_JS_RUNTIMES = _env("YTDLP_JS_RUNTIMES", default="deno")
 YTDLP_REMOTE_COMPONENTS = _env("YTDLP_REMOTE_COMPONENTS", default="ejs:github")
+
+# Which browser yt-dlp should impersonate at the TLS layer, via curl_cffi.
+#
+# YouTube fingerprints the connection itself — cipher order, ALPN, HTTP/2
+# settings — and python's own stack looks nothing like a browser. On a
+# residential address that is usually tolerated; from a datacenter or VPN exit
+# it is the difference between a download and "HTTP Error 403: Forbidden"
+# partway through the media fetch, after the search and the metadata call have
+# both succeeded. Impersonation makes the handshake indistinguishable from
+# Chrome's, which is the single most effective thing available against those
+# 403s and costs nothing when they are not happening.
+#
+# Set to "" to disable. If curl_cffi is missing this is ignored rather than
+# fatal — see :func:`app.download.impersonate_target`.
+YTDLP_IMPERSONATE = _env("YTDLP_IMPERSONATE", default="chrome")
+
+# How many times a download that 403s is re-extracted before the candidate is
+# given up on. A 403 on the media fetch usually means the signed URL was
+# rejected or went stale between extraction and transfer, and a fresh
+# extraction is enough — so this is a genuine retry, not a hopeful one.
+YTDLP_403_RETRIES = _int("YTDLP_403_RETRIES", 2)
+
+# Seconds to hold the download queue after this many 403s in a row. Past a
+# handful of consecutive refusals it is the exit IP being throttled, not the
+# tracks, and continuing simply converts the whole queue into failures at the
+# speed the workers can dequeue it.
+YTDLP_403_STREAK = _int("YTDLP_403_STREAK", 3)
+YTDLP_403_COOLDOWN = _int("YTDLP_403_COOLDOWN", 300)
 
 # Escape hatches for networks, rate limits and bot checks — not everyday
 # settings. PO tokens look like "<client>.<context>+<token>", comma separated.

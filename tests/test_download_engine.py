@@ -405,3 +405,221 @@ def test_a_direct_download_without_a_url_still_gets_matched():
     with db.connect() as conn:
         row = conn.execute("SELECT source_url FROM downloads WHERE id = ?", (download_id,)).fetchone()
     assert row["source_url"] == ""
+
+
+# ─── HTTP 403 ──────────────────────────────────────────────────────────────
+#
+# The failure that produced all of this: search and metadata succeed, the media
+# fetch comes back 403, and the queue then converts every remaining track into
+# a failure at the speed it can dequeue them.
+
+
+@pytest.fixture(autouse=True)
+def no_lingering_cooldown():
+    """A test that trips the cooldown must not stall the next one."""
+    yield
+    download._403_until = 0.0
+    download._403_streak = 0
+
+
+class FakeYdl:
+    """A yt-dlp stand-in that fails a set number of times, then succeeds."""
+
+    def __init__(self, failures: int, error: str = "HTTP Error 403: Forbidden"):
+        self.remaining = failures
+        self.error = error
+        self.calls = 0
+
+    def YoutubeDL(self, options):  # noqa: N802 - mirrors yt_dlp's own name
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=True):
+        self.calls += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise RuntimeError(self.error)
+        return {"id": "abc"}
+
+
+def test_a_403_is_retried_against_freshly_extracted_urls(tmp_path, monkeypatch):
+    """The signed media URL goes stale; re-extracting produces a new one."""
+    monkeypatch.setattr(config, "YTDLP_403_RETRIES", 2)
+    fake = FakeYdl(failures=1)
+    sleeps = []
+    monkeypatch.setattr(download.time, "sleep", sleeps.append)
+
+    download._extract_with_retry(
+        fake, {}, download.Candidate(url="u", title="t"), tmp_path
+    )
+
+    assert fake.calls == 2
+    assert sleeps == [2]
+
+
+def test_retries_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_403_RETRIES", 2)
+    monkeypatch.setattr(download.time, "sleep", lambda seconds: None)
+    fake = FakeYdl(failures=99)
+
+    with pytest.raises(RuntimeError, match="403"):
+        download._extract_with_retry(
+            fake, {}, download.Candidate(url="u", title="t"), tmp_path
+        )
+    assert fake.calls == 3  # the first attempt plus two retries
+
+
+def test_anything_other_than_a_403_fails_immediately(tmp_path, monkeypatch):
+    """A missing format or a broken ffmpeg does not improve with waiting."""
+    monkeypatch.setattr(config, "YTDLP_403_RETRIES", 2)
+    fake = FakeYdl(failures=99, error="Requested format is not available")
+
+    with pytest.raises(RuntimeError):
+        download._extract_with_retry(
+            fake, {}, download.Candidate(url="u", title="t"), tmp_path
+        )
+    assert fake.calls == 1
+
+
+def test_partial_output_is_cleared_between_attempts(tmp_path, monkeypatch):
+    """Otherwise the half-file left by the refused attempt looks finished."""
+    monkeypatch.setattr(config, "YTDLP_403_RETRIES", 1)
+    monkeypatch.setattr(download.time, "sleep", lambda seconds: None)
+    (tmp_path / "abc.mp3").write_bytes(b"half a song")
+
+    download._extract_with_retry(
+        FakeYdl(failures=1), {}, download.Candidate(url="u", title="t"), tmp_path
+    )
+    assert not (tmp_path / "abc.mp3").exists()
+
+
+def test_a_refused_candidate_falls_through_to_the_next(monkeypatch):
+    """A different upload of the same track is often served without complaint."""
+    tried = []
+
+    def attempt(download_id, candidate, meta):
+        tried.append(candidate.url)
+        if candidate.url == "first":
+            raise download.DownloadError("HTTP Error 403: Forbidden")
+        return download.Path("/music/ok.mp3")
+
+    monkeypatch.setattr(download, "_download_audio", attempt)
+    candidates = [
+        download.Candidate(url="first", title="t"),
+        download.Candidate(url="second", title="t"),
+    ]
+
+    chosen, path = download._download_first_that_works(
+        1, candidates, {"artist": "A", "title": "T"}
+    )
+    assert tried == ["first", "second"]
+    assert chosen.url == "second"
+    assert str(path) == "/music/ok.mp3"
+
+
+def test_a_failure_that_is_not_a_403_does_not_try_other_candidates(monkeypatch):
+    tried = []
+
+    def attempt(download_id, candidate, meta):
+        tried.append(candidate.url)
+        raise download.DownloadError("ffmpeg is not installed")
+
+    monkeypatch.setattr(download, "_download_audio", attempt)
+    candidates = [
+        download.Candidate(url="first", title="t"),
+        download.Candidate(url="second", title="t"),
+    ]
+
+    with pytest.raises(download.DownloadError, match="ffmpeg"):
+        download._download_first_that_works(1, candidates, {"artist": "A", "title": "T"})
+    assert tried == ["first"]
+
+
+def test_a_streak_of_403s_pauses_the_queue(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_403_STREAK", 3)
+    monkeypatch.setattr(config, "YTDLP_403_COOLDOWN", 300)
+
+    download._note_403()
+    download._note_403()
+    assert download._403_until == 0.0  # two is not a pattern
+
+    download._note_403()
+    assert download._403_until > time.time()
+
+
+def test_a_completed_download_clears_the_streak(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_403_STREAK", 3)
+    monkeypatch.setattr(config, "YTDLP_403_COOLDOWN", 300)
+
+    download._note_403()
+    download._note_403()
+    download._note_download_ok()
+    download._note_403()
+
+    assert download._403_until == 0.0
+
+
+def test_the_cooldown_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_403_COOLDOWN", 0)
+
+    for _ in range(10):
+        download._note_403()
+    assert download._403_until == 0.0
+
+
+def test_the_403_message_names_the_likely_cause():
+    message = download.explain_forbidden("ERROR: unable to download video data: HTTP Error 403")
+    assert "VPN" in message
+    assert "YTDLP_COOKIES_FILE" in message
+
+
+@pytest.mark.parametrize("message", [
+    "ERROR: unable to download video data: HTTP Error 403: Forbidden",
+    "fragment 1 not found, unable to continue: HTTP Error 403",
+    "HTTP Error 403: Forbidden",
+])
+def test_refusals_are_recognised(message):
+    assert download.is_forbidden(message)
+
+
+@pytest.mark.parametrize("message", [
+    "Requested format is not available",
+    "no confident match on YouTube Music or YouTube",
+    "HTTP Error 404: Not Found",
+])
+def test_other_failures_are_not_mistaken_for_refusals(message):
+    assert not download.is_forbidden(message)
+
+
+# ─── Browser impersonation ─────────────────────────────────────────────────
+
+
+def test_impersonation_is_omitted_when_it_is_unavailable(monkeypatch):
+    """Asking for a target yt-dlp cannot provide fails every single request."""
+    monkeypatch.setattr(download, "_impersonate_cache", download._UNSET)
+    monkeypatch.setattr(download, "impersonate_target", lambda: None)
+    assert "impersonate" not in download._ydl_options()
+
+
+def test_impersonation_is_passed_through_when_available(monkeypatch):
+    monkeypatch.setattr(download, "impersonate_target", lambda: "chrome-target")
+    assert download._ydl_options()["impersonate"] == "chrome-target"
+
+
+def test_impersonation_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_IMPERSONATE", "")
+    monkeypatch.setattr(download, "_impersonate_cache", download._UNSET)
+    assert download.impersonate_target() is None
+    assert "off" in download.impersonation_status()
+
+
+def test_a_track_called_forbidden_is_not_mistaken_for_a_refusal():
+    """yt-dlp quotes video titles back in its errors."""
+    assert not download.is_forbidden(
+        "ERROR: Requested format is not available: Forbidden Fruit (Official Video)"
+    )

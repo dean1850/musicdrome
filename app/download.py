@@ -23,6 +23,20 @@ The client list itself is deliberately *not* pinned. yt-dlp's own defaults move
 with YouTube; a list written down here does not, and a stale pin is worse than
 no pin because it puts known-broken clients first.
 
+**On HTTP 403.** The search succeeds, the metadata call succeeds, and then the
+media fetch is refused. That is YouTube declining the *connection*, not the
+video: the exit address looks like a datacenter or a VPN, or the signed media
+URL went stale between extraction and transfer. Four things answer it, in the
+order they get a chance to:
+
+1. the TLS handshake impersonates Chrome (:func:`impersonate_target`), which is
+   what stops the connection looking like a script in the first place;
+2. a 403 mid-download is retried against freshly extracted URLs;
+3. failing that, the next-best candidate is tried, since a different upload of
+   the same track is often served without complaint;
+4. and once several downloads in a row have 403'd, the queue pauses instead of
+   converting every remaining track into a failure at dequeue speed.
+
 Downloads run on a small pool of worker threads draining the ``downloads``
 table, so the queue survives a restart: anything left mid-flight is requeued at
 boot by :func:`start_workers`.
@@ -86,9 +100,34 @@ _progress: dict[int, int] = {}
 _ytmusic_client: Any = None
 _ytmusic_lock = threading.Lock()
 
+# Appends to the one playlist are serialised: two workers finishing at the same
+# moment would otherwise interleave an #EXTINF with somebody else's path.
+_playlist_lock = threading.Lock()
+
+# How many downloads have 403'd in a row, and when the queue may resume. Shared
+# across the worker pool, hence the lock.
+_403_lock = threading.Lock()
+_403_streak = 0
+_403_until = 0.0
+
+_UNSET = object()
+_impersonate_cache: Any = _UNSET
+
+# yt-dlp reports a refusal in a few shapes ("HTTP Error 403: Forbidden",
+# "fragment 1 not found ... 403"), all of which carry the status code. Matching
+# the number rather than the word matters: yt-dlp's errors quote video titles,
+# and a track called "Forbidden" must not be mistaken for a refusal and sent
+# round the retry loop.
+_FORBIDDEN = re.compile(r"\b403\b")
+
 
 class DownloadError(RuntimeError):
     pass
+
+
+def is_forbidden(error: BaseException | str) -> bool:
+    """Whether an error is YouTube refusing the connection rather than us."""
+    return bool(_FORBIDDEN.search(str(error)))
 
 
 @dataclass
@@ -188,6 +227,81 @@ def js_runtime_problem() -> str:
         f"no usable JavaScript runtime ({'; '.join(problems)}) — YouTube downloads "
         f"will fail with 403 or find no formats. Install one yt-dlp accepts "
         f"(deno >= 2.3, node >= 22) or point YTDLP_JS_RUNTIMES at it."
+    )
+
+
+# ─── Browser impersonation ─────────────────────────────────────────────────
+
+
+def impersonate_target() -> Any | None:
+    """The browser yt-dlp should impersonate, or ``None`` to send our own TLS.
+
+    YouTube fingerprints the handshake — cipher order, extensions, ALPN, HTTP/2
+    settings — and python's stack has a signature nothing else on the internet
+    shares. From a home address that is usually let through; from a VPN or a
+    datacenter it is a large part of why the media fetch comes back 403 when
+    the search that preceded it was answered normally.
+
+    Every failure path here returns ``None`` rather than raising. Asking for a
+    target yt-dlp cannot provide makes *every* request fail with
+    "Impersonate target is not available", so an absent curl_cffi has to mean
+    "carry on without it", not "download nothing".
+    """
+    global _impersonate_cache
+    if _impersonate_cache is not _UNSET:
+        return _impersonate_cache
+
+    _impersonate_cache = None
+    name = config.YTDLP_IMPERSONATE.strip()
+    if not name:
+        return None
+
+    # Imported for its side effect of proving it works, not for anything it
+    # exports: a wheel that unpacked but cannot find its bundled libcurl raises
+    # here, and that is exactly as unusable as not being installed at all.
+    try:
+        import curl_cffi  # noqa: F401 — the only backend yt-dlp impersonates with
+    except Exception as exc:
+        log.debug("curl_cffi is unusable (%s); TLS impersonation is off", exc)
+        return None
+
+    try:
+        import yt_dlp
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+
+        target = ImpersonateTarget.from_str(name)
+    except Exception as exc:
+        log.warning("YTDLP_IMPERSONATE=%s is not a target yt-dlp knows: %s", name, exc)
+        return None
+
+    # Confirm something can actually serve it. The API is private, so an
+    # inspection that fails is treated as "probably fine" — curl_cffi is
+    # installed, which is the part that usually is not.
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "logger": _YtdlpLogger()}) as ydl:
+            available = ydl._get_available_impersonate_targets()
+        if available and not any(candidate in target for candidate, _ in available):
+            log.warning(
+                "no request handler can impersonate '%s' — continuing without it", name
+            )
+            return None
+    except Exception as exc:
+        log.debug("could not enumerate impersonation targets: %s", exc)
+
+    _impersonate_cache = target
+    return target
+
+
+def impersonation_status() -> str:
+    """One line for the boot log: what the connection will look like."""
+    target = impersonate_target()
+    if target:
+        return f"impersonating {target}"
+    if not config.YTDLP_IMPERSONATE.strip():
+        return "off (YTDLP_IMPERSONATE is empty)"
+    return (
+        "off — curl_cffi is unavailable, so YouTube sees a python TLS fingerprint. "
+        "Expect HTTP 403 on the media fetch from VPN or datacenter addresses."
     )
 
 
@@ -307,6 +421,13 @@ def _ydl_options(**overrides) -> dict[str, Any]:
         "sleep_interval_requests": 1,
     }
 
+    # A Chrome TLS fingerprint instead of python's, when curl_cffi can provide
+    # one. Left out entirely otherwise: an unavailable target fails every
+    # request, which would be a far worse problem than the one it solves.
+    target = impersonate_target()
+    if target is not None:
+        options["impersonate"] = target
+
     # Only ever sent when explicitly configured. Left unset, yt-dlp chooses,
     # and its choice tracks YouTube's current behaviour.
     clients = config.player_clients()
@@ -387,8 +508,14 @@ def _channel_artist(entry: dict[str, Any]) -> str:
     return re.sub(r"\s*-\s*Topic$", "", name, flags=re.IGNORECASE).strip()
 
 
-def best_match(artist: str, title: str, expected: int = 0) -> Candidate | None:
-    """The best candidate across both sources, or ``None`` if none is credible."""
+def ranked_matches(artist: str, title: str, expected: int = 0, limit: int = 3) -> list[Candidate]:
+    """Every credible candidate across both sources, best first.
+
+    More than one is worth having because YouTube's refusals are per-upload: a
+    track that answers 403 from one video id is regularly served without
+    complaint from another upload of the same recording, so a download that
+    hits a wall has somewhere to go before it is called a failure.
+    """
     ranked: list[Candidate] = []
 
     for candidate in search_ytmusic(artist, title):
@@ -396,17 +523,21 @@ def best_match(artist: str, title: str, expected: int = 0) -> Candidate | None:
         ranked.append(candidate)
 
     ranked.sort(key=lambda c: c.score, reverse=True)
-    if ranked and ranked[0].score >= GOOD_SCORE:
-        return ranked[0]
+    # A strong YouTube Music hit is trusted on its own; plain YouTube is only
+    # consulted when nothing in the catalogue was convincing enough.
+    if not ranked or ranked[0].score < GOOD_SCORE:
+        for candidate in search_youtube(artist, title):
+            candidate.score = score(candidate, artist, title, expected)
+            ranked.append(candidate)
+        ranked.sort(key=lambda c: c.score, reverse=True)
 
-    for candidate in search_youtube(artist, title):
-        candidate.score = score(candidate, artist, title, expected)
-        ranked.append(candidate)
+    return [candidate for candidate in ranked if candidate.score >= MIN_SCORE][:limit]
 
-    ranked.sort(key=lambda c: c.score, reverse=True)
-    if ranked and ranked[0].score >= MIN_SCORE:
-        return ranked[0]
-    return None
+
+def best_match(artist: str, title: str, expected: int = 0) -> Candidate | None:
+    """The best candidate across both sources, or ``None`` if none is credible."""
+    ranked = ranked_matches(artist, title, expected, limit=1)
+    return ranked[0] if ranked else None
 
 
 # ─── Tagging and filing ────────────────────────────────────────────────────
@@ -535,33 +666,147 @@ def target_path(artist: str, album: str, title: str, track_no: int = 0,
     raise DownloadError(f"too many files named {title_part} in {directory}")
 
 
-def append_to_playlist(scan_id: int | None, path: Path, meta: dict[str, Any]) -> str:
-    """Add a finished download to its scan's .m3u, creating it on first use.
+def playlist_entry(path: Path) -> str:
+    """Where a downloaded file sits, written relative to the playlist.
 
-    Paths are written relative to the playlist file so the folder can be moved
-    or mounted elsewhere and still play.
+    Relative so the library can be moved, or mounted at a different path in
+    whatever plays it, without every line breaking.
     """
-    if not scan_id:
-        return ""
-
-    config.PLAYLIST_DIR.mkdir(parents=True, exist_ok=True)
-    playlist = config.PLAYLIST_DIR / f"musicdrome-scan-{scan_id:04d}.m3u"
-
     try:
-        relative = path.relative_to(config.PLAYLIST_DIR.parent)
-        entry = Path("..") / relative
+        return (Path("..") / path.relative_to(config.PLAYLIST_DIR.parent)).as_posix()
     except ValueError:
-        entry = path
+        return str(path)
 
-    new_file = not playlist.exists()
-    with playlist.open("a", encoding="utf-8") as handle:
-        if new_file:
-            handle.write("#EXTM3U\n")
-        handle.write(
-            f"#EXTINF:{meta.get('duration', 0)},{meta.get('artist', '')} - {meta.get('title', '')}\n"
-            f"{entry.as_posix()}\n"
-        )
+
+def playlist_paths(playlist: Path) -> set[str]:
+    """The file paths already listed in a playlist, ignoring the #EXTINF lines."""
+    try:
+        text = playlist.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    return {
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+
+
+def append_to_playlist(path: Path, meta: dict[str, Any]) -> str:
+    """Add a finished download to the one Musicdrome playlist.
+
+    One file for the life of the install, not one per scan. Per-scan playlists
+    meant a library server accumulated a musicdrome-scan-0001, -0002, -0003
+    that nobody opened twice, and no single place to hear what Musicdrome has
+    actually brought in.
+
+    Appending is idempotent: a track already listed is not listed again, so a
+    re-download or a retry cannot double an entry.
+    """
+    entry = playlist_entry(path)
+    playlist = config.PLAYLIST_PATH
+
+    with _playlist_lock:
+        try:
+            config.PLAYLIST_DIR.mkdir(parents=True, exist_ok=True)
+            if entry in playlist_paths(playlist):
+                return str(playlist)
+
+            new_file = not playlist.exists()
+            with playlist.open("a", encoding="utf-8") as handle:
+                if new_file:
+                    handle.write("#EXTM3U\n")
+                handle.write(
+                    f"#EXTINF:{meta.get('duration', 0)},"
+                    f"{meta.get('artist', '')} - {meta.get('title', '')}\n"
+                    f"{entry}\n"
+                )
+        except OSError as exc:
+            # The file is on disk and the row is written; a playlist that could
+            # not be updated is worth a line in the log and nothing more.
+            log.warning("could not update %s: %s", playlist, exc)
+            return ""
     return str(playlist)
+
+
+def _parse_playlist(playlist: Path) -> list[tuple[str, str]]:
+    """``(#EXTINF line, path)`` pairs from an .m3u, in order."""
+    try:
+        lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        log.warning("could not read %s: %s", playlist, exc)
+        return []
+
+    entries: list[tuple[str, str]] = []
+    extinf = ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            # Anything else (#EXTM3U, comments) is not carried across.
+            extinf = stripped if stripped.startswith("#EXTINF:") else extinf
+            continue
+        entries.append((extinf, stripped))
+        extinf = ""
+    return entries
+
+
+def consolidate_scan_playlists() -> int:
+    """Fold the old per-scan playlists into the single one and delete them.
+
+    Runs once, at boot, for installs that predate the single playlist. Only
+    files this app wrote are touched — the ``musicdrome-scan-NNNN.m3u`` naming
+    is matched exactly, inside our own playlist directory — so nothing a person
+    made by hand is at risk.
+    """
+    if not config.PLAYLIST_DIR.is_dir():
+        return 0
+
+    # Never the destination itself, however MUSICDROME_PLAYLIST_NAME is set —
+    # merging a file into itself and then deleting it would lose the lot.
+    old = [
+        path
+        for path in sorted(config.PLAYLIST_DIR.glob("musicdrome-scan-[0-9]*.m3u"))
+        if path != config.PLAYLIST_PATH
+    ]
+    if not old:
+        return 0
+
+    with _playlist_lock:
+        playlist = config.PLAYLIST_PATH
+        seen = playlist_paths(playlist)
+        merged = 0
+        try:
+            new_file = not playlist.exists()
+            with playlist.open("a", encoding="utf-8") as handle:
+                if new_file:
+                    handle.write("#EXTM3U\n")
+                for source in old:
+                    for extinf, entry in _parse_playlist(source):
+                        if entry in seen:
+                            continue
+                        seen.add(entry)
+                        if extinf:
+                            handle.write(f"{extinf}\n")
+                        handle.write(f"{entry}\n")
+                        merged += 1
+        except OSError as exc:
+            log.warning("could not merge the old scan playlists: %s", exc)
+            return 0
+
+        removed = 0
+        for source in old:
+            try:
+                source.unlink()
+                removed += 1
+            except OSError as exc:
+                log.warning("could not remove %s: %s", source, exc)
+
+    log.info(
+        "merged %d track(s) from %d per-scan playlist(s) into %s",
+        merged, removed, playlist.name,
+    )
+    return merged
 
 
 # ─── Temporary files ───────────────────────────────────────────────────────
@@ -603,7 +848,7 @@ def fetch(download_id: int) -> None:
     with db.connect() as conn:
         row = conn.execute(
             "SELECT d.*, s.year, s.track_no, s.tags, s.cover_url, s.recording_mbid, "
-            "       s.duration AS want_duration, s.scan_id "
+            "       s.duration AS want_duration "
             "FROM downloads d LEFT JOIN suggestions s ON s.id = d.suggestion_id "
             "WHERE d.id = ?",
             (download_id,),
@@ -628,24 +873,25 @@ def fetch(download_id: int) -> None:
         # A row that already carries a source URL came from a pasted link —
         # the user named the exact recording, so there is nothing to match.
         if meta.get("source_url"):
-            candidate = Candidate(
-                url=meta["source_url"],
-                title=meta["title"],
-                artist=meta["artist"],
-                source=meta.get("source") or "url",
-                score=1.0,
-            )
+            candidates = [
+                Candidate(
+                    url=meta["source_url"],
+                    title=meta["title"],
+                    artist=meta["artist"],
+                    source=meta.get("source") or "url",
+                    score=1.0,
+                )
+            ]
         else:
-            candidate = best_match(meta["artist"], meta["title"], int(meta["want_duration"] or 0))
-            if candidate is None:
+            candidates = ranked_matches(
+                meta["artist"], meta["title"], int(meta["want_duration"] or 0)
+            )
+            if not candidates:
                 raise DownloadError("no confident match on YouTube Music or YouTube")
 
-        log.info(
-            "downloading %s — %s from %s (score %.2f)",
-            meta["artist"], meta["title"], candidate.source, candidate.score,
-        )
-        path = _download_audio(download_id, candidate, meta)
-        playlist = append_to_playlist(meta["scan_id"], path, meta)
+        candidate, path = _download_first_that_works(download_id, candidates, meta)
+        append_to_playlist(path, meta)
+        _note_download_ok()
 
         with db.connect() as conn:
             conn.execute(
@@ -661,14 +907,14 @@ def fetch(download_id: int) -> None:
                     "UPDATE suggestions SET status = 'downloaded', decided_at = ? WHERE id = ?",
                     (db.now(), meta["suggestion_id"]),
                 )
-            if playlist and meta["scan_id"]:
-                conn.execute(
-                    "UPDATE scans SET playlist_path = ? WHERE id = ?", (playlist, meta["scan_id"])
-                )
         log.info("imported %s", path)
 
     except Exception as exc:
-        message = str(exc)[:500]
+        message = str(exc)
+        if is_forbidden(exc):
+            message = explain_forbidden(message)
+            _note_403()
+        message = message[:500]
         log.warning("download %d failed: %s", download_id, message)
         with db.connect() as conn:
             conn.execute(
@@ -682,6 +928,92 @@ def fetch(download_id: int) -> None:
                 )
     finally:
         _progress.pop(download_id, None)
+
+
+def explain_forbidden(message: str) -> str:
+    """Turn a bare 403 into something that names the likely cause.
+
+    "HTTP Error 403: Forbidden" is true and useless. It is almost never the
+    track: the search and the metadata call went through on the same
+    connection moments earlier, so what was refused is who is asking.
+    """
+    return (
+        f"{message.strip()} — YouTube refused the media fetch. This is the exit "
+        f"address, not the track: VPN and datacenter IPs are blocked routinely. "
+        f"Route downloads outside the VPN, or give yt-dlp a signed-in identity "
+        f"with YTDLP_COOKIES_FILE or YTDLP_PO_TOKEN."
+    )
+
+
+def _note_403() -> None:
+    """Count a refusal, and pause the queue once they start arriving in a run."""
+    global _403_streak, _403_until
+
+    if config.YTDLP_403_COOLDOWN <= 0 or config.YTDLP_403_STREAK <= 0:
+        return
+
+    with _403_lock:
+        _403_streak += 1
+        if _403_streak < config.YTDLP_403_STREAK:
+            return
+        _403_streak = 0
+        _403_until = time.time() + config.YTDLP_403_COOLDOWN
+
+    log.warning(
+        "%d downloads refused in a row — pausing the queue for %d seconds. "
+        "Continuing would just convert the rest of the queue into failures.",
+        config.YTDLP_403_STREAK, config.YTDLP_403_COOLDOWN,
+    )
+
+
+def _note_download_ok() -> None:
+    """A completed download means whatever was refusing us has stopped."""
+    global _403_streak
+    with _403_lock:
+        _403_streak = 0
+
+
+def _wait_out_cooldown() -> None:
+    """Block until the 403 cooldown has expired. Called between downloads."""
+    while True:
+        with _403_lock:
+            remaining = _403_until - time.time()
+        if remaining <= 0:
+            return
+        # Short sleeps so a container stop is not held up by a long pause.
+        time.sleep(min(remaining, 5.0))
+
+
+def _download_first_that_works(
+    download_id: int, candidates: list[Candidate], meta: dict[str, Any]
+) -> tuple[Candidate, Path]:
+    """Try each candidate in turn, moving on only when one is refused.
+
+    A 403 is the single failure worth trying a different upload for. Anything
+    else — no formats, a bad encode, an unwritable library — will fail exactly
+    the same way on the next candidate, so it is raised immediately rather than
+    spending three searches to arrive at the same message.
+    """
+    last: Exception | None = None
+
+    for index, candidate in enumerate(candidates):
+        log.info(
+            "downloading %s — %s from %s (score %.2f)",
+            meta["artist"], meta["title"], candidate.source, candidate.score,
+        )
+        try:
+            return candidate, _download_audio(download_id, candidate, meta)
+        except Exception as exc:
+            if not is_forbidden(exc):
+                raise
+            last = exc
+            if index + 1 < len(candidates):
+                log.info(
+                    "refused by YouTube — trying the next candidate (%d of %d)",
+                    index + 2, len(candidates),
+                )
+
+    raise DownloadError(str(last) if last else "no candidate could be downloaded")
 
 
 def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]) -> Path:
@@ -716,8 +1048,7 @@ def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]
             ],
             ffmpeg_location=str(Path(config.FFMPEG_PATH).parent),
         )
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.extract_info(candidate.url, download=True)
+        _extract_with_retry(yt_dlp, options, candidate, workdir)
 
         produced = sorted(
             (p for p in workdir.iterdir()
@@ -740,6 +1071,41 @@ def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]
         return target
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _extract_with_retry(yt_dlp, options: dict[str, Any], candidate: Candidate, workdir: Path) -> None:
+    """Download one candidate, re-extracting when YouTube answers 403.
+
+    The media URLs yt-dlp hands to the transfer are signed and short-lived, and
+    a 403 partway through usually means the one in hand was rejected — the
+    player response it came from is minutes old, or the client it was issued
+    for has just been throttled. Extracting again produces fresh URLs, which is
+    why this retries the whole ``extract_info`` rather than the transfer.
+
+    Only 403s are retried. Everything else fails on the first attempt, as it
+    should: a missing format or a broken ffmpeg does not improve with waiting.
+    """
+    attempts = max(0, config.YTDLP_403_RETRIES) + 1
+
+    for attempt in range(attempts):
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.extract_info(candidate.url, download=True)
+            return
+        except Exception as exc:
+            if not is_forbidden(exc) or attempt + 1 >= attempts:
+                raise
+            delay = 2 * (3 ** attempt)  # 2s, 6s, 18s
+            log.info(
+                "403 on %s — re-extracting in %ds (attempt %d of %d)",
+                candidate.url, delay, attempt + 2, attempts,
+            )
+            # Partial output from the refused attempt, which would otherwise be
+            # picked up as the finished file.
+            for leftover in workdir.iterdir():
+                if leftover.is_file():
+                    leftover.unlink(missing_ok=True)
+            time.sleep(delay)
 
 
 def _set_status(download_id: int, status: str) -> None:
@@ -775,10 +1141,10 @@ def enqueue(suggestion_id: int) -> int | None:
             return existing["id"]
 
         cursor = conn.execute(
-            "INSERT INTO downloads (suggestion_id, user_id, track_key, artist, title, album, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO downloads (suggestion_id, track_key, artist, title, album, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                suggestion_id, row["user_id"], row["track_key"], row["artist"], row["title"],
+                suggestion_id, row["track_key"], row["artist"], row["title"],
                 row["album"], db.now(),
             ),
         )
@@ -793,7 +1159,7 @@ def enqueue(suggestion_id: int) -> int | None:
 
 
 def enqueue_direct(*, artist: str, title: str, album: str = "", url: str = "",
-                   source: str = "url", user_id: int | None = None) -> int:
+                   source: str = "url") -> int:
     """Queue a track the user named directly, by pasted link or by hand.
 
     When ``url`` is set the download skips matching entirely — the link already
@@ -801,9 +1167,9 @@ def enqueue_direct(*, artist: str, title: str, album: str = "", url: str = "",
     """
     with db.connect() as conn:
         cursor = conn.execute(
-            "INSERT INTO downloads (user_id, track_key, artist, title, album, source_url, source, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, track_key(artist, title), artist, title, album, url, source, db.now()),
+            "INSERT INTO downloads (track_key, artist, title, album, source_url, source, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (track_key(artist, title), artist, title, album, url, source, db.now()),
         )
         download_id = cursor.lastrowid
 
@@ -811,7 +1177,7 @@ def enqueue_direct(*, artist: str, title: str, album: str = "", url: str = "",
     return download_id
 
 
-def auto_enqueue(scan_id: int | None = None, user_id: int | None = None) -> int:
+def auto_enqueue(scan_id: int | None = None) -> int:
     """Queue high-confidence suggestions, if auto-download is switched on.
 
     The daily cap counts finished downloads in the last 24 hours, so a runaway
@@ -829,14 +1195,11 @@ def auto_enqueue(scan_id: int | None = None, user_id: int | None = None) -> int:
     query = (
         "SELECT id FROM suggestions WHERE status = 'new' AND match >= ? "
         + ("AND scan_id = ? " if scan_id else "")
-        + ("AND user_id = ? " if user_id else "")
         + "ORDER BY match DESC LIMIT ?"
     )
     params: list[Any] = [int(settings["auto_download_threshold"])]
     if scan_id:
         params.append(scan_id)
-    if user_id:
-        params.append(user_id)
     params.append(remaining)
 
     with db.connect() as conn:
@@ -862,6 +1225,9 @@ def _worker() -> None:
     while True:
         download_id = _queue.get()
         try:
+            # Held here rather than inside fetch() so a paused queue leaves the
+            # row 'queued' — a download that has not started has not failed.
+            _wait_out_cooldown()
             fetch(download_id)
         except Exception:
             log.exception("download worker crashed on %s", download_id)

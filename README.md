@@ -38,6 +38,12 @@ Open <http://localhost:3046> and press **Scan now**.
 Update with `docker compose pull && docker compose up -d`. The database survives
 schema changes automatically.
 
+The shipped `docker-compose.yml` routes Musicdrome through
+[gluetun](https://github.com/qdm12/gluetun), so downloads leave over a VPN. Port
+3046 is then published by the gluetun service rather than this one. Not using
+gluetun? Drop `network_mode` and `networks` and add a `ports:` block — the file
+says exactly what, in a comment at the top.
+
 ### Building from source instead
 
 If you have the repository checked out — to run an unpushed change, or because
@@ -97,12 +103,13 @@ A track is excluded if any of these is true:
 - it is anywhere in your scrobble history
 - Musicdrome already downloaded it
 - you dismissed it with ✕
-- it was found in `EXCLUDE_MUSIC_DIR`
+- it was found in `EXCLUDE_MUSIC_DIR`, which is your library
 
-That last one is an existing library you point at. It is mounted read-only, and
-only artist and title tags are read from it — no library database is built,
-nothing is moved, nothing is written. Set it if you have a collection that
-predates Musicdrome.
+That last one is the collection you already have. Compose points it at `/music`,
+the same directory downloads are filed into, which is the point: everything you
+owned before Musicdrome existed is excluded, and so is everything it has fetched
+since. Only artist and title tags are read — no library database is built,
+nothing is moved, nothing is written that Musicdrome did not download.
 
 Matching is done on normalised keys, so "The Beatles" and "Beatles", or
 "Karma Police" and "Karma Police (Remastered 2016)", are recognised as the same
@@ -110,16 +117,17 @@ thing rather than suggested back to you.
 
 ## Configuration
 
-`.env` carries startup concerns only — keys, usernames, paths, port. Every value
-has a working default, so a `.env` with your Last.fm key and an AI credential is
-a complete configuration. See [`.env.example`](.env.example).
+`.env` carries startup concerns only — keys, usernames, paths, port. Two paths
+have no default and describe your machine: `MUSIC_LOCATION`, your library, and
+`DATA_LOCATION`, where the SQLite database goes. Inside the container they are
+always `/music` and `/config`; `docker-compose.yml` sets that and you never need
+to. See [`.env.example`](.env.example).
 
 Everything you would want to change while using it lives in the **Settings** tab
 and applies immediately, no restart:
 
 | Setting | Default | |
 |---|---|---|
-| Listeners | One | Who lives here, and their scrobble accounts |
 | Schedule | Daily | Off, every 6 hours, daily or weekly |
 | Tracks per scan | 40 | 5–100, one AI call regardless |
 | Listening window | 90 days | How far back the taste profile reaches |
@@ -129,48 +137,20 @@ and applies immediately, no restart:
 | Retention | 60 days | Un-actioned cards are purged; decisions are kept |
 | Taste summary | On | One AI call a day for the stats page |
 
-## Listeners
+## One listener
 
-A household is rarely one set of ears. Musicdrome keeps a list of **listeners**,
-each with their own Last.fm and ListenBrainz accounts, and everything that is a
-matter of taste is kept per person: their scrobble history, their recommendation
-cards, their saved and hidden decisions, their stats page.
+Musicdrome recommends for one person. `LASTFM_USER` and `LISTENBRAINZ_USER` in
+`.env` are who that is, and there is nothing else to set up — no accounts, no
+profiles, no picker.
 
-What is shared is the music. One library on disk, one download queue — because a
-house has one record collection. Hiding a card never removes it from someone
-else's grid, and the same track can be recommended to two people independently.
-
-There are no passwords. A listener is a taste profile, not an account, and the
-picker in the header works the way a streaming box asks who is watching. Put
-Musicdrome behind a VPN or an authenticating proxy if it needs to be reachable
-from outside — see [Security](#security).
-
-Add people in **Settings → Listeners**. Scans run for whoever is selected;
-scheduled scans run for every active listener in turn, so everyone's grid is
-fresh in the morning. Deactivate someone to keep their history but skip them.
-
-### Importing from Navidrome
-
-If you already run [Navidrome](https://github.com/navidrome/navidrome), it knows
-who lives here. Set the admin credentials in `.env`:
-
-```bash
-NAVIDROME_URL=http://192.168.1.5:4533
-NAVIDROME_USER=admin
-NAVIDROME_PASSWORD=...
-```
-
-and **Import from Navidrome** appears in Settings. It brings across the account
-names and mail addresses. Nothing is ever written back.
-
-**It cannot import anyone's Last.fm account, and no integration could.**
-Navidrome's Subsonic `getUsers` returns usernames, mail addresses and role flags
-only; each user's linked scrobble session is kept private and is never exposed
-over the API, not even to an admin. So the roster arrives automatically and the
-scrobble usernames are filled in once per person, by hand, in Settings.
-
-Listing users is admin-only, which is why the credentials above have to be an
-admin's. The password is never sent — Subsonic's salted-token scheme is used.
+This was briefly a household app, with a users table and per-person suggestions.
+It was more machinery than the job needed: one library, one queue and one taste
+profile is what actually gets used. Upgrading from a multi-user image drops the
+listening history and re-syncs it from Last.fm and ListenBrainz on the next scan
+(they hold every scrobble; nothing is lost that cannot be fetched again).
+Downloads are kept, because those rows name files that are on your disk. The old
+database is copied to `musicdrome.db.pre-single-user` first, in case you want to
+go back.
 
 ## Downloads
 
@@ -180,11 +160,16 @@ recording MBID) with cover art embedded, and filed as:
 
 ```
 /music/Radiohead/OK Computer/06 - Karma Police.mp3
-/music/_playlists/musicdrome-scan-0007.m3u
+/music/_playlists/Musicdrome.m3u
 ```
 
-Each scan writes an `.m3u` of its own batch with relative paths, so a discovery
-run can be played as a set and the folder can be moved without breaking it.
+**One playlist, appended to forever.** Every download lands in
+`_playlists/Musicdrome.m3u` with relative paths, so the folder can be moved
+without breaking it, and a re-download never doubles an entry. Navidrome, Plex
+and Jellyfin import it as a single playlist that grows — which is the point:
+per-scan playlists produced a wall of `musicdrome-scan-0001`, `-0002`, `-0003`
+that nobody opened twice. Old per-scan files are merged into it and deleted the
+first time the new image boots. Rename it with `MUSICDROME_PLAYLIST_NAME`.
 
 Jellyfin, Navidrome, Plex and friends read this layout as-is — point them at the
 same directory.
@@ -266,12 +251,12 @@ YouTube as it changes. The clients that still serve real URLs need a JavaScript
 runtime to solve YouTube's signature challenges; the image ships Deno for that,
 plus yt-dlp's solver scripts (`YTDLP_JS_RUNTIMES`, `YTDLP_REMOTE_COMPONENTS`).
 
-### "No supported JavaScript runtime could be found", or HTTP 403
+### "No supported JavaScript runtime could be found"
 
-The same root cause, one step earlier. yt-dlp needs an external JavaScript
-runtime to answer YouTube's challenges, and when it cannot find a usable one it
-does not stop — it falls back to clients that need no JavaScript, and YouTube
-answers those with `HTTP Error 403: Forbidden` partway through the download.
+The same root cause as above, one step earlier. yt-dlp needs an external
+JavaScript runtime to answer YouTube's challenges, and when it cannot find a
+usable one it does not stop — it falls back to clients that need no JavaScript,
+and YouTube answers those with `HTTP Error 403: Forbidden` partway through.
 
 **A runtime that is installed but too old counts as missing.** yt-dlp requires
 Deno ≥ 2.3, Node ≥ 22, or QuickJS ≥ 2023-12-9, and anything below the floor is
@@ -284,9 +269,38 @@ recommended runtime, and Musicdrome logs which runtime it found at boot:
 INFO  app.download: javascript: deno 2.9.5
 ```
 
-If that line is missing, or an error follows it, downloads will 403. Pull the
-current image; `YTDLP_JS_RUNTIMES` only needs setting if you are running
-outside the image and want to name a runtime of your own.
+If that line is missing, or an error follows it, downloads will 403.
+
+### "HTTP Error 403: Forbidden"
+
+The search succeeded, the metadata call succeeded, and then the media fetch was
+refused. Once the JavaScript runtime above is confirmed working, what is left is
+**who is asking**, not what is being asked for. YouTube fingerprints the TLS
+handshake and the address it comes from, and blocks VPN and datacenter exits
+routinely — so this is common the moment you route downloads through gluetun.
+
+Musicdrome pushes back four ways, all on by default:
+
+| | | Setting |
+|---|---|---|
+| 1 | The TLS handshake impersonates Chrome, so the connection stops looking like a python script | `YTDLP_IMPERSONATE=chrome` |
+| 2 | A 403 mid-download is retried against freshly extracted URLs — a signed media URL that went stale produces exactly this error | `YTDLP_403_RETRIES=2` |
+| 3 | Then the next-best candidate is tried, since a different upload of the same track is often served without complaint | — |
+| 4 | And after several refusals in a row the queue pauses, rather than converting every remaining track into a failure at dequeue speed | `YTDLP_403_STREAK`, `YTDLP_403_COOLDOWN` |
+
+Impersonation needs [curl_cffi](https://github.com/lexiforest/curl_cffi), which
+the image installs — note that `yt-dlp[default]` does **not** include it, so an
+install that builds its own environment has to add it or yt-dlp silently reports
+zero impersonation targets. Musicdrome says which it got at boot:
+
+```
+INFO  app.main: tls:     impersonating chrome
+```
+
+If downloads still 403 after all of that, the exit address is the problem.
+Either route downloads outside the VPN, or give yt-dlp a signed-in identity:
+export cookies to a Netscape-format file (`YTDLP_COOKIES_FILE`) or supply a PO
+token (`YTDLP_PO_TOKEN`).
 
 ### "no confident match on YouTube Music or YouTube"
 
@@ -299,9 +313,8 @@ titles; a narrower listening window tends to help.
 ## Security
 
 Musicdrome has **no authentication**, by design — it is meant for a trusted home
-network. Listeners are taste profiles, not accounts: picking a different one is
-not a login and is not a security boundary. Put it behind a VPN or an
-authenticating reverse proxy if you need to reach it from outside.
+network. Put it behind a VPN or an authenticating reverse proxy if you need to
+reach it from outside.
 
 ## Notes
 

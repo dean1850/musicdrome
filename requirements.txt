@@ -18,6 +18,15 @@ ytmusicapi==1.9.0
 yt-dlp[default]>=2026.7.4
 mutagen==1.47.0
 
+# The TLS fingerprint YouTube is willing to serve. yt-dlp can impersonate a
+# real browser handshake, but only through curl_cffi — and the [default] extra
+# above does *not* include it, so without this line yt-dlp reports zero
+# impersonation targets and every request goes out looking like a python
+# script. On a home connection that is usually tolerated; from a VPN or a
+# datacenter it is a large part of why the media fetch answers 403 when the
+# search on the same connection did not. See YTDLP_IMPERSONATE in .env.example.
+curl_cffi>=0.7.0
+
 # ── Scan schedule ───────────────────────────────────────
 APScheduler==3.11.0
 
