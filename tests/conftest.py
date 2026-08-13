@@ -53,55 +53,34 @@ def client():
 
 
 @pytest.fixture
-def default_user():
-    """The user :func:`app.db.init` seeds, which owns fixture data by default."""
-    from app import users
-
-    return users.default_id()
-
-
-@pytest.fixture
-def make_user():
-    """Add a second person, for the tests that check taste stays separate."""
-    from app import users
-
-    def add(name: str, **fields) -> int:
-        return users.create(name=name, **fields)["id"]
-
-    return add
-
-
-@pytest.fixture
-def play(default_user):
+def play():
     """Insert a play. Usage: ``play("Radiohead", "Karma Police", at=...)``."""
     from app.norm import artist_key, track_key
 
-    def add(artist: str, title: str, at: int | None = None, source: str = "lastfm",
-            user_id: int | None = None) -> None:
+    def add(artist: str, title: str, at: int | None = None, source: str = "lastfm") -> None:
         with db.connect() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO plays "
-                "(user_id, artist, title, album, artist_key, track_key, played_at, source) "
-                "VALUES (?, ?, ?, '', ?, ?, ?, ?)",
-                (user_id or default_user, artist, title, artist_key(artist),
-                 track_key(artist, title), at if at is not None else db.now(), source),
+                "(artist, title, album, artist_key, track_key, played_at, source) "
+                "VALUES (?, ?, '', ?, ?, ?, ?)",
+                (artist, title, artist_key(artist), track_key(artist, title),
+                 at if at is not None else db.now(), source),
             )
 
     return add
 
 
 @pytest.fixture
-def suggestion(default_user):
+def suggestion():
     """Insert a suggestion and return its id."""
     from app.norm import track_key
 
     def add(artist: str, title: str, match: int = 90, status: str = "new", **extra) -> int:
         with db.connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO suggestions (user_id, track_key, artist, title, album, match, reason, "
-                "tags, status, duration, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO suggestions (track_key, artist, title, album, match, reason, "
+                "tags, status, duration, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    extra.get("user_id") or default_user,
                     track_key(artist, title), artist, title, extra.get("album", ""),
                     match, extra.get("reason", ""), extra.get("tags", ""), status,
                     extra.get("duration", 0), db.now(),

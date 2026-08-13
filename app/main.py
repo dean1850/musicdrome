@@ -92,6 +92,14 @@ async def lifespan(app: FastAPI):
     if problem:
         log.error("youtube downloads will be degraded: %s", problem)
 
+    # And for the TLS fingerprint, which decides whether YouTube answers the
+    # media fetch at all from a VPN or a datacenter address.
+    log.info("tls:     %s", download.impersonation_status())
+
+    # One playlist, not one per scan. Installs that predate that have their old
+    # per-scan files folded into it here, once.
+    download.consolidate_scan_playlists()
+
     if not config.TESTING:
         download.start_workers()
         scheduler.start()

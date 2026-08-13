@@ -7,8 +7,23 @@
 #
 #    docker compose pull && docker compose up -d
 #
-#  One container, one SQLite file. Ollama, if you use it, is something you
-#  already run; Musicdrome talks to it over HTTP.
+#  This file routes Musicdrome through gluetun, so every YouTube request leaves
+#  over the VPN. Two consequences worth knowing:
+#
+#    * Ports are published by gluetun, not here. Add 3046 to the gluetun
+#      service's `ports:` to reach the UI.
+#    * A VPN exit address is a common cause of "HTTP Error 403" on downloads.
+#      Musicdrome now impersonates a browser TLS fingerprint, retries and backs
+#      off (see the 403 notes in .env.example), but if downloads still fail,
+#      the exit IP is the first thing to change.
+#
+#  Not using gluetun? Delete `network_mode` and `networks`, then add:
+#
+#      ports:
+#        - "${MUSICDROME_PORT:-3046}:3046"
+#        # so http://host.docker.internal:11434 reaches Ollama on the host
+#      extra_hosts:
+#        - "host.docker.internal:host-gateway"
 #
 #  Every value below comes from .env — see .env.example.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -19,36 +34,27 @@ services:
     # version (:v2.0.0) or a commit (:sha-abc1234). Both are published.
     image: ghcr.io/dean1850/musicdrome:latest
     container_name: musicdrome
+    network_mode: service:gluetun
     restart: unless-stopped
     env_file:
       - .env
+    # These three are container paths and never change. They are set here
+    # rather than in .env because .env describes your machine, and /music and
+    # /config only mean anything inside the container.
     environment:
       MUSICDROME_MUSIC_DIR: /music
       MUSICDROME_DATA_DIR: /config
-      EXCLUDE_MUSIC_DIR: "${EXCLUDE_MUSIC_DIR:+/library}"
-    ports:
-      - "${MUSICDROME_PORT:-3046}:${MUSICDROME_PORT:-3046}"
+      # The library is scanned for artist/title tags so nothing you already own
+      # is ever suggested to you. It is the same directory downloads are filed
+      # into, which is the point: yesterday's download is today's "already have
+      # it".
+      EXCLUDE_MUSIC_DIR: /music
     volumes:
-      # Where downloads are filed as Artist/Album/01 - Title.mp3
-      - "${MUSIC_DIR:-./data/music}:/music"
-      # The SQLite database
-      - "${DATA_DIR:-./data/config}:/config"
-      # Optional: an existing library, mounted read-only, read for artist and
-      # title tags only so its tracks are never suggested to you.
-      #
-      # The fallback has to be a real directory — a bind mount cannot point at
-      # nothing. When EXCLUDE_MUSIC_DIR is unset this mounts ./data/music
-      # instead and the container-side variable above stays empty, so the
-      # directory is mounted but never scanned.
-      - "${EXCLUDE_MUSIC_DIR:-./data/music}:/library:ro"
-    # Lets http://host.docker.internal:<port> reach Ollama on the Docker host.
-    # Docker Desktop provides this name already; the mapping is what makes it
-    # work on Linux too.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${MUSICDROME_PORT:-3046}/api/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      start_period: 20s
-      retries: 3
+      # Your music. Downloads are filed here as Artist/Album/01 - Title.mp3,
+      # so it has to be writable — a read-only mount fails every download at
+      # the last step, after the audio has been fetched and encoded.
+      - ${MUSIC_LOCATION:-./data/music}:/music
+      # The SQLite database, and nothing else.
+      - ${DATA_LOCATION:-./data/config}:/config
+
+networks: {}

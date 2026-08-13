@@ -29,30 +29,24 @@ artists back verbatim. No preamble, no headings.
 """
 
 
-def overview(days: int = 90, user_id: int | None = None) -> dict[str, Any]:
-    """Everything the stats page draws, in one query batch.
-
-    Scoped to one listener when given one, so a household's stats page shows
-    whoever is selected rather than everybody's plays added together.
-    """
+def overview(days: int = 90) -> dict[str, Any]:
+    """Everything the stats page draws, in one query batch."""
     since = db.now() - days * 86400
-    # Appended to every windowed query below. The extra parameter has to be
-    # appended in the same order, hence one list reused throughout.
-    scope = "AND user_id = ?" if user_id else ""
-    params: list[Any] = [since, user_id] if user_id else [since]
+    # Reused by every windowed query below.
+    params: list[Any] = [since]
 
     with db.connect() as conn:
         totals = conn.execute(
             "SELECT COUNT(*) AS plays, COUNT(DISTINCT artist_key) AS artists, "
             "       COUNT(DISTINCT track_key) AS tracks "
-            f"FROM plays WHERE played_at >= ? {scope}",
+            "FROM plays WHERE played_at >= ?",
             params,
         ).fetchone()
 
         top_artists = [
             dict(row)
             for row in conn.execute(
-                f"SELECT artist, COUNT(*) AS plays FROM plays WHERE played_at >= ? {scope} "
+                "SELECT artist, COUNT(*) AS plays FROM plays WHERE played_at >= ? "
                 "GROUP BY artist_key ORDER BY plays DESC, artist ASC LIMIT 15",
                 params,
             )
@@ -61,7 +55,7 @@ def overview(days: int = 90, user_id: int | None = None) -> dict[str, Any]:
         top_tracks = [
             dict(row)
             for row in conn.execute(
-                f"SELECT artist, title, COUNT(*) AS plays FROM plays WHERE played_at >= ? {scope} "
+                "SELECT artist, title, COUNT(*) AS plays FROM plays WHERE played_at >= ? "
                 "GROUP BY track_key ORDER BY plays DESC, artist ASC LIMIT 15",
                 params,
             )
@@ -71,7 +65,7 @@ def overview(days: int = 90, user_id: int | None = None) -> dict[str, Any]:
             dict(row)
             for row in conn.execute(
                 "SELECT date(played_at, 'unixepoch', 'localtime') AS day, COUNT(*) AS plays "
-                f"FROM plays WHERE played_at >= ? {scope} GROUP BY day ORDER BY day",
+                "FROM plays WHERE played_at >= ? GROUP BY day ORDER BY day",
                 params,
             )
         ]
@@ -81,28 +75,25 @@ def overview(days: int = 90, user_id: int | None = None) -> dict[str, Any]:
             for row in conn.execute(
                 "SELECT CAST(strftime('%H', played_at, 'unixepoch', 'localtime') AS INTEGER) AS hour, "
                 "       COUNT(*) AS plays "
-                f"FROM plays WHERE played_at >= ? {scope} GROUP BY hour",
+                "FROM plays WHERE played_at >= ? GROUP BY hour",
                 params,
             )
         }
 
         # A play is "new" when the track was first heard inside this window.
-        # The user filter goes inside the subquery so "first heard" means first
-        # by this listener, not first by anyone in the house.
-        inner_scope = "WHERE user_id = ?" if user_id else ""
         freshness = conn.execute(
             "SELECT SUM(CASE WHEN first_play >= ? THEN plays ELSE 0 END) AS new_plays, "
             "       SUM(CASE WHEN first_play <  ? THEN plays ELSE 0 END) AS familiar_plays "
             "FROM (SELECT track_key, MIN(played_at) AS first_play, "
             "             SUM(CASE WHEN played_at >= ? THEN 1 ELSE 0 END) AS plays "
-            f"      FROM plays {inner_scope} GROUP BY track_key)",
-            ([since, since, since, user_id] if user_id else [since, since, since]),
+            "      FROM plays GROUP BY track_key)",
+            (since, since, since),
         ).fetchone()
 
         sources = [
             dict(row)
             for row in conn.execute(
-                f"SELECT source, COUNT(*) AS plays FROM plays WHERE played_at >= ? {scope} "
+                "SELECT source, COUNT(*) AS plays FROM plays WHERE played_at >= ? "
                 "GROUP BY source ORDER BY plays DESC",
                 params,
             )
@@ -130,9 +121,7 @@ def overview(days: int = 90, user_id: int | None = None) -> dict[str, Any]:
     }
 
 
-def taste_summary(
-    days: int = 90, force: bool = False, user_id: int | None = None
-) -> dict[str, Any]:
+def taste_summary(days: int = 90, force: bool = False) -> dict[str, Any]:
     """A short AI-written description of your taste, refreshed daily.
 
     Returns a payload rather than a bare string so the page can distinguish "not
@@ -142,12 +131,8 @@ def taste_summary(
     if not db.get_setting("taste_summary"):
         return {"enabled": False, "text": "", "error": ""}
 
-    # Keyed per user. A summary describes one person's listening, so a shared
-    # key would show whoever generated it first to everybody else.
-    cache_key = f"{SUMMARY_CACHE_KEY}:{user_id}" if user_id else SUMMARY_CACHE_KEY
-
     if not force:
-        cached = db.cache_get(cache_key, SUMMARY_MAX_AGE)
+        cached = db.cache_get(SUMMARY_CACHE_KEY, SUMMARY_MAX_AGE)
         if cached:
             return {"enabled": True, "cached": True, **cached}
 
@@ -156,7 +141,7 @@ def taste_summary(
 
     from . import history
 
-    profile = history.profile(days=days, user_id=user_id)
+    profile = history.profile(days=days)
     if profile["plays"] < 20:
         return {"enabled": True, "text": "", "error": "not enough listening history yet"}
 
@@ -182,5 +167,5 @@ def taste_summary(
         return {"enabled": True, "text": "", "error": str(exc)[:200]}
 
     payload = {"text": text, "error": "", "days": days}
-    db.cache_put(cache_key, payload)
+    db.cache_put(SUMMARY_CACHE_KEY, payload)
     return {"enabled": True, "cached": False, **payload}
