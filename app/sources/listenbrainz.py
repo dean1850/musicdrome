@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 import httpx
 
-from .. import config
+from .. import config, net
 
 log = logging.getLogger(__name__)
 
@@ -31,9 +31,12 @@ def _get(path: str, params: dict[str, Any], token: str = "") -> dict[str, Any]:
     url = f"{config.LISTENBRAINZ_API_URL.rstrip('/')}/{path.lstrip('/')}"
     token = token or config.LISTENBRAINZ_TOKEN
     headers = {"Authorization": f"Token {token}"} if token else {}
-    try:
+    def fetch() -> httpx.Response:
         with httpx.Client(timeout=TIMEOUT) as client:
-            response = client.get(url, params=params, headers=headers)
+            return client.get(url, params=params, headers=headers)
+
+    try:
+        response = net.with_retry(fetch, what=f"listenbrainz {path}")
     except httpx.HTTPError as exc:
         raise ListenBrainzError(f"network error: {exc}") from exc
 

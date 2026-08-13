@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 import httpx
 
-from .. import config
+from .. import config, net
 
 log = logging.getLogger(__name__)
 
@@ -41,9 +41,12 @@ def _get(method: str, params: dict[str, Any]) -> dict[str, Any]:
     payload = {k: v for k, v in params.items() if v not in (None, "")}
     payload.update(method=method, api_key=config.LASTFM_API_KEY, format="json")
 
-    try:
+    def fetch() -> httpx.Response:
         with httpx.Client(timeout=TIMEOUT) as client:
-            response = client.get(API_ROOT, params=payload)
+            return client.get(API_ROOT, params=payload)
+
+    try:
+        response = net.with_retry(fetch, what=f"last.fm {method}")
     except httpx.HTTPError as exc:
         raise LastFmError(f"network error: {exc}") from exc
 

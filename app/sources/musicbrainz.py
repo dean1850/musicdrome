@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from .. import config
+from .. import config, net
 
 log = logging.getLogger(__name__)
 
@@ -48,9 +48,12 @@ def _get(path: str, params: dict[str, Any]) -> dict[str, Any]:
     _throttle()
     url = f"{config.MUSICBRAINZ_API_URL.rstrip('/')}/{path.lstrip('/')}"
     headers = {"User-Agent": config.MUSICBRAINZ_USER_AGENT, "Accept": "application/json"}
-    try:
+    def fetch() -> httpx.Response:
         with httpx.Client(timeout=TIMEOUT) as client:
-            response = client.get(url, params={**params, "fmt": "json"}, headers=headers)
+            return client.get(url, params={**params, "fmt": "json"}, headers=headers)
+
+    try:
+        response = net.with_retry(fetch, what=f"musicbrainz {path}")
     except httpx.HTTPError as exc:
         raise MusicBrainzError(f"network error: {exc}") from exc
 

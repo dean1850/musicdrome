@@ -289,13 +289,33 @@ Musicdrome pushes back four ways, all on by default:
 | 4 | And after several refusals in a row the queue pauses, rather than converting every remaining track into a failure at dequeue speed | `YTDLP_403_STREAK`, `YTDLP_403_COOLDOWN` |
 
 Impersonation needs [curl_cffi](https://github.com/lexiforest/curl_cffi), which
-the image installs — note that `yt-dlp[default]` does **not** include it, so an
-install that builds its own environment has to add it or yt-dlp silently reports
-zero impersonation targets. Musicdrome says which it got at boot:
+the image installs as `yt-dlp[default,curl-cffi]`. Install it that way if you
+build your own environment, and resist the urge to depend on `curl_cffi`
+directly: yt-dlp enforces the version range it was built against at import
+time, so an open-ended requirement will eventually install a curl_cffi yt-dlp
+refuses to load. When that happens there is no warning — yt-dlp simply reports
+zero impersonation targets, and every request fails with:
+
+```
+Impersonate target "chrome" is not available. Use --list-impersonate-targets to see available targets.
+```
+
+Asking through the extra lets pip resolve whatever yt-dlp currently supports,
+at build time and again on every restart. Musicdrome says which it got at boot:
 
 ```
 INFO  app.main: tls:     impersonating chrome
 ```
+
+and, when it got nothing, says why rather than leaving you to guess:
+
+```
+INFO  app.main: tls:     off — curl_cffi 0.16.0 is installed but yt-dlp will not
+load it — Only curl_cffi versions 0.5.10 and 0.10.x through 0.15.x are supported.
+```
+
+Downloads continue without impersonation in that state rather than failing
+outright, so the worst case is the 403s coming back, not an idle queue.
 
 If downloads still 403 after all of that, the exit address is the problem.
 Either route downloads outside the VPN, or give yt-dlp a signed-in identity:

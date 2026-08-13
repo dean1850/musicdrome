@@ -112,6 +112,7 @@ _403_until = 0.0
 
 _UNSET = object()
 _impersonate_cache: Any = _UNSET
+_impersonate_reason = ""
 
 # yt-dlp reports a refusal in a few shapes ("HTTP Error 403: Forbidden",
 # "fragment 1 not found ... 403"), all of which carry the status code. Matching
@@ -119,6 +120,12 @@ _impersonate_cache: Any = _UNSET
 # and a track called "Forbidden" must not be mistaken for a refusal and sent
 # round the retry loop.
 _FORBIDDEN = re.compile(r"\b403\b")
+
+# yt-dlp's refusal when nothing can serve the requested impersonation target:
+# 'Impersonate target "chrome" is not available. Use --list-impersonate-targets
+# to see available targets.' It is raised per request, before anything is
+# fetched, so it fails searches and downloads alike.
+_NO_IMPERSONATION = re.compile(r"impersonate target.{0,80}?is not available", re.IGNORECASE | re.DOTALL)
 
 
 class DownloadError(RuntimeError):
@@ -128,6 +135,11 @@ class DownloadError(RuntimeError):
 def is_forbidden(error: BaseException | str) -> bool:
     """Whether an error is YouTube refusing the connection rather than us."""
     return bool(_FORBIDDEN.search(str(error)))
+
+
+def is_impersonation_unavailable(error: BaseException | str) -> bool:
+    """Whether yt-dlp refused the request because it cannot impersonate at all."""
+    return bool(_NO_IMPERSONATION.search(str(error)))
 
 
 @dataclass
@@ -247,7 +259,7 @@ def impersonate_target() -> Any | None:
     "Impersonate target is not available", so an absent curl_cffi has to mean
     "carry on without it", not "download nothing".
     """
-    global _impersonate_cache
+    global _impersonate_cache, _impersonate_reason
     if _impersonate_cache is not _UNSET:
         return _impersonate_cache
 
@@ -262,6 +274,7 @@ def impersonate_target() -> Any | None:
     try:
         import curl_cffi  # noqa: F401 — the only backend yt-dlp impersonates with
     except Exception as exc:
+        _impersonate_reason = f"curl_cffi is not usable ({exc})"
         log.debug("curl_cffi is unusable (%s); TLS impersonation is off", exc)
         return None
 
@@ -271,25 +284,78 @@ def impersonate_target() -> Any | None:
 
         target = ImpersonateTarget.from_str(name)
     except Exception as exc:
-        log.warning("YTDLP_IMPERSONATE=%s is not a target yt-dlp knows: %s", name, exc)
+        _impersonate_reason = f"YTDLP_IMPERSONATE={name} is not a target yt-dlp knows ({exc})"
+        log.debug("YTDLP_IMPERSONATE=%s is not a target yt-dlp knows: %s", name, exc)
         return None
 
-    # Confirm something can actually serve it. The API is private, so an
-    # inspection that fails is treated as "probably fine" — curl_cffi is
-    # installed, which is the part that usually is not.
+    # Ask yt-dlp what its request handlers can actually serve. Private API, so
+    # an inspection that raises is treated as "probably fine" and left to the
+    # runtime fallback in :func:`_extract_info` to disprove.
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "logger": _YtdlpLogger()}) as ydl:
             available = ydl._get_available_impersonate_targets()
-        if available and not any(candidate in target for candidate, _ in available):
-            log.warning(
-                "no request handler can impersonate '%s' — continuing without it", name
-            )
-            return None
     except Exception as exc:
         log.debug("could not enumerate impersonation targets: %s", exc)
+        _impersonate_cache = target
+        return target
+
+    # An empty list is the whole answer, not a missing one: it means no request
+    # handler registered any target at all. This used to read `if available and
+    # not any(...)`, which skipped the check precisely when it mattered — a
+    # curl_cffi yt-dlp declines to load imports perfectly well, enumerates to
+    # nothing, and was cached here as a valid target. The boot log then said
+    # "impersonating chrome" while every subsequent request died with
+    # 'Impersonate target "chrome" is not available'.
+    if not available:
+        _impersonate_reason = _no_handler_reason(curl_cffi)
+        log.debug("no impersonation targets are available: %s", _impersonate_reason)
+        return None
+
+    if not any(candidate in target for candidate, _ in available):
+        offered = ", ".join(str(candidate) for candidate, _ in available[:4])
+        _impersonate_reason = f"no request handler offers '{name}' (available: {offered})"
+        log.debug("no request handler can impersonate '%s'; continuing without it", name)
+        return None
 
     _impersonate_cache = target
     return target
+
+
+def _no_handler_reason(curl_cffi: Any) -> str:
+    """Why curl_cffi imported cleanly and still produced no targets.
+
+    Almost always a version gate. yt-dlp pins the curl_cffi range it was built
+    against and enforces it at import time, so a curl_cffi outside that window
+    raises out of ``yt_dlp.networking._curlcffi`` and the handler is never
+    registered — no warning, no targets, and a clear ImportError that nobody
+    ever sees because it is caught during handler discovery. Surfacing that
+    message verbatim turns an unexplained failure into an actionable one, since
+    it names the versions that would work.
+    """
+    version = getattr(curl_cffi, "__version__", "unknown")
+    try:
+        import yt_dlp.networking._curlcffi  # noqa: F401
+    except ImportError as exc:
+        return f"curl_cffi {version} is installed but yt-dlp will not load it — {exc}"
+    except Exception as exc:
+        return f"curl_cffi {version} is installed but its yt-dlp handler failed: {exc}"
+    return f"curl_cffi {version} is installed but no request handler registered a target"
+
+
+def _drop_impersonation(exc: BaseException) -> None:
+    """Stop asking for a target yt-dlp has just told us it does not have.
+
+    The boot check can be right at boot and wrong an hour later: the entrypoint
+    upgrades yt-dlp on every start, and a yt-dlp that moves its supported
+    curl_cffi window lands on an install whose curl_cffi has not moved with it.
+    Taking the hint from the first refusal costs one failed request; not taking
+    it costs every download until somebody reads the logs.
+    """
+    global _impersonate_cache, _impersonate_reason
+    if _impersonate_cache is not None:
+        _impersonate_cache = None
+        _impersonate_reason = f"yt-dlp refused the target at runtime ({exc})"
+        log.debug("impersonation off after yt-dlp refused the target: %s", exc)
 
 
 def impersonation_status() -> str:
@@ -300,9 +366,34 @@ def impersonation_status() -> str:
     if not config.YTDLP_IMPERSONATE.strip():
         return "off (YTDLP_IMPERSONATE is empty)"
     return (
-        "off — curl_cffi is unavailable, so YouTube sees a python TLS fingerprint. "
-        "Expect HTTP 403 on the media fetch from VPN or datacenter addresses."
+        f"off — {_impersonate_reason or 'curl_cffi is unavailable'}. YouTube sees a "
+        "python TLS fingerprint; expect HTTP 403 on the media fetch from VPN or "
+        "datacenter addresses."
     )
+
+
+def _extract_info(yt_dlp: Any, options: dict[str, Any], url: str, *, download: bool) -> Any:
+    """``extract_info``, retried once without impersonation if that is what failed.
+
+    Impersonation is an optimisation — it is what keeps YouTube from answering
+    403 on a datacenter exit — but an unavailable target is fatal to the
+    request rather than degrading it, and it fails before a single byte is
+    fetched. Retrying without it converts "nothing downloads" into "downloads
+    work, with a python TLS fingerprint", which is strictly the better failure.
+    """
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(url, download=download)
+    except Exception as exc:
+        if "impersonate" not in options or not is_impersonation_unavailable(exc):
+            raise
+        _drop_impersonation(exc)
+        # The caller's dict is mutated deliberately: the 403 retry loop in
+        # :func:`_extract_with_retry` reuses these options, and would otherwise
+        # put the dead target straight back on the wire on its next attempt.
+        options.pop("impersonate", None)
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(url, download=download)
 
 
 # ─── Candidate scoring ─────────────────────────────────────────────────────
@@ -469,8 +560,12 @@ def search_youtube(artist: str, title: str, limit: int = 5) -> list[Candidate]:
     import yt_dlp
 
     try:
-        with yt_dlp.YoutubeDL(_ydl_options(skip_download=True, extract_flat="in_playlist")) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{artist} {title} audio", download=False)
+        info = _extract_info(
+            yt_dlp,
+            _ydl_options(skip_download=True, extract_flat="in_playlist"),
+            f"ytsearch{limit}:{artist} {title} audio",
+            download=False,
+        )
     except Exception as exc:
         log.warning("YouTube search failed for %s - %s: %s", artist, title, exc)
         return []
@@ -1089,8 +1184,7 @@ def _extract_with_retry(yt_dlp, options: dict[str, Any], candidate: Candidate, w
 
     for attempt in range(attempts):
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.extract_info(candidate.url, download=True)
+            _extract_info(yt_dlp, options, candidate.url, download=True)
             return
         except Exception as exc:
             if not is_forbidden(exc) or attempt + 1 >= attempts:

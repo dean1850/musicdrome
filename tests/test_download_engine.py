@@ -618,6 +618,131 @@ def test_impersonation_can_be_switched_off(monkeypatch):
     assert "off" in download.impersonation_status()
 
 
+class _FakeYoutubeDL:
+    """Stand-in for yt_dlp.YoutubeDL that records how it was constructed."""
+
+    def __init__(self, options, *, fail_with=None):
+        self.options = options
+        self._fail_with = fail_with
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def extract_info(self, url, download=False):
+        if self._fail_with:
+            raise RuntimeError(self._fail_with)
+        return {"url": url}
+
+
+def _fake_yt_dlp(*, fail_while_impersonating=""):
+    """A yt_dlp module whose requests fail only while a target is requested."""
+    calls = []
+
+    class Module:
+        @staticmethod
+        def YoutubeDL(options):
+            calls.append(dict(options))
+            failure = fail_while_impersonating if "impersonate" in options else ""
+            return _FakeYoutubeDL(options, fail_with=failure)
+
+    return Module, calls
+
+
+# The exact text yt-dlp raises, from the Musicdrome logs that prompted this.
+UNAVAILABLE = (
+    'Impersonate target "chrome" is not available. Use --list-impersonate-targets '
+    "to see available targets. You may be missing dependencies required to support "
+    "this target."
+)
+
+
+def test_an_unavailable_target_is_recognised():
+    assert download.is_impersonation_unavailable(UNAVAILABLE)
+    assert download.is_impersonation_unavailable(f"ERROR: {UNAVAILABLE}")
+
+
+@pytest.mark.parametrize("message", [
+    "HTTP Error 403: Forbidden",
+    "Requested format is not available",
+    # A video title, quoted back by yt-dlp — not a report about impersonation.
+    "Requested format is not available: Impersonate Target (Official Video)",
+])
+def test_other_failures_are_not_mistaken_for_missing_impersonation(message):
+    assert not download.is_impersonation_unavailable(message)
+
+
+def test_extraction_retries_without_impersonation_when_the_target_is_refused(monkeypatch):
+    """One failed request, not a queue full of them."""
+    monkeypatch.setattr(download, "_impersonate_cache", "chrome-target")
+    yt_dlp, calls = _fake_yt_dlp(fail_while_impersonating=UNAVAILABLE)
+    options = {"format": "bestaudio/best", "impersonate": "chrome-target"}
+
+    assert download._extract_info(yt_dlp, options, "https://y.t/x", download=True)
+
+    assert len(calls) == 2
+    assert "impersonate" in calls[0]
+    assert "impersonate" not in calls[1]
+    # The caller's options are cleaned too, so the 403 retry loop that reuses
+    # them does not put the dead target back on the wire.
+    assert "impersonate" not in options
+    # And every later request skips the doomed first attempt entirely.
+    assert download.impersonate_target() is None
+
+
+def test_other_extraction_failures_are_not_retried(monkeypatch):
+    monkeypatch.setattr(download, "_impersonate_cache", "chrome-target")
+    yt_dlp, calls = _fake_yt_dlp(fail_while_impersonating="HTTP Error 403: Forbidden")
+
+    with pytest.raises(RuntimeError):
+        download._extract_info(
+            yt_dlp, {"impersonate": "chrome-target"}, "https://y.t/x", download=True
+        )
+
+    assert len(calls) == 1
+    # A 403 is handled by re-extraction upstream; impersonation is not to blame
+    # for it and must survive.
+    assert download.impersonate_target() == "chrome-target"
+
+
+def test_no_available_targets_means_impersonation_is_off(monkeypatch):
+    """The regression that broke every download.
+
+    curl_cffi imports cleanly, yt-dlp declines to load it because the version
+    is outside the range it was built against, and the target list comes back
+    empty. Read as "inconclusive" that cached a target nothing could serve, and
+    the boot log cheerfully announced it while every request failed.
+    """
+    monkeypatch.setattr(config, "YTDLP_IMPERSONATE", "chrome")
+    monkeypatch.setattr(download, "_impersonate_cache", download._UNSET)
+    monkeypatch.setattr(download, "_impersonate_reason", "")
+
+    class Ydl:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def _get_available_impersonate_targets(self):
+            return []
+
+    monkeypatch.setattr(download, "_no_handler_reason", lambda module: "curl_cffi 0.16.0 is too new")
+
+    import yt_dlp
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", lambda options: Ydl())
+
+    assert download.impersonate_target() is None
+    assert "impersonate" not in download._ydl_options()
+    # And the boot line says why, rather than claiming to impersonate Chrome.
+    status = download.impersonation_status()
+    assert status.startswith("off")
+    assert "0.16.0" in status
+
+
 def test_a_track_called_forbidden_is_not_mistaken_for_a_refusal():
     """yt-dlp quotes video titles back in its errors."""
     assert not download.is_forbidden(

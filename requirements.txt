@@ -11,21 +11,29 @@ ytmusicapi==1.9.0
 # usually ships within days, so the image also upgrades yt-dlp at boot unless
 # YTDLP_AUTO_UPDATE=false — see docker/entrypoint.sh.
 #
-# The [default] extra is what pulls in yt-dlp-ejs, the challenge-solver scripts
-# the JavaScript runtime executes. Without it they are fetched from GitHub on
-# first use (YTDLP_REMOTE_COMPONENTS), which turns every boot into a network
-# dependency on a host that may well have none.
-yt-dlp[default]>=2026.7.4
+# Both extras matter, for different reasons:
+#
+# [default] pulls in yt-dlp-ejs, the challenge-solver scripts the JavaScript
+# runtime executes. Without it they are fetched from GitHub on first use
+# (YTDLP_REMOTE_COMPONENTS), which turns every boot into a network dependency
+# on a host that may well have none.
+#
+# [curl-cffi] is the TLS fingerprint YouTube is willing to serve — impersonating
+# a real browser handshake is what stops the media fetch answering 403 from a
+# VPN or datacenter exit when the search on the same connection was fine.
+#
+# Asking for it *through yt-dlp* rather than depending on curl_cffi directly is
+# the whole point, and this line used to read `curl_cffi>=0.7.0`. yt-dlp
+# version-gates the handler hard — `_curlcffi.py` raises ImportError on anything
+# outside the window it was built against — so an open-ended requirement quietly
+# installs a curl_cffi yt-dlp will not load, reports zero impersonation targets,
+# and fails every request with 'Impersonate target "chrome" is not available'.
+# That is not theoretical: curl_cffi 0.16.0 published while yt-dlp still capped
+# at <0.16 (yt-dlp/yt-dlp#17341) and broke every fresh install that day. The
+# extra carries yt-dlp's own current range, so pip resolves a version that
+# works and keeps doing so when upstream moves the window.
+yt-dlp[default,curl-cffi]>=2026.7.4
 mutagen==1.47.0
-
-# The TLS fingerprint YouTube is willing to serve. yt-dlp can impersonate a
-# real browser handshake, but only through curl_cffi — and the [default] extra
-# above does *not* include it, so without this line yt-dlp reports zero
-# impersonation targets and every request goes out looking like a python
-# script. On a home connection that is usually tolerated; from a VPN or a
-# datacenter it is a large part of why the media fetch answers 403 when the
-# search on the same connection did not. See YTDLP_IMPERSONATE in .env.example.
-curl_cffi>=0.7.0
 
 # ── Scan schedule ───────────────────────────────────────
 APScheduler==3.11.0
