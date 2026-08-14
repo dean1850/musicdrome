@@ -114,6 +114,28 @@ def test_download_all_respects_the_minimum(client, suggestion):
 # ─── Downloads ─────────────────────────────────────────────────────────────
 
 
+def test_a_download_carries_what_it_was_served(client, suggestion):
+    """So "no re-encode" is checkable per track rather than taken on trust."""
+    from app import db
+
+    suggestion_id = suggestion("A", "One")
+    client.post(f"/api/suggestions/{suggestion_id}/download")
+    row = client.get("/api/downloads").json()["downloads"][0]
+
+    # Queued but not yet fetched: nothing is known, and nothing is claimed.
+    assert (row["source_codec"], row["source_abr"], row["encoded"]) == ("", 0, "")
+
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE downloads SET source_codec = 'opus', source_abr = 160, encoded = 'copied' "
+            "WHERE id = ?",
+            (row["id"],),
+        )
+
+    row = client.get("/api/downloads").json()["downloads"][0]
+    assert (row["source_codec"], row["source_abr"], row["encoded"]) == ("opus", 160, "copied")
+
+
 def test_downloads_can_be_filtered_and_removed(client, suggestion):
     suggestion_id = suggestion("A", "One")
     client.post(f"/api/suggestions/{suggestion_id}/download")

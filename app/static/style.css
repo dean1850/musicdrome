@@ -408,6 +408,12 @@ input[type="checkbox"] { accent-color: var(--accent); width: 17px; height: 17px;
 .pill.failed      { color: var(--bad); }
 .pill.queued      { color: var(--muted); }
 .pill.downloading { color: var(--accent-2); }
+/* Whether the audio survived the download intact. "copied" is the good and
+   usual outcome; "converted" is not a failure, just worth being able to see. */
+.pill.copied      { color: var(--good); }
+.pill.converted   { color: var(--muted); }
+
+.audio { white-space: nowrap; font-size: 0.85rem; }
 
 .progress { width: 90px; height: 5px; background: var(--surface-hi); border-radius: 3px; overflow: hidden; }
 .progress > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }

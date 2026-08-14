@@ -135,8 +135,13 @@ AI_REQUEST_TIMEOUT = _int("AI_REQUEST_TIMEOUT", 300)
 # re-encodes them. The file is the source, exactly.
 #
 # The bitrate below is therefore not used on the normal path at all — it only
-# applies to the occasional track served as AAC and nothing else, where 160
-# kbps of Opus is comfortably more than a ~128 kbps AAC source contains.
+# applies to the occasional track served as AAC and nothing else. 256 is chosen
+# there for one reason: it is past the point where anyone has demonstrated a
+# difference, so the question does not have to be asked again. It is not doing
+# what a bitrate normally does. Re-encoding cannot recover what the AAC encoder
+# already discarded, and a 128 kbps AAC source holds less than Opus needs to be
+# transparent — so every bit above roughly 192 is spent storing that encoder's
+# artefacts more faithfully. That is a fair price for never having to wonder.
 #
 # "mp3"/"320" is still a supported answer and was the old default. It costs a
 # second lossy encode of an already-lossy source, for a file about twice the
@@ -145,7 +150,7 @@ AI_REQUEST_TIMEOUT = _int("AI_REQUEST_TIMEOUT", 300)
 # stereo from 2009 and not much else; a library server transcodes on the fly
 # for anything that cannot read Opus.
 AUDIO_FORMAT = _env("AUDIO_FORMAT", default="opus").lower()
-AUDIO_BITRATE = _env("AUDIO_BITRATE", default="160")
+AUDIO_BITRATE = _env("AUDIO_BITRATE", default="256")
 FFMPEG_PATH = _env("FFMPEG_PATH", default="/usr/bin/ffmpeg")
 
 # Which YouTube player clients yt-dlp may use, in order. Empty is the right

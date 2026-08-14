@@ -322,6 +322,124 @@ def test_no_preference_is_sent_when_there_is_nothing_to_prefer(monkeypatch):
     assert "format_sort" not in download._ydl_options()
 
 
+# ─── Provenance ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # YouTube reports AAC as its MPEG-4 object type, which is the same
+        # codec by a name that cannot be compared with anything.
+        ("mp4a.40.2", "aac"),
+        ("mp4a.40.5", "aac"),
+        ("aac", "aac"),
+        ("opus", "opus"),
+        ("vorbis", "vorbis"),
+        ("none", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_a_codec_name_is_normalised_so_it_can_be_compared(raw, expected):
+    assert download.codec_name(raw) == expected
+
+
+def test_the_served_format_is_read_from_the_selected_stream():
+    info = {"acodec": "opus", "abr": 159.7, "format_id": "251"}
+    assert download._source_audio(info) == ("opus", 160)
+
+
+def test_the_served_format_falls_back_to_the_requested_download():
+    """Format selection does not always leave the codec on the top level."""
+    info = {"requested_downloads": [{"acodec": "mp4a.40.2", "abr": 129.0}]}
+    assert download._source_audio(info) == ("aac", 129)
+
+
+def test_an_unknown_source_says_so_rather_than_guessing():
+    assert download._source_audio({}) == ("", 0)
+    assert download._source_audio(None) == ("", 0)
+
+
+@pytest.mark.parametrize(
+    "codec,abr,encoded,expected",
+    [
+        ("opus", 160, "copied", "opus 160k copied"),
+        ("aac", 129, "converted", "aac 129k converted"),
+        ("opus", 0, "copied", "opus copied"),
+        ("", 0, "", "source unknown"),
+    ],
+)
+def test_provenance_reads_as_a_phrase(codec, abr, encoded, expected):
+    assert download.provenance(codec, abr, encoded) == expected
+
+
+@pytest.mark.parametrize(
+    "codec,extension,expected",
+    [
+        # The normal path: YouTube's Opus into an .opus file, bytes intact.
+        ("opus", "opus", "copied"),
+        # AAC into .m4a is equally untouched — same codec, different container.
+        ("aac", "m4a", "copied"),
+        # And the two that cost a generation.
+        ("aac", "opus", "converted"),
+        ("opus", "mp3", "converted"),
+        ("opus", "flac", "converted"),
+        # Nothing known about the source is not the same as nothing happening.
+        ("", "opus", ""),
+    ],
+)
+def test_whether_the_bytes_survived_is_measured_not_assumed(codec, extension, expected):
+    assert download.encoding_of(codec, extension) == expected
+
+
+def _fake_extraction(monkeypatch, produced: str, info: dict):
+    """Stand in for yt-dlp: drop a finished file in the workdir, report a format."""
+    def fake_extract(yt_dlp, options, candidate, workdir):
+        (workdir / produced).write_bytes(b"audio bytes")
+        return info
+
+    monkeypatch.setattr(download, "_extract_with_retry", fake_extract)
+    return {
+        "artist": "Gareth Emery", "album": "Northern Lights", "title": "Concrete Angel",
+        "track_no": 3, "year": "2010", "tags": "trance", "cover_url": "",
+        "duration": 0, "recording_mbid": "",
+    }
+
+
+def test_a_copied_download_is_recorded_as_copied(monkeypatch):
+    monkeypatch.setattr(config, "AUDIO_FORMAT", "opus")
+    meta = _fake_extraction(monkeypatch, "video.opus", {"acodec": "opus", "abr": 160.2})
+
+    fetched = download._download_audio(1, download.Candidate(url="u", title="t"), meta)
+
+    assert fetched.source_codec == "opus"
+    assert fetched.source_abr == 160
+    assert fetched.encoded == "copied"
+    assert fetched.path.name == "03 - Concrete Angel.opus"
+    assert fetched.path.exists()
+
+
+def test_a_converted_download_is_recorded_as_converted(monkeypatch):
+    """The AAC-only minority: served as AAC, re-encoded to Opus. Not a failure,
+    but the one case where the file is not what YouTube sent."""
+    monkeypatch.setattr(config, "AUDIO_FORMAT", "opus")
+    meta = _fake_extraction(monkeypatch, "video.opus", {"acodec": "mp4a.40.2", "abr": 129.0})
+
+    fetched = download._download_audio(2, download.Candidate(url="u", title="t"), meta)
+
+    assert fetched.source_codec == "aac"
+    assert fetched.encoded == "converted"
+
+
+def test_a_download_that_reports_no_format_claims_nothing(monkeypatch):
+    monkeypatch.setattr(config, "AUDIO_FORMAT", "opus")
+    meta = _fake_extraction(monkeypatch, "video.opus", {})
+
+    fetched = download._download_audio(3, download.Candidate(url="u", title="t"), meta)
+
+    assert (fetched.source_codec, fetched.source_abr, fetched.encoded) == ("", 0, "")
+
+
 # ─── Cover art ─────────────────────────────────────────────────────────────
 
 

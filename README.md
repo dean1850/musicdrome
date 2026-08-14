@@ -173,6 +173,27 @@ Jellyfin all transcode on the fly for the client that needs it, which is the
 better place to pay that cost. Existing MP3s are left where they are; the
 change only affects what is downloaded next.
 
+**No lossless is on offer here, from anyone.** YouTube re-encodes every upload
+and discards the source, so the artist's master is not retrievable by any tool.
+What is achievable is *no second encode*, and that is what copying the Opus
+stream gets you. Converting YouTube's audio to FLAC would triple the file size
+and recover nothing, which is why `AUDIO_FORMAT=flac` is a supported setting
+and a bad idea.
+
+The exception is the minority of tracks YouTube serves only as AAC. Those are
+re-encoded to Opus at `AUDIO_BITRATE` (256 by default — comfortably past the
+point where a difference has been demonstrated, since re-encoding cannot
+recover what the AAC encoder already threw away).
+
+**Which of the two happened is recorded per track.** The Downloads tab has an
+Audio column reading `opus 160k copied` or `aac 129k converted`, and the same
+phrase goes in the log line for every import. It is measured from the stream
+yt-dlp selected against the container that was written, not inferred from the
+settings — so "nothing was re-encoded" is something you can check rather than
+something you have to take on trust. Downloads from before this shipped show
+`—`: a finished file cannot say what it used to be, and a backfilled guess
+would be indistinguishable from a measurement.
+
 **One playlist, appended to forever.** Every download lands in
 `_playlists/Musicdrome.m3u` with relative paths, so the folder can be moved
 without breaking it, and a re-download never doubles an entry. Navidrome, Plex

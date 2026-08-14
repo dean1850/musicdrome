@@ -71,6 +71,23 @@ function bytes(value) {
   return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
+// What YouTube served, and whether the file still holds those exact bytes.
+// "copied" is the good outcome and the usual one; "converted" means the track
+// was served in a format other than the configured one and was re-encoded.
+function audio(row) {
+  if (!row.source_codec) return '<span class="muted">—</span>';
+  const rate = row.source_abr ? ` ${row.source_abr}k` : '';
+  const label = escapeHtml(row.source_codec + rate);
+  if (!row.encoded) return `<span class="muted">${label}</span>`;
+  // Narrowed to the two known values rather than escaped: this reaches a class
+  // attribute as well as the text, and only these two mean anything in either.
+  const state = row.encoded === 'copied' ? 'copied' : 'converted';
+  const title = state === 'copied'
+    ? 'Copied from the source stream without re-encoding'
+    : 'Re-encoded: the source was served in another format';
+  return `${label} <span class="pill ${state}" title="${title}">${state}</span>`;
+}
+
 function ago(timestamp) {
   if (!timestamp) return 'never';
   const seconds = Math.floor(Date.now() / 1000) - timestamp;
@@ -239,6 +256,7 @@ async function loadDownloads() {
         <td class="num">${row.match != null ? `${row.match}%` : '—'}</td>
         <td>${status}${row.error ? `<div class="card-error">${escapeHtml(row.error)}</div>` : ''}</td>
         <td class="path" title="${escapeHtml(row.path)}">${escapeHtml(row.path || '—')}</td>
+        <td class="audio">${audio(row)}</td>
         <td class="num">${bytes(row.bytes)}</td>
         <td>
           ${row.status === 'failed' ? `<button class="btn btn-icon" data-retry="${row.id}" title="Try again">↻</button>` : ''}
