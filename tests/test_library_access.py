@@ -168,12 +168,41 @@ def test_an_unwritable_data_directory_names_the_uids(tmp_path, monkeypatch):
     assert "PUID/PGID" in problem, "changing PUID is the usual cause"
 
 
+def test_a_data_directory_that_does_not_exist_yet_is_not_a_problem(tmp_path, monkeypatch):
+    """A fresh install has no /config until db.init() makes one — and this
+    check runs before db.init(). Reporting it missing would be a false alarm on
+    every first boot, so the check creates it and only complains if it cannot.
+    """
+    data = tmp_path / "config"
+    monkeypatch.setattr(config, "DATA_DIR", data)
+
+    assert config.data_dir_problem() == ""
+    assert data.is_dir(), "the check should have created it"
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root can write to anything")
+def test_a_data_directory_that_cannot_be_created_is_reported(tmp_path, monkeypatch):
+    parent = tmp_path / "readonly"
+    parent.mkdir()
+    monkeypatch.setattr(config, "DATA_DIR", parent / "config")
+
+    parent.chmod(0o500)
+    try:
+        problem = config.data_dir_problem()
+    finally:
+        parent.chmod(0o700)
+
+    assert "config" in problem
+    assert "PUID/PGID" in problem
+
+
 def test_each_directory_is_reported_by_its_own_name(tmp_path, monkeypatch):
-    """The two probes must not blame each other's path — they did share code."""
+    """The two probes must not blame each other's path — they do share code."""
     music, data = tmp_path / "music", tmp_path / "config"
     music.mkdir()
+    data.write_text("a file where the directory should be")
     monkeypatch.setattr(config, "MUSIC_DIR", music)
-    monkeypatch.setattr(config, "DATA_DIR", data)  # deliberately absent
+    monkeypatch.setattr(config, "DATA_DIR", data)
 
     assert config.music_dir_problem() == ""
     problem = config.data_dir_problem()

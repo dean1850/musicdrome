@@ -243,7 +243,19 @@ def data_dir_problem() -> str:
     /config is fatal where an unwritable /music merely stops downloads. Left to
     sqlite it surfaces as "unable to open database file", which names neither
     the directory, the uid, nor the fact that PUID is what moved.
+
+    Creating it is part of the check rather than a precondition of it. This
+    runs before :func:`app.db.init`, which is where ``ensure_directories`` would
+    otherwise make it — so a missing directory here is the normal state of a
+    fresh install, and reporting it as a fault would be a false alarm every
+    first boot. Only a directory that cannot be *made* is worth saying anything
+    about.
     """
+    if not DATA_DIR.exists():
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return _write_probe_failure(DATA_DIR, exc)
     return write_problem(DATA_DIR)
 
 
