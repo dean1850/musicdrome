@@ -211,16 +211,38 @@ run, matches are found, yt-dlp downloads the audio and ffmpeg encodes it — and
 then the very last step, creating the artist folder, fails. The bandwidth is
 already spent.
 
-Musicdrome now checks this at boot and again before each download, and says
-which uid it is running as and which owns the directory. The container runs as
-**root by default** precisely so this does not happen; if you have set
-`PUID`/`PGID` to a normal user, make sure that user can write to `MUSIC_DIR`:
+Musicdrome checks both `/music` and `/config` at boot, and `/music` again before
+each download, naming the uid it is running as against the uid that owns the
+directory. The container runs as **root by default** precisely so this does not
+happen out of the box.
+
+#### Running as yourself instead
+
+Root is the compatible default, not the best one — everything it downloads ends
+up owned by `root`, which is a nuisance on the host. Running as your own account
+is fully supported and lives entirely in `.env`:
+
+```sh
+PUID=1000     # id -u
+PGID=1000     # id -g
+```
+
+Musicdrome hands the existing `/config` — database, caches, scratch space — to
+that uid on the next boot, so switching is not a one-way door and you can switch
+back. What it cannot do is change who owns `MUSIC_DIR`, and how you do that
+depends on the mount:
 
 | Mount | Fix |
 |---|---|
 | Local disk, ZFS, unRAID | `sudo chown -R 1000:1000 /path/to/music` |
 | CIFS/SMB | Mount with `uid=1000,gid=1000,file_mode=0664,dir_mode=0775` — `chown` does not work on CIFS |
 | NFS | Match the uid on the server, or map it with `anonuid` |
+
+On a network share the mount options are the *only* thing that decides
+ownership, so setting `uid=`/`gid=` in `/etc/fstab` to match `PUID`/`PGID` is
+the whole job — and it is also what makes the files Musicdrome writes land owned
+by you rather than by root. Existing files keep whatever ownership they already
+had on a local disk; on CIFS they are simply re-presented under the new uid.
 
 **Read the errno before you chown anything.** The message ends in the reason
 the write failed, and only `Permission denied` / `Read-only file system` are

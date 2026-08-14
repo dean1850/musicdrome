@@ -136,3 +136,46 @@ def test_a_download_fails_before_spending_bandwidth(music_dir, monkeypatch, sugg
         ).fetchone()
     assert row["status"] == "failed"
     assert "not writable" in row["error"]
+
+
+# ─── The data directory ────────────────────────────────────────────────────
+#
+# /config is the first thing to break when PUID changes, and the worst placed
+# to break quietly: the database, the download scratch space and yt-dlp's cache
+# all live there.
+
+
+def test_a_writable_data_directory_reports_no_problem(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    assert config.data_dir_problem() == ""
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root can write to anything")
+def test_an_unwritable_data_directory_names_the_uids(tmp_path, monkeypatch):
+    """Otherwise this arrives as sqlite's "unable to open database file"."""
+    data = tmp_path / "config"
+    data.mkdir()
+    monkeypatch.setattr(config, "DATA_DIR", data)
+
+    data.chmod(0o500)
+    try:
+        problem = config.data_dir_problem()
+    finally:
+        data.chmod(0o700)
+
+    assert str(data) in problem, "the message must name the directory"
+    assert "not writable" in problem
+    assert "PUID/PGID" in problem, "changing PUID is the usual cause"
+
+
+def test_each_directory_is_reported_by_its_own_name(tmp_path, monkeypatch):
+    """The two probes must not blame each other's path — they did share code."""
+    music, data = tmp_path / "music", tmp_path / "config"
+    music.mkdir()
+    monkeypatch.setattr(config, "MUSIC_DIR", music)
+    monkeypatch.setattr(config, "DATA_DIR", data)  # deliberately absent
+
+    assert config.music_dir_problem() == ""
+    problem = config.data_dir_problem()
+    assert str(data) in problem
+    assert str(music) not in problem
