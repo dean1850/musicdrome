@@ -102,6 +102,7 @@ async def lifespan(app: FastAPI):
     # And for the TLS fingerprint, which decides whether YouTube answers the
     # media fetch at all from a VPN or a datacenter address.
     log.info("tls:     %s", download.impersonation_status())
+    log.info("audio:   %s", download.audio_status())
 
     # One playlist, not one per scan. Installs that predate that have their old
     # per-scan files folded into it here, once.

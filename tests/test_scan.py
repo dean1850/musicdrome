@@ -65,6 +65,88 @@ def test_an_unrecognised_shape_yields_nothing():
     assert scan._recommendations("text") == []
 
 
+def test_an_object_keyed_by_the_track_is_unpacked():
+    """What llama3.1:8b answers when it is only told "valid JSON": a dictionary
+    keyed by "Artist — Title", with the fields under names of its own choosing.
+    This used to yield nothing at all and fail the scan."""
+    answer = {
+        "Gareth Emery — Laserface 01 (Aperture)": {
+            "artist": "Gareth Emery",
+            "name": "Laserface 01 (Aperture)",
+            "genre": "Electronic",
+        }
+    }
+    assert scan._recommendations(answer) == [
+        {
+            "artist": "Gareth Emery",
+            "name": "Laserface 01 (Aperture)",
+            "title": "Laserface 01 (Aperture)",
+            "genre": "Electronic",
+        }
+    ]
+
+
+def test_a_keyed_object_supplies_what_the_entry_omits():
+    answer = {"Pendulum — Propane Nightmares": {"match": 88}}
+    assert scan._recommendations(answer) == [
+        {"artist": "Pendulum", "title": "Propane Nightmares", "match": 88}
+    ]
+
+
+def test_bare_strings_are_read_as_artist_and_title():
+    assert scan._recommendations(["Portishead - Glory Box"]) == [
+        {"artist": "Portishead", "title": "Glory Box"}
+    ]
+
+
+def test_a_hyphenated_name_is_not_split_down_the_middle():
+    """The separator needs its spaces: "Jay-Z" is one artist, not two fields."""
+    assert scan._recommendations(["Jay-Z — 99 Problems"]) == [
+        {"artist": "Jay-Z", "title": "99 Problems"}
+    ]
+
+
+def test_junk_in_the_list_is_dropped_rather_than_crashing():
+    """A string, a null and a number alongside real entries. These reached
+    _store's item.get() and took the whole scan down with an AttributeError."""
+    assert scan._recommendations([{"artist": "A", "title": "One"}, None, 7, []]) == [
+        {"artist": "A", "title": "One"}
+    ]
+
+
+def test_a_list_of_artists_becomes_one_credit():
+    assert scan._recommendations([{"artists": ["Above & Beyond", "Zoë Johnston"],
+                                   "track": "Alchemy"}]) == [
+        {
+            "artists": ["Above & Beyond", "Zoë Johnston"],
+            "artist": "Above & Beyond, Zoë Johnston",
+            "track": "Alchemy",
+            "title": "Alchemy",
+        }
+    ]
+
+
+def test_what_the_entry_says_beats_what_it_is_filed_under():
+    answer = {"Wrong Label — Wrong Title": {"artist": "Boards of Canada", "title": "Roygbiv"}}
+    assert scan._recommendations(answer) == [
+        {"artist": "Boards of Canada", "title": "Roygbiv"}
+    ]
+
+
+# ─── Confidence ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (95, 95), ("95", 95), ("95%", 95), (0.87, 87), ("0.87", 87),
+        (1, 1), (1.0, 100), (250, 100), (-5, 0), ("very high", 0), (None, 0), (True, 0),
+    ],
+)
+def test_a_confidence_is_read_however_it_is_written(value, expected):
+    assert scan._match_percent(value) == expected
+
+
 # ─── Storing ───────────────────────────────────────────────────────────────
 
 

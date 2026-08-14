@@ -288,6 +288,115 @@ def test_target_path_extension_can_be_overridden():
     assert download.target_path("A", "B", "C", 0, "flac").name == "C.flac"
 
 
+def test_the_default_format_is_what_youtube_already_serves(monkeypatch):
+    """Opus, so ffmpeg copies YouTube's own stream through instead of spending
+    a second lossy encode on an already-lossy source."""
+    assert config.AUDIO_FORMAT == "opus"
+    assert download.format_sort() == ["acodec:opus"]
+
+
+@pytest.mark.parametrize(
+    "fmt,sort",
+    [
+        ("opus", ["acodec:opus"]),
+        ("m4a", ["acodec:aac"]),
+        ("vorbis", ["acodec:vorbis"]),
+        # Nothing YouTube serves is MP3 or FLAC, so there is nothing to prefer
+        # and yt-dlp's own ordering — highest bitrate — is left alone.
+        ("mp3", []),
+        ("flac", []),
+    ],
+)
+def test_the_source_stream_that_needs_no_re_encode_is_preferred(monkeypatch, fmt, sort):
+    monkeypatch.setattr(config, "AUDIO_FORMAT", fmt)
+    assert download.format_sort() == sort
+
+
+def test_the_format_preference_reaches_yt_dlp(monkeypatch):
+    monkeypatch.setattr(config, "AUDIO_FORMAT", "opus")
+    assert download._ydl_options()["format_sort"] == ["acodec:opus"]
+
+
+def test_no_preference_is_sent_when_there_is_nothing_to_prefer(monkeypatch):
+    monkeypatch.setattr(config, "AUDIO_FORMAT", "mp3")
+    assert "format_sort" not in download._ydl_options()
+
+
+# ─── Cover art ─────────────────────────────────────────────────────────────
+
+
+def test_ogg_cover_art_is_a_flac_picture_block(monkeypatch):
+    """Ogg has no picture field. Every player reads the same convention: a FLAC
+    picture block, base64-encoded, in a METADATA_BLOCK_PICTURE comment."""
+    import base64
+
+    from mutagen.flac import Picture
+
+    cover = b"\xff\xd8\xff\xe0" + b"payload"
+    picture = Picture(base64.b64decode(download._ogg_picture(cover)))
+
+    assert picture.data == cover
+    assert picture.mime == "image/jpeg"
+    assert picture.type == 3  # front cover
+
+
+def test_a_png_cover_is_declared_as_a_png():
+    import base64
+
+    from mutagen.flac import Picture
+
+    cover = b"\x89PNG\r\n\x1a\n" + b"payload"
+    assert Picture(base64.b64decode(download._ogg_picture(cover))).mime == "image/png"
+
+
+class _FakeAudio(dict):
+    """Enough of a mutagen file for :func:`app.download.tag` to write through."""
+
+    def __init__(self):
+        super().__init__()
+        self.tags = self
+        self.saves = 0
+
+    def add_tags(self):
+        pass
+
+    def save(self, *args, **kwargs):
+        self.saves += 1
+
+
+def test_an_opus_download_is_tagged_and_gets_its_artwork(monkeypatch, tmp_path):
+    """Without this an Opus library is a library with no artwork in it — the
+    cover branch only knew about MP3, FLAC and MP4."""
+    import mutagen
+
+    audio = _FakeAudio()
+    monkeypatch.setattr(mutagen, "File", lambda *a, **k: audio)
+    monkeypatch.setattr(download, "_fetch_cover", lambda url: b"\xff\xd8\xff\xe0cover")
+
+    download.tag(
+        tmp_path / "01 - Song.opus",
+        {"artist": "A", "title": "Song", "album": "Album", "year": "2019",
+         "tags": "electronic,trance", "cover_url": "http://example/cover.jpg"},
+    )
+
+    assert audio["artist"] == "A"
+    assert audio["genre"] == "electronic"
+    assert "metadata_block_picture" in audio
+    assert audio.saves == 2  # fields, then the picture
+
+
+def test_a_format_without_cover_support_is_left_alone(monkeypatch, tmp_path):
+    import mutagen
+
+    audio = _FakeAudio()
+    monkeypatch.setattr(mutagen, "File", lambda *a, **k: audio)
+    monkeypatch.setattr(download, "_fetch_cover", lambda url: b"\xff\xd8\xff\xe0cover")
+
+    download.tag(tmp_path / "01 - Song.wav", {"artist": "A", "cover_url": "http://x"})
+
+    assert "metadata_block_picture" not in audio
+
+
 # ─── Temp sweeping ─────────────────────────────────────────────────────────
 
 

@@ -15,6 +15,7 @@ the progress line, and :data:`_lock` is what stops two of them overlapping.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from typing import Any
 
@@ -53,6 +54,10 @@ Rules:
   led you here. "seed" is the single artist from their history it came from.
 """
 
+# Enforced, not merely described. Ollama compiles this into a grammar, so
+# "additionalProperties": false is doing real work here: without it a small
+# model invents fields — popularity, image_url, genre — and spends its token
+# budget on them until the answer is cut off mid-value.
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -69,11 +74,18 @@ SCHEMA = {
                     "seed": {"type": "string"},
                 },
                 "required": ["artist", "title", "match", "reason"],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["recommendations"],
+    "additionalProperties": False,
 }
+
+# What one recommendation costs to write out, roughly, including the JSON
+# scaffolding around it and a sentence of reasoning inside it. Only used to
+# size the request — see :func:`app.ai._context_window`.
+TOKENS_PER_RECOMMENDATION = 120
 
 
 def state() -> dict[str, Any]:
@@ -233,7 +245,12 @@ def run(trigger: str = "manual") -> dict[str, Any]:
 
         _state["step"] = f"asking {ai.model()}"
         prompt = build_prompt(profile, _excluded_sample(), batch_size)
-        answer = ai.complete_json(SYSTEM_PROMPT, prompt, schema=SCHEMA)
+        answer = ai.complete_json(
+            SYSTEM_PROMPT,
+            prompt,
+            schema=SCHEMA,
+            max_output_tokens=batch_size * TOKENS_PER_RECOMMENDATION,
+        )
         items = _recommendations(answer)
         log.info("scan %s: model returned %d recommendations", scan_id, len(items))
 
@@ -266,13 +283,127 @@ def run(trigger: str = "manual") -> dict[str, Any]:
 
 
 def _recommendations(answer: Any) -> list[dict[str, Any]]:
-    """Accept the shapes models actually return, not just the one we asked for."""
+    """Accept the shapes models actually return, not just the one we asked for.
+
+    The schema makes the right shape overwhelmingly likely; it does not make it
+    certain, because a backend that cannot enforce a schema falls back to "any
+    valid JSON" and a small model given that latitude uses it. Three
+    departures are common enough to be worth handling rather than failing on:
+
+    * the list arrives under a wrapper key nobody agreed on ("songs", "data");
+    * the list is not a list but an object keyed by ``"Artist — Title"``, with
+      the artist and title repeated inside, or not repeated at all;
+    * a field is present under another name — ``name`` for ``title``,
+      ``score`` for ``match``.
+
+    Anything genuinely unrecoverable is dropped here rather than carried on to
+    :func:`_store`, which is where a stray string used to become an
+    ``AttributeError`` on ``.get`` and take the scan with it.
+    """
+    return [item for item in (_normalise(*entry) for entry in _entries(answer)) if item]
+
+
+_WRAPPER_KEYS = ("recommendations", "tracks", "results", "items", "songs", "suggestions", "data")
+
+# Field names models reach for when they do not use ours.
+_ALIASES: dict[str, tuple[str, ...]] = {
+    "artist": ("artists", "artist_name", "performer", "band"),
+    "title": ("track", "song", "name", "track_title", "song_title"),
+    "album": ("release", "album_name"),
+    "match": ("score", "confidence", "rating", "match_score", "similarity"),
+    "reason": ("why", "rationale", "explanation", "justification", "note"),
+    "seed": ("based_on", "seed_artist", "because", "from"),
+}
+
+# " — ", " - ", " | " and friends, with the spaces required so that "Jay-Z" and
+# "Wu-Tang Clan" are never split down the middle.
+_LABEL_SPLIT = re.compile(r"\s+[-—–‒−~|:·/]\s+")
+
+
+def _entries(answer: Any) -> list[tuple[str, Any]]:
+    """``(label, entry)`` pairs, where the label is a key like "Artist — Title"."""
     if isinstance(answer, dict):
-        for key in ("recommendations", "tracks", "results", "items"):
-            if isinstance(answer.get(key), list):
-                return answer[key]
-        return []
-    return answer if isinstance(answer, list) else []
+        for key in _WRAPPER_KEYS:
+            if key in answer:
+                return _entries(answer[key])
+        # No wrapper key: an object whose own keys name the tracks.
+        return [(str(key), value) for key, value in answer.items()]
+    if isinstance(answer, list):
+        return [("", entry) for entry in answer]
+    return []
+
+
+def _normalise(label: str, entry: Any) -> dict[str, Any] | None:
+    """One recommendation in our field names, or ``None`` if it is not one."""
+    if isinstance(entry, dict):
+        item = dict(entry)
+    elif isinstance(entry, str):
+        # A bare "Artist — Title" string, with nothing else to go on.
+        item, label = {}, label or entry
+    else:
+        return None  # a number, a null, a nested list — nothing to recover
+
+    for field, aliases in _ALIASES.items():
+        if _text(item.get(field)):
+            continue
+        for alias in aliases:
+            if _text(item.get(alias)):
+                item[field] = item[alias]
+                break
+
+    # Fall back to the key the entry was filed under. Only ever fills a gap:
+    # what the model put *inside* the object is better evidence than how it
+    # chose to label it.
+    if label and not (_text(item.get("artist")) and _text(item.get("title"))):
+        artist, title = _split_label(label)
+        if artist and not _text(item.get("artist")):
+            item["artist"] = artist
+        if title and not _text(item.get("title")):
+            item["title"] = title
+
+    for field in ("artist", "title", "album", "reason", "seed"):
+        if field in item:
+            item[field] = _text(item[field])
+
+    return item or None
+
+
+def _text(value: Any) -> str:
+    """A field as a string. Lists happen — "artists" is regularly one."""
+    if value is None or isinstance(value, (dict, bool)):
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(part for part in (_text(v) for v in value) if part)
+    return str(value).strip()
+
+
+def _split_label(label: str) -> tuple[str, str]:
+    """``"Gareth Emery — Laserface 01"`` into its artist and its title."""
+    parts = _LABEL_SPLIT.split(label.strip(), maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return "", label.strip()
+
+
+def _match_percent(value: Any) -> int:
+    """A confidence as 0-100, however the model chose to express it.
+
+    Asked for an integer percentage, models still answer "87%", or 0.87 — and
+    a fraction read as an integer is a card that sorts to the bottom and never
+    auto-downloads. How it was written is the evidence for what it means: a
+    bare ``1`` is one percent, while ``1.0`` was written on a 0-1 scale and
+    means all of it.
+    """
+    if isinstance(value, bool) or value is None:
+        return 0
+    raw = str(value).strip().rstrip("%").strip()
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return 0
+    if 0 < number <= 1 and ("." in raw or isinstance(value, float)):
+        number *= 100
+    return max(0, min(100, int(number)))
 
 
 def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int:
@@ -305,10 +436,7 @@ def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int
         seen.update({key, canonical})
         per_artist[akey] = per_artist.get(akey, 0) + 1
 
-        try:
-            match = max(0, min(100, int(float(item.get("match", 0)))))
-        except (TypeError, ValueError):
-            match = 0
+        match = _match_percent(item.get("match"))
 
         with db.connect() as conn:
             conn.execute(
