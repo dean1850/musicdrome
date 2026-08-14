@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS downloads (
     source        TEXT    NOT NULL DEFAULT '',
     bytes         INTEGER NOT NULL DEFAULT 0,
     duration      INTEGER NOT NULL DEFAULT 0,
+    -- What YouTube served, and whether it survived intact: "copied" means the
+    -- file holds those exact bytes, "converted" means it was re-encoded.
+    source_codec  TEXT    NOT NULL DEFAULT '',
+    source_abr    INTEGER NOT NULL DEFAULT 0,
+    encoded       TEXT    NOT NULL DEFAULT '',
     status        TEXT    NOT NULL DEFAULT 'queued',
     progress      INTEGER NOT NULL DEFAULT 0,
     error         TEXT    NOT NULL DEFAULT '',
@@ -221,7 +226,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("recording_mbid", "TEXT NOT NULL DEFAULT ''"),
             ("track_no", "INTEGER NOT NULL DEFAULT 0"),
         ],
-        "downloads": [("progress", "INTEGER NOT NULL DEFAULT 0")],
+        "downloads": [
+            ("progress", "INTEGER NOT NULL DEFAULT 0"),
+            # Downloads that predate this stay blank rather than being guessed
+            # at: nothing on disk records what a finished file used to be.
+            ("source_codec", "TEXT NOT NULL DEFAULT ''"),
+            ("source_abr", "INTEGER NOT NULL DEFAULT 0"),
+            ("encoded", "TEXT NOT NULL DEFAULT ''"),
+        ],
     }
     for table, columns in additions.items():
         for name, definition in columns:

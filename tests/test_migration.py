@@ -391,6 +391,31 @@ def test_an_original_database_loses_nothing(original_database):
     assert cursor["cursor"] == 1700
 
 
+def test_an_older_database_gains_the_provenance_columns(original_database):
+    """Added by ALTER on an existing downloads table, not only by CREATE on a
+    fresh one — otherwise every upgraded install fails on the first download."""
+    db.init()
+
+    with db.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(downloads)")}
+    assert {"source_codec", "source_abr", "encoded"} <= columns
+
+
+def test_downloads_that_predate_the_columns_claim_nothing(original_database):
+    """A file already on disk cannot say what it used to be, so its row stays
+    blank rather than being backfilled with a guess."""
+    db.init()
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO downloads (track_key, artist, title, status, path, created_at) "
+            "VALUES ('a|one', 'A', 'One', 'done', '/music/A/Album/One.mp3', 1700)"
+        )
+        row = conn.execute("SELECT source_codec, source_abr, encoded FROM downloads").fetchone()
+
+    assert (row["source_codec"], row["source_abr"], row["encoded"]) == ("", 0, "")
+
+
 def test_an_original_database_is_not_backed_up(original_database):
     """Nothing destructive runs, so there is nothing to insure against."""
     db.init()

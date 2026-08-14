@@ -154,6 +154,78 @@ class Candidate:
     score: float = field(default=0.0)
 
 
+@dataclass
+class Fetched:
+    """A finished download, and what it cost in quality to get there.
+
+    Recorded because "no re-encode" is a claim worth being able to check. The
+    normal path copies YouTube's Opus stream through untouched, but a track
+    served only as AAC is converted, and nothing in the resulting file says
+    which of those happened — the two are indistinguishable on disk.
+    """
+
+    path: Path
+    source_codec: str = ""
+    source_abr: int = 0
+    encoded: str = ""  # "copied", "converted", or "" when the source is unknown
+
+
+# What yt-dlp calls a codec, mapped onto what we call it. YouTube reports AAC
+# as its MPEG-4 object type ("mp4a.40.2"), which is the same codec by a name
+# that cannot be compared with anything.
+_CODEC_NAMES = {"mp4a": "aac", "m4a": "aac", "aac": "aac", "opus": "opus",
+                "vorbis": "vorbis", "mp3": "mp3", "mp4a.40.2": "aac", "flac": "flac"}
+
+# And the codec each container we produce holds, for deciding whether the file
+# on disk still contains the bytes that were downloaded.
+_EXTENSION_CODECS = {"opus": "opus", "m4a": "aac", "mp3": "mp3", "flac": "flac",
+                     "ogg": "vorbis", "wav": "pcm"}
+
+
+def codec_name(raw: Any) -> str:
+    """A codec name that can be compared. ``mp4a.40.2`` and ``aac`` are one thing."""
+    base = str(raw or "").split(".")[0].strip().lower()
+    if not base or base == "none":
+        return ""
+    return _CODEC_NAMES.get(base, base)
+
+
+def encoding_of(source_codec: str, extension: str) -> str:
+    """Whether a file with this extension still holds the bytes that were served.
+
+    Decided by comparing the served codec with what the container we produced
+    can hold, rather than by predicting what ffmpeg would do — that would be a
+    second copy of yt-dlp's decision rules, free to drift out of step with the
+    first. ``""`` when the source is unknown, because a finished file cannot
+    say what it used to be and a guess here would be indistinguishable from a
+    measurement.
+    """
+    if not source_codec:
+        return ""
+    return "copied" if source_codec == _EXTENSION_CODECS.get(extension) else "converted"
+
+
+def _source_audio(info: Any) -> tuple[str, int]:
+    """The codec and bitrate of the stream YouTube actually served.
+
+    Read from the format yt-dlp selected rather than from the finished file,
+    because the finished file cannot say what it used to be.
+    """
+    if not isinstance(info, dict):
+        return "", 0
+
+    codec, abr = "", 0.0
+    for entry in (info, *(info.get("requested_downloads") or [])):
+        if not isinstance(entry, dict):
+            continue
+        codec = codec or codec_name(entry.get("acodec"))
+        try:
+            abr = abr or float(entry.get("abr") or 0)
+        except (TypeError, ValueError):
+            pass
+    return codec, int(round(abr))
+
+
 def audio_extension() -> str:
     fmt = config.AUDIO_FORMAT or "opus"
     return _EXTENSIONS.get(fmt, fmt)
@@ -377,6 +449,20 @@ def _drop_impersonation(exc: BaseException) -> None:
         _impersonate_cache = None
         _impersonate_reason = f"yt-dlp refused the target at runtime ({exc})"
         log.debug("impersonation off after yt-dlp refused the target: %s", exc)
+
+
+def provenance(source_codec: str, source_abr: int, encoded: str) -> str:
+    """One phrase for what a download was, and what happened to it.
+
+    "opus 160k copied" is the answer to the only question worth asking about a
+    file YouTube served: is this still the audio they sent, or a second encode
+    of it? Reused by the log line and the downloads table so both say the same
+    thing.
+    """
+    if not source_codec:
+        return "source unknown"
+    rate = f" {source_abr}k" if source_abr else ""
+    return f"{source_codec}{rate} {encoded}".strip()
 
 
 def audio_status() -> str:
@@ -1055,17 +1141,21 @@ def fetch(download_id: int) -> None:
             if not candidates:
                 raise DownloadError("no confident match on YouTube Music or YouTube")
 
-        candidate, path = _download_first_that_works(download_id, candidates, meta)
+        candidate, fetched = _download_first_that_works(download_id, candidates, meta)
+        path = fetched.path
         append_to_playlist(path, meta)
         _note_download_ok()
 
         with db.connect() as conn:
             conn.execute(
                 "UPDATE downloads SET status = 'done', path = ?, source_url = ?, source = ?, "
-                "bytes = ?, duration = ?, progress = 100, error = '', finished_at = ? WHERE id = ?",
+                "bytes = ?, duration = ?, source_codec = ?, source_abr = ?, encoded = ?, "
+                "progress = 100, error = '', finished_at = ? WHERE id = ?",
                 (
                     str(path), candidate.url, candidate.source,
-                    path.stat().st_size, candidate.duration, db.now(), download_id,
+                    path.stat().st_size, candidate.duration,
+                    fetched.source_codec, fetched.source_abr, fetched.encoded,
+                    db.now(), download_id,
                 ),
             )
             if meta["suggestion_id"]:
@@ -1073,7 +1163,8 @@ def fetch(download_id: int) -> None:
                     "UPDATE suggestions SET status = 'downloaded', decided_at = ? WHERE id = ?",
                     (db.now(), meta["suggestion_id"]),
                 )
-        log.info("imported %s", path)
+        log.info("imported %s (%s)", path, provenance(fetched.source_codec,
+                                                     fetched.source_abr, fetched.encoded))
 
     except Exception as exc:
         message = str(exc)
@@ -1152,7 +1243,7 @@ def _wait_out_cooldown() -> None:
 
 def _download_first_that_works(
     download_id: int, candidates: list[Candidate], meta: dict[str, Any]
-) -> tuple[Candidate, Path]:
+) -> tuple[Candidate, Fetched]:
     """Try each candidate in turn, moving on only when one is refused.
 
     A 403 is the single failure worth trying a different upload for. Anything
@@ -1182,7 +1273,7 @@ def _download_first_that_works(
     raise DownloadError(str(last) if last else "no candidate could be downloaded")
 
 
-def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]) -> Path:
+def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]) -> Fetched:
     """yt-dlp into a scratch dir, transcode, tag, then file it."""
     import yt_dlp
 
@@ -1217,7 +1308,8 @@ def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]
             ],
             ffmpeg_location=str(Path(config.FFMPEG_PATH).parent),
         )
-        _extract_with_retry(yt_dlp, options, candidate, workdir)
+        info = _extract_with_retry(yt_dlp, options, candidate, workdir)
+        source_codec, source_abr = _source_audio(info)
 
         produced = sorted(
             (p for p in workdir.iterdir()
@@ -1237,12 +1329,13 @@ def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]
             meta["artist"], meta["album"], meta["title"], int(meta["track_no"] or 0), extension
         )
         shutil.move(str(source), str(target))
-        return target
+
+        return Fetched(target, source_codec, source_abr, encoding_of(source_codec, extension))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _extract_with_retry(yt_dlp, options: dict[str, Any], candidate: Candidate, workdir: Path) -> None:
+def _extract_with_retry(yt_dlp, options: dict[str, Any], candidate: Candidate, workdir: Path) -> Any:
     """Download one candidate, re-extracting when YouTube answers 403.
 
     The media URLs yt-dlp hands to the transfer are signed and short-lived, and
@@ -1258,8 +1351,7 @@ def _extract_with_retry(yt_dlp, options: dict[str, Any], candidate: Candidate, w
 
     for attempt in range(attempts):
         try:
-            _extract_info(yt_dlp, options, candidate.url, download=True)
-            return
+            return _extract_info(yt_dlp, options, candidate.url, download=True)
         except Exception as exc:
             if not is_forbidden(exc) or attempt + 1 >= attempts:
                 raise
