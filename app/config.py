@@ -231,15 +231,45 @@ def music_dir_problem() -> str:
     creates with ``O_EXCL`` under a name nobody else holds, so the probe now
     only ever fails for the reason it is meant to detect.
     """
-    if not MUSIC_DIR.exists():
-        return f"{MUSIC_DIR} does not exist — check the volume mount"
-    if not MUSIC_DIR.is_dir():
-        return f"{MUSIC_DIR} is not a directory"
+    return write_problem(MUSIC_DIR)
+
+
+def data_dir_problem() -> str:
+    """Why DATA_DIR cannot be written to, or ``""`` if it can.
+
+    Worth its own check because it is the first thing to break when PUID
+    changes, and because it breaks badly: the database, the scratch space for
+    in-flight downloads and yt-dlp's cache all live here, so an unwritable
+    /config is fatal where an unwritable /music merely stops downloads. Left to
+    sqlite it surfaces as "unable to open database file", which names neither
+    the directory, the uid, nor the fact that PUID is what moved.
+
+    Creating it is part of the check rather than a precondition of it. This
+    runs before :func:`app.db.init`, which is where ``ensure_directories`` would
+    otherwise make it — so a missing directory here is the normal state of a
+    fresh install, and reporting it as a fault would be a false alarm every
+    first boot. Only a directory that cannot be *made* is worth saying anything
+    about.
+    """
+    if not DATA_DIR.exists():
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return _write_probe_failure(DATA_DIR, exc)
+    return write_problem(DATA_DIR)
+
+
+def write_problem(path: Path) -> str:
+    """Why ``path`` cannot be written to, or ``""`` if it can."""
+    if not path.exists():
+        return f"{path} does not exist — check the volume mount"
+    if not path.is_dir():
+        return f"{path} is not a directory"
 
     try:
-        handle, probe = tempfile.mkstemp(prefix=".musicdrome-write-test-", dir=MUSIC_DIR)
+        handle, probe = tempfile.mkstemp(prefix=".musicdrome-write-test-", dir=path)
     except OSError as exc:
-        return _write_probe_failure(exc)
+        return _write_probe_failure(path, exc)
 
     # Creating the file was the test. Failing to clean up after it is untidy,
     # never a reason to refuse a download.
@@ -251,7 +281,7 @@ def music_dir_problem() -> str:
     return ""
 
 
-def _write_probe_failure(exc: OSError) -> str:
+def _write_probe_failure(path: Path, exc: OSError) -> str:
     """Turn a failed write probe into something worth acting on.
 
     The uid and gid we run as and the ones owning the directory are named
@@ -261,7 +291,7 @@ def _write_probe_failure(exc: OSError) -> str:
     afternoon spent chowning a directory that was never the problem.
     """
     try:
-        stat = MUSIC_DIR.stat()
+        stat = path.stat()
         owner = f"owned by {stat.st_uid}:{stat.st_gid}"
     except OSError:
         owner = "owner unknown"
@@ -270,11 +300,11 @@ def _write_probe_failure(exc: OSError) -> str:
 
     if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
         return (
-            f"{MUSIC_DIR} is not writable ({exc.strerror}). {running_as} "
+            f"{path} is not writable ({exc.strerror}). {running_as} "
             f"Set PUID/PGID in .env to a user that can write there, or fix the mount."
         )
     return (
-        f"{MUSIC_DIR} could not be written to ({exc.strerror}). {running_as} "
+        f"{path} could not be written to ({exc.strerror}). {running_as} "
         f"That is not a permissions error — check that the mount behind it is "
         f"still connected and that the host path exists."
     )

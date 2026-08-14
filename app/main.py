@@ -75,6 +75,13 @@ async def lifespan(app: FastAPI):
     log.info("data:    %s", config.DATA_DIR)
     log.info("history: %s", ", ".join(config.history_sources()) or "none configured")
 
+    # Before db.init(), because db.init() is what fails if this is wrong, and
+    # it fails as "unable to open database file" — a message that names neither
+    # the directory nor the uid. Changing PUID is the usual cause.
+    problem = config.data_dir_problem()
+    if problem:
+        log.error("data directory is not writable — this will not start: %s", problem)
+
     db.init()
 
     # Said once, loudly, at boot. An unwritable music directory is the one

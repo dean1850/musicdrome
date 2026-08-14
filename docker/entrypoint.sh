@@ -2,18 +2,39 @@
 # Boot sequence: refresh yt-dlp, drop to PUID/PGID, start the server.
 set -e
 
-# Root by default, because the common case for MUSIC_DIR is a network share or
-# a media directory owned by root, which a dropped-privilege process cannot
-# write to — and that failure lands at the very end of a download, after the
-# audio has been fetched and encoded.
+# Root by default, and that default is about compatibility rather than being
+# the right answer: a MUSIC_DIR that is a network share or a root-owned media
+# directory is the one setup that works with no configuration at all, and the
+# alternative failure lands at the very end of a download, after the audio has
+# been fetched and encoded.
 #
-# The tradeoff is real: downloaded files end up owned by root. UMASK keeps them
-# readable by everyone else, so Plex, Navidrome or Jellyfin can still serve
-# them. Set PUID/PGID to your own id in .env if you would rather not run as
-# root — see .env.example.
+# Running as yourself is better practice and fully supported — set PUID/PGID in
+# .env and everything below adapts, including handing an existing /config to
+# the new uid. What it cannot do is change who owns MUSIC_DIR: on a local disk
+# that is `chown -R`, and on a CIFS or NFS mount ownership comes from the mount
+# options (uid=/gid= in fstab), where chown is a no-op. Get that right and the
+# files Musicdrome creates land owned by you, which is the whole point.
+#
+# Either way UMASK keeps them readable by everyone else, so Plex, Navidrome or
+# Jellyfin can still serve them. See .env.example.
 PUID="${PUID:-0}"
 PGID="${PGID:-0}"
 umask "${UMASK:-022}"
+
+# gosu deliberately does not touch the environment, so HOME survives the drop
+# still pointing at root's (tianon/gosu#3, #14). Every tool that caches under
+# ~ then tries to write a directory the new uid does not own. yt-dlp's is the
+# one that costs something: its player and EJS script cache lives in
+# $XDG_CACHE_HOME (falling back to ~/.cache), so at any PUID but 0 it silently
+# stops persisting and every boot re-fetches and re-solves what it already had.
+#
+# /config is the answer for both, because it is the one path guaranteed to be
+# writable by whoever we end up as — it is chowned to PUID/PGID below. Setting
+# it for the root case too is not just tidiness: the cache lands in the mounted
+# volume, so it now survives a restart instead of dying with the container.
+HOME=/config
+XDG_CACHE_HOME=/config/.cache
+export HOME XDG_CACHE_HOME
 
 start() {
     exec uvicorn app.main:app \
@@ -54,6 +75,11 @@ if [ "${YTDLP_AUTO_UPDATE:-true}" = "true" ]; then
     fi
 fi
 
+# Made before the drop so the chown below covers them. Left to the first tool
+# that wants one, they would be created by whoever gets there first — as root
+# on a still-root pass, and then be unwritable the next time PUID changes.
+mkdir -p "$XDG_CACHE_HOME" "${DENO_DIR:-/config/.deno}" 2>/dev/null || true
+
 if [ "$(id -u)" != "0" ] || [ "$PUID" = "0" ]; then
     echo "Musicdrome running as $(id -u):$(id -g) (umask ${UMASK:-022})"
     start
@@ -67,7 +93,13 @@ if ! id -u musicdrome >/dev/null 2>&1; then
 fi
 
 # Only ever chown what we own. The music directory is left alone: it may be a
-# large read-only mount, and recursively chowning someone's library is rude.
+# large read-only mount, and recursively chowning someone's library is rude —
+# on a network share it is also a no-op, since ownership there comes from the
+# mount options rather than from anything the container can change.
+#
+# This is what makes PUID changeable rather than a one-way door: switching from
+# root to 1000 hands the existing database, caches and scratch files to the new
+# uid on the next boot instead of leaving a /config it cannot open.
 chown -R "$PUID:$PGID" /config 2>/dev/null || true
 
 echo "Musicdrome running as ${PUID}:${PGID}"
