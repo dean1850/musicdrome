@@ -110,18 +110,42 @@ OPENAI_BASE_URL = _env("OPENAI_BASE_URL", default="https://api.openai.com/v1")
 OLLAMA_BASE_URL = _env("OLLAMA_BASE_URL", default="http://host.docker.internal:11434")
 OLLAMA_MODEL = _env("OLLAMA_MODEL", default="llama3.1")
 
+# Ollama's context window. Left at 0, each request is sized from what it
+# actually sends and expects back — a forty-track scan carrying three hundred
+# excluded titles needs several times the window a taste summary does. This
+# matters more than it sounds: Ollama's own default is commonly 4096 tokens and
+# it drops whatever does not fit *silently*, which is how a scan ends up
+# parsing a reply that stopped mid-token and reporting it as a JSON error.
+#
+# Set OLLAMA_NUM_CTX to pin one value regardless of the request. The ceiling on
+# the automatic sizing is worth knowing the cost of: the KV cache for an 8B
+# model runs to roughly 128 KB per token, so 16384 is about 2 GB of VRAM held
+# for the length of the call.
+OLLAMA_NUM_CTX = _int("OLLAMA_NUM_CTX", 0)
+OLLAMA_MAX_NUM_CTX = _int("OLLAMA_MAX_NUM_CTX", 16384)
+
 AI_MAX_TOKENS = _int("AI_MAX_TOKENS", 8192)
 AI_REQUEST_TIMEOUT = _int("AI_REQUEST_TIMEOUT", 300)
 
 # ─── Downloads ─────────────────────────────────────────────────────────────
 
-# MP3 at 320 kbps by default. Worth knowing what the tradeoff is before
-# changing it: YouTube serves Opus at around 160 kbps, so "mp3"/"320" makes a
-# file about twice the size that is fractionally *worse* than the source,
-# bought in exchange for playing on absolutely everything. "opus" or "m4a"
-# keeps the original bytes with no second encode.
-AUDIO_FORMAT = _env("AUDIO_FORMAT", default="mp3").lower()
-AUDIO_BITRATE = _env("AUDIO_BITRATE", default="320")
+# Opus by default, because it is what YouTube and YouTube Music actually serve:
+# their best audio stream is Opus at around 160 kbps, so asking for Opus means
+# ffmpeg remuxes those bytes into an .opus file with ``-c:a copy`` and never
+# re-encodes them. The file is the source, exactly.
+#
+# The bitrate below is therefore not used on the normal path at all — it only
+# applies to the occasional track served as AAC and nothing else, where 160
+# kbps of Opus is comfortably more than a ~128 kbps AAC source contains.
+#
+# "mp3"/"320" is still a supported answer and was the old default. It costs a
+# second lossy encode of an already-lossy source, for a file about twice the
+# size that is fractionally *worse* than what YouTube sent — bought in exchange
+# for playing on absolutely everything. That trade is worth making for a car
+# stereo from 2009 and not much else; a library server transcodes on the fly
+# for anything that cannot read Opus.
+AUDIO_FORMAT = _env("AUDIO_FORMAT", default="opus").lower()
+AUDIO_BITRATE = _env("AUDIO_BITRATE", default="160")
 FFMPEG_PATH = _env("FFMPEG_PATH", default="/usr/bin/ffmpeg")
 
 # Which YouTube player clients yt-dlp may use, in order. Empty is the right

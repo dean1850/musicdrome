@@ -25,7 +25,8 @@ ENV PYTHONUNBUFFERED=1 \
     MUSICDROME_DATA_DIR=/config \
     DENO_DIR=/config/.deno
 
-# ffmpeg does the 320 kbps encode; tini reaps the yt-dlp and ffmpeg children;
+# ffmpeg remuxes YouTube's Opus into .opus (and converts when a format other
+# than Opus is asked for); tini reaps the yt-dlp and ffmpeg children;
 # gosu drops to PUID/PGID when those are not root.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \

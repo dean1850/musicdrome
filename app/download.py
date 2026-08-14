@@ -44,6 +44,7 @@ boot by :func:`start_workers`.
 
 from __future__ import annotations
 
+import base64
 import logging
 import queue
 import re
@@ -154,8 +155,28 @@ class Candidate:
 
 
 def audio_extension() -> str:
-    fmt = config.AUDIO_FORMAT or "mp3"
+    fmt = config.AUDIO_FORMAT or "opus"
     return _EXTENSIONS.get(fmt, fmt)
+
+
+def format_sort() -> list[str]:
+    """Ask YouTube for the stream that needs no re-encode, when there is one.
+
+    yt-dlp's ``bestaudio`` sorts by bitrate, which usually lands on Opus but is
+    free not to. That matters because ffmpeg only copies the audio through
+    untouched when the source codec already *is* the configured format — the
+    moment it picks the AAC stream instead, an Opus library costs a second
+    lossy encode of an already-lossy source for no benefit whatsoever.
+
+    Naming the codec removes the "usually". Nothing is pinned beyond that: this
+    is a preference, so a track served only as AAC still downloads and is
+    converted. For formats YouTube does not serve at all — mp3, flac — there is
+    nothing to prefer and yt-dlp's own ordering is left alone.
+    """
+    codec = {"opus": "opus", "m4a": "aac", "aac": "aac", "vorbis": "vorbis"}.get(
+        config.AUDIO_FORMAT
+    )
+    return [f"acodec:{codec}"] if codec else []
 
 
 class _YtdlpLogger:
@@ -358,6 +379,27 @@ def _drop_impersonation(exc: BaseException) -> None:
         log.debug("impersonation off after yt-dlp refused the target: %s", exc)
 
 
+def audio_status() -> str:
+    """One line for the boot log: what lands in the library, and at what cost.
+
+    Worth saying out loud because the answer changed. Installs that never set
+    AUDIO_FORMAT used to get MP3 320 and now get Opus, and the boot log is the
+    one place that difference is visible before the first download.
+    """
+    fmt = config.AUDIO_FORMAT or "opus"
+    if format_sort():
+        return (
+            f"{fmt} — copied from YouTube's own {fmt} stream where there is one "
+            f"(no re-encode), otherwise converted at {config.AUDIO_BITRATE} kbps"
+        )
+    if fmt in {"flac", "wav", "alac"}:
+        return (
+            f"{fmt} — lossless container around a lossy source, so it is larger "
+            f"than the download without being better than it"
+        )
+    return f"{fmt} at {config.AUDIO_BITRATE} kbps — re-encoded from YouTube's audio"
+
+
 def impersonation_status() -> str:
     """One line for the boot log: what the connection will look like."""
     target = impersonate_target()
@@ -512,6 +554,12 @@ def _ydl_options(**overrides) -> dict[str, Any]:
         "sleep_interval_requests": 1,
     }
 
+    # Prefer the source stream that is already in the configured format, so
+    # ffmpeg remuxes rather than re-encodes.
+    sort = format_sort()
+    if sort:
+        options["format_sort"] = sort
+
     # A Chrome TLS fingerprint instead of python's, when curl_cffi can provide
     # one. Left out entirely otherwise: an unavailable target fails every
     # request, which would be a far worse problem than the one it solves.
@@ -655,6 +703,24 @@ def _cover_mime(cover: bytes) -> str:
     return "image/png" if cover[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
 
 
+def _ogg_picture(cover: bytes) -> str:
+    """Cover art as Ogg carries it: a FLAC picture block, base64, in a comment.
+
+    Ogg has no picture field of its own. The convention every player follows —
+    Navidrome and taglib included — is a ``METADATA_BLOCK_PICTURE`` comment
+    holding a base64-encoded FLAC picture block, which is what this builds.
+    Without it an Opus library is a library with no artwork in it.
+    """
+    from mutagen.flac import Picture
+
+    picture = Picture()
+    picture.data = cover
+    picture.type = 3  # front cover
+    picture.mime = _cover_mime(cover)
+    picture.desc = "Cover"
+    return base64.b64encode(picture.write()).decode("ascii")
+
+
 def tag(path: Path, meta: dict[str, Any]) -> None:
     """Write tags and embed cover art, in whichever container we produced."""
     import mutagen
@@ -733,6 +799,11 @@ def tag(path: Path, meta: dict[str, Any]) -> None:
             mp4 = MP4(path)
             mp4["covr"] = [MP4Cover(cover, imageformat=fmt)]
             mp4.save()
+        elif suffix in {".opus", ".ogg", ".oga"}:
+            # The same object the fields were just written through: Ogg tags
+            # are free-form Vorbis comments, so the picture is one more of them.
+            audio["metadata_block_picture"] = [_ogg_picture(cover)]
+            audio.save()
         else:
             log.debug("no cover-art support for %s files", suffix)
     except Exception as exc:
@@ -1137,7 +1208,10 @@ def _download_audio(download_id: int, candidate: Candidate, meta: dict[str, Any]
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": config.AUDIO_FORMAT,
                     # Not a 0-9 VBR value, so yt-dlp passes this to ffmpeg as
-                    # -b:a <n>k. Ignored for lossless codecs.
+                    # -b:a <n>k. Only reached when the source codec differs
+                    # from the target: matching codecs are copied through
+                    # untouched, which is the whole point of defaulting to the
+                    # format YouTube already serves.
                     "preferredquality": config.AUDIO_BITRATE,
                 }
             ],

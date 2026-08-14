@@ -15,10 +15,10 @@ server, no build step, no telemetry, no third-party embeds. Dark only.
           ├──▶ SQLite ──▶ 40 ranked tracks ──▶  ↓ download  ♥ save  ✕ hide
  ListenBrainz ┘           + match % + why            │
                                                      ▼
-                              YouTube Music ─▶ yt-dlp ─▶ MP3 320
+                              YouTube Music ─▶ yt-dlp ─▶ Opus ~160
                                                      │
                                 MusicBrainz tags, cover art, and
-                                Artist/Album/01 - Title.mp3
+                                Artist/Album/01 - Title.opus
 ```
 
 ## Quick start
@@ -154,14 +154,24 @@ go back.
 
 ## Downloads
 
-Always MP3 at 320 kbps — there is no format setting to get wrong. Files are
-tagged from MusicBrainz (artist, title, album, album artist, year, track number,
-recording MBID) with cover art embedded, and filed as:
+**Opus, copied rather than re-encoded.** YouTube and YouTube Music serve their
+best audio as Opus at around 160 kbps, so that is the stream Musicdrome asks
+for and ffmpeg copies it into an `.opus` file untouched. What lands on disk is
+the source, bit for bit — no second lossy encode, and about half the size of
+the MP3 320 this used to produce. Files are tagged from MusicBrainz (artist,
+title, album, album artist, year, track number, recording MBID) with cover art
+embedded, and filed as:
 
 ```
-/music/Radiohead/OK Computer/06 - Karma Police.mp3
+/music/Radiohead/OK Computer/06 - Karma Police.opus
 /music/_playlists/Musicdrome.m3u
 ```
+
+Set `AUDIO_FORMAT=mp3` and `AUDIO_BITRATE=320` in `.env` for the old behaviour
+if something in the house cannot read Opus — though Navidrome, Plex and
+Jellyfin all transcode on the fly for the client that needs it, which is the
+better place to pay that cost. Existing MP3s are left where they are; the
+change only affects what is downloaded next.
 
 **One playlist, appended to forever.** Every download lands in
 `_playlists/Musicdrome.m3u` with relative paths, so the folder can be moved
@@ -351,6 +361,32 @@ found. Musicdrome refuses to file a track it cannot attribute to the right
 artist, on the grounds that a tribute band in your library is worse than a gap.
 If it happens constantly, the AI is probably recommending obscure or misspelled
 titles; a narrower listening window tends to help.
+
+## When a scan fails
+
+### "could not parse JSON from the model response"
+
+Almost always a local model on Ollama, and almost always the context window
+rather than the model. Two things are asked of it, and both are now handled:
+
+**The shape.** Ollama is sent the recommendation *schema*, not just
+`"format": "json"`, so the sampler is held to a grammar it cannot leave. Told
+only "valid JSON", an 8B model will happily answer with an object keyed by
+`"Artist — Title"`, or invent `popularity` and `image_url` fields and spend its
+token budget filling them in. Older Ollama builds that reject a schema are
+retried the plain way, and the parser accepts the odd shapes anyway.
+
+**The size.** Ollama does not size its context to the request — it uses the
+server default, commonly 4096 tokens, and drops whatever does not fit *without
+saying so*. A scan sending a long exclusion list and asking for forty
+recommendations overflows that, and the reply stops mid-token. Musicdrome now
+sizes the window per request, up to `OLLAMA_MAX_NUM_CTX` (16384). Raise it for
+large batch sizes, lower it if Ollama is spilling into system RAM, or pin one
+value with `OLLAMA_NUM_CTX`.
+
+If a reply is cut off anyway, the recommendations that arrived complete are
+kept rather than the scan being thrown away, and the log says so. Lowering
+**Tracks per scan** in Settings is the other lever.
 
 ## Security
 

@@ -79,12 +79,12 @@ def test_target_path_uses_the_artist_album_track_layout():
     path = download.target_path("Radiohead", "OK Computer", "Karma Police", 6)
     assert path.parent.parent.name == "Radiohead"
     assert path.parent.name == "OK Computer"
-    assert path.name == "06 - Karma Police.mp3"
+    assert path.name == "06 - Karma Police.opus"
 
 
 def test_a_missing_track_number_drops_the_prefix():
     path = download.target_path("Radiohead", "OK Computer", "Karma Police", 0)
-    assert path.name == "Karma Police.mp3"
+    assert path.name == "Karma Police.opus"
 
 
 def test_a_missing_album_files_under_singles():
@@ -95,7 +95,7 @@ def test_a_missing_album_files_under_singles():
 def test_path_separators_in_names_do_not_escape_the_layout():
     path = download.target_path("AC/DC", "Back/Slash", "Hells/Bells", 0)
     assert path.parent.parent.name == "ACDC"
-    assert path.relative_to(config.MUSIC_DIR).parts == ("ACDC", "BackSlash", "HellsBells.mp3")
+    assert path.relative_to(config.MUSIC_DIR).parts == ("ACDC", "BackSlash", "HellsBells.opus")
 
 
 def test_an_existing_file_is_never_overwritten():
