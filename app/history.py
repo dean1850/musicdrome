@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Iterator
 
-from . import config, db
+from . import affinity, config, db
 from .norm import artist_key, track_key
 from .sources import lastfm, listenbrainz, navidrome
 
@@ -189,11 +189,21 @@ def _sync_navidrome_hearts() -> int:
     ids = [song["id"] for song in songs if song["id"]]
     with db.connect() as conn:
         if ids:
-            placeholders = ",".join("?" * len(ids))
+            # Through a temp table rather than an inlined `NOT IN (?, ?, ...)`.
+            # That list is one bind parameter per hearted track and SQLite caps
+            # them — 32766 on a current build, 999 on an older one — so the
+            # obvious version works right up until somebody's hearted set is
+            # large enough, then fails the whole sync with "too many SQL
+            # variables". The temp table has no such ceiling, and it lives on
+            # this connection only.
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS starred_now (id TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM starred_now")
+            conn.executemany(
+                "INSERT OR IGNORE INTO starred_now (id) VALUES (?)", [(i,) for i in ids]
+            )
             conn.execute(
-                f"UPDATE navidrome_tracks SET starred = 0, starred_at = 0 "
-                f"WHERE starred = 1 AND id NOT IN ({placeholders})",
-                ids,
+                "UPDATE navidrome_tracks SET starred = 0, starred_at = 0 "
+                "WHERE starred = 1 AND id NOT IN (SELECT id FROM starred_now)"
             )
         else:
             conn.execute("UPDATE navidrome_tracks SET starred = 0, starred_at = 0")
@@ -375,14 +385,13 @@ def navidrome_profile() -> dict[str, Any]:
                 "GROUP BY artist_key ORDER BY hearts DESC, artist ASC LIMIT 40"
             )
         ]
-        loved_genres = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT genre, COUNT(*) AS hearts FROM navidrome_tracks "
-                "WHERE starred = 1 AND genre != '' GROUP BY lower(genre) "
-                "ORDER BY hearts DESC, genre ASC LIMIT 15"
-            )
-        ]
+        # Folded in Python, for the reason in :func:`app.affinity.fold_genre` —
+        # SQLite's lower() is ASCII-only, so grouping on it leaves
+        # "Électronique" and "électronique" as two genres rather than one.
+        genre_rows = conn.execute(
+            "SELECT genre, COUNT(*) AS hearts FROM navidrome_tracks "
+            "WHERE starred = 1 AND genre != '' GROUP BY genre"
+        ).fetchall()
         library_top_tracks = [
             dict(row)
             for row in conn.execute(
@@ -394,7 +403,13 @@ def navidrome_profile() -> dict[str, Any]:
     return {
         "loved_tracks": loved_tracks,
         "loved_artists": loved_artists,
-        "loved_genres": loved_genres,
+        "loved_genres": [
+            {"genre": genre, "hearts": hearts}
+            # minimum=1: the prompt lists what you heart, and a genre hearted
+            # once is still something you hearted. The *boost* wants a pattern
+            # and asks for more, which is a different question.
+            for genre, hearts in affinity.count_genres(genre_rows, minimum=1, limit=15).items()
+        ],
         "library_top_tracks": library_top_tracks,
     }
 

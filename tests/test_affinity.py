@@ -115,6 +115,40 @@ def test_genre_matching_ignores_case(navidrome_credentials, navidrome_track):
     assert affinity.load().boost("C", tags=["Trip Hop"])[0] == affinity.LOVED_GENRE
 
 
+def test_a_genre_outside_ascii_still_matches(navidrome_credentials, navidrome_track):
+    """SQLite's lower() is ASCII-only and leaves "Électronique" untouched.
+
+    Folding in SQL therefore meant the genre boost silently never fired for
+    any genre outside ASCII — no error and no log line, just a signal doing
+    nothing.
+    """
+    navidrome_track("Air", "La Femme", starred=True, genre="Électronique")
+    navidrome_track("Justice", "D.A.N.C.E", starred=True, genre="Électronique")
+
+    picture = affinity.load()
+
+    assert picture.loved_genres == {"électronique": 2}
+    assert picture.boost("Nobody", tags=["électronique"])[0] == affinity.LOVED_GENRE
+    assert picture.boost("Nobody", tags=["Électronique"])[0] == affinity.LOVED_GENRE
+
+
+def test_two_spellings_of_one_genre_are_counted_together(
+    navidrome_credentials, navidrome_track
+):
+    """Otherwise each spelling falls under the minimum on its own."""
+    navidrome_track("A", "One", starred=True, genre="Électronique")
+    navidrome_track("B", "Two", starred=True, genre="électronique")
+
+    assert affinity.load().boost("C", tags=["electronique"])[0] == 0  # not the same word
+    assert affinity.load().boost("C", tags=["Électronique"])[0] == affinity.LOVED_GENRE
+
+
+def test_genre_folding_survives_surrounding_whitespace():
+    assert affinity.fold_genre("  Trip Hop  ") == "trip hop"
+    assert affinity.fold_genre(None) == ""
+    assert affinity.fold_genre("") == ""
+
+
 def test_unhearted_tracks_contribute_nothing(navidrome_credentials, navidrome_track):
     navidrome_track("Aphex Twin", "Xtal", starred=False, genre="IDM")
     assert affinity.load().boost("Aphex Twin", tags=["idm"]) == (0, "")
@@ -193,6 +227,25 @@ def test_an_unrelated_artist_gets_nothing(navidrome_credentials, navidrome_track
 def test_a_blank_seed_is_ignored(navidrome_credentials, navidrome_track):
     navidrome_track("Aphex Twin", "Xtal", starred=True)
     assert affinity.load().boost("Autechre", seed="") == (0, "")
+
+
+def test_tags_given_as_one_comma_joined_string_still_match(
+    navidrome_credentials, navidrome_track
+):
+    """That is how tags are stored on the suggestions row."""
+    navidrome_track("A", "One", starred=True, genre="idm")
+    navidrome_track("B", "Two", starred=True, genre="idm")
+
+    assert affinity.load().boost("C", tags="downtempo,idm")[0] == affinity.LOVED_GENRE
+
+
+def test_junk_tag_values_are_ignored_rather_than_fatal(
+    navidrome_credentials, navidrome_track
+):
+    navidrome_track("A", "One", starred=True, genre="idm")
+    navidrome_track("B", "Two", starred=True, genre="idm")
+
+    assert affinity.load().boost("C", tags=[None, 123, ["nested"], ""])[0] == 0
 
 
 def test_blank_tags_are_ignored(navidrome_credentials, navidrome_track):

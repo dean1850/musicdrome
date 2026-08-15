@@ -70,6 +70,34 @@ LOVED_GENRE_LIMIT = 12
 LOVED_GENRE_MIN = 2
 
 
+def fold_genre(value: Any) -> str:
+    """A genre name as the key both sides compare on.
+
+    Folded in Python rather than in SQL, which is the whole point of it having
+    its own function. SQLite's ``lower()`` is ASCII-only by default: it leaves
+    ``Électronique`` exactly as it found it, while Python lowercases the tag
+    coming from Last.fm to ``électronique``, and the two never meet. The genre
+    boost then silently never fires for any genre outside ASCII — no error, no
+    log line, just a signal that quietly does nothing.
+    """
+    return str(value or "").strip().casefold()
+
+
+def count_genres(rows: Iterable[Any], minimum: int, limit: int) -> dict[str, int]:
+    """``{genre: hearts}`` for the most-hearted genres, folded and re-summed.
+
+    Two spellings that fold to the same name are one genre, so the counts are
+    added together here rather than left as separate rows.
+    """
+    counts: dict[str, int] = {}
+    for row in rows:
+        name = fold_genre(row["genre"])
+        if name:
+            counts[name] = counts.get(name, 0) + int(row["hearts"])
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return {name: hearts for name, hearts in ranked[:limit] if hearts >= minimum}
+
+
 @dataclass
 class Affinity:
     """A snapshot of what you have hearted, read once per scan.
@@ -136,9 +164,15 @@ class Affinity:
 
     def _genres(self, tags: Iterable[str]) -> list[str]:
         """The two most-hearted genres this recommendation shares with you."""
+        # A bare string is an Iterable[str] of single characters, so it would
+        # be accepted and quietly match nothing. Worth a line, because tags are
+        # stored on the suggestions row as one comma-joined string and anything
+        # rescoring from there would hand over exactly that.
+        if isinstance(tags, str):
+            tags = tags.split(",")
         hits = [
             (self.loved_genres[name], name)
-            for name in {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+            for name in {fold_genre(tag) for tag in tags if fold_genre(tag)}
             if name in self.loved_genres
         ]
         return [name for _, name in sorted(hits, reverse=True)[:2]]
@@ -160,11 +194,11 @@ def load() -> Affinity:
             "WHERE starred = 1 AND artist_key != '' GROUP BY artist_key"
         ).fetchall()
 
+        # Grouped exactly, then folded and re-ranked in Python — see
+        # :func:`fold_genre` for why SQL cannot do the folding.
         genres = conn.execute(
-            "SELECT lower(genre) AS genre, COUNT(*) AS hearts FROM navidrome_tracks "
-            "WHERE starred = 1 AND genre != '' GROUP BY lower(genre) "
-            "HAVING hearts >= ? ORDER BY hearts DESC LIMIT ?",
-            (LOVED_GENRE_MIN, LOVED_GENRE_LIMIT),
+            "SELECT genre, COUNT(*) AS hearts FROM navidrome_tracks "
+            "WHERE starred = 1 AND genre != '' GROUP BY genre"
         ).fetchall()
 
         played = conn.execute(
@@ -180,7 +214,7 @@ def load() -> Affinity:
 
     return Affinity(
         loved_artists={row["artist_key"]: row["hearts"] for row in loved},
-        loved_genres={row["genre"]: row["hearts"] for row in genres},
+        loved_genres=count_genres(genres, LOVED_GENRE_MIN, LOVED_GENRE_LIMIT),
         played_artists={row["artist_key"]: row["plays"] for row in played},
         loved_tracks=total["n"] if total else 0,
     )

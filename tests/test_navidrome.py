@@ -252,6 +252,44 @@ def test_no_hearts_is_not_an_error(monkeypatch, navidrome_credentials):
     assert navidrome.starred_songs() == []
 
 
+def test_a_single_song_serialised_as_a_bare_object_is_read(
+    monkeypatch, navidrome_credentials
+):
+    """Subsonic's JSON is a mechanical translation of its XML, and several
+    servers emit a one-element array as a bare object. Iterating a dict yields
+    its keys, so this used to kill the sync on 'str' has no attribute 'get'."""
+    stub_transport(monkeypatch, [ok({"starred2": {"song": child("s1")}})])
+
+    songs = navidrome.starred_songs()
+    assert [s["title"] for s in songs] == ["Xtal"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"starred2": None},
+        {"starred2": []},
+        {"starred2": {"song": None}},
+        {"starred2": {"song": "nonsense"}},
+        {},
+    ],
+)
+def test_a_malformed_hearts_response_yields_nothing_rather_than_raising(
+    monkeypatch, navidrome_credentials, payload
+):
+    stub_transport(monkeypatch, [ok(payload)])
+    assert navidrome.starred_songs() == []
+
+
+def test_junk_in_the_song_list_is_skipped_not_fatal(monkeypatch, navidrome_credentials):
+    """One bad entry must not cost the other nine hundred."""
+    stub_transport(monkeypatch, [ok({"starred2": {"song": [
+        None, "nonsense", 42, [], child("s1"),
+    ]}})])
+
+    assert [s["id"] for s in navidrome.starred_songs()] == ["s1"]
+
+
 # ─── The library walk ──────────────────────────────────────────────────────
 
 
@@ -283,6 +321,24 @@ def test_library_walk_does_not_pay_for_artists_and_albums(monkeypatch, navidrome
 def test_library_walk_stops_on_an_empty_page(monkeypatch, navidrome_credentials):
     stub_transport(monkeypatch, [ok({"searchResult3": {}})])
     assert list(navidrome.library_songs(page_size=100)) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"searchResult3": None}, {"searchResult3": {"song": None}}, {}],
+)
+def test_a_malformed_page_ends_the_walk_rather_than_raising(
+    monkeypatch, navidrome_credentials, payload
+):
+    stub_transport(monkeypatch, [ok(payload)])
+    assert list(navidrome.library_songs(page_size=100)) == []
+
+
+def test_a_single_song_page_serialised_as_a_bare_object_is_read(
+    monkeypatch, navidrome_credentials
+):
+    stub_transport(monkeypatch, [ok({"searchResult3": {"song": child("s1")}})])
+    assert [s["id"] for s in navidrome.library_songs(page_size=100)] == ["s1"]
 
 
 def test_a_server_that_ignores_the_offset_does_not_loop_forever(
@@ -413,6 +469,62 @@ def test_unhearting_one_of_several_leaves_the_others(
     with db.connect() as conn:
         rows = {r["id"]: r["starred"] for r in conn.execute("SELECT id, starred FROM navidrome_tracks")}
     assert rows == {"s1": 1, "s2": 0}
+
+
+def test_a_large_hearted_set_does_not_blow_the_sql_variable_limit(
+    monkeypatch, navidrome_credentials
+):
+    """The un-starring pass used one bind parameter per hearted track.
+
+    SQLite caps those — 32766 on a current build, 999 on an older one — so the
+    inlined `NOT IN (?, ?, ...)` worked right up until somebody's hearted set
+    was large enough and then failed the whole sync. The exact ceiling is a
+    build option, so this asserts the behaviour at a size that would have
+    produced an unreasonable query rather than trying to trip a limit that
+    varies by machine.
+    """
+    many = [
+        navidrome._song(child(f"s{i}", title=f"Track {i}", starred="2024-03-11T21:04:07Z"))
+        for i in range(5000)
+    ]
+    monkeypatch.setattr(navidrome, "library_songs", lambda *a, **k: iter([]))
+    monkeypatch.setattr(navidrome, "starred_songs", lambda: many)
+    history.sync_navidrome()
+
+    # Now un-heart all but one of them.
+    monkeypatch.setattr(navidrome, "starred_songs", lambda: many[:1])
+    history.sync_navidrome()
+
+    with db.connect() as conn:
+        starred = conn.execute(
+            "SELECT COUNT(*) AS n FROM navidrome_tracks WHERE starred = 1"
+        ).fetchone()["n"]
+        total = conn.execute("SELECT COUNT(*) AS n FROM navidrome_tracks").fetchone()["n"]
+    assert (starred, total) == (1, 5000)
+
+
+def test_the_temp_table_does_not_leak_between_syncs(monkeypatch, navidrome_credentials):
+    """A stale row in it would keep an un-hearted track marked as hearted."""
+    monkeypatch.setattr(navidrome, "library_songs", lambda *a, **k: iter([]))
+    monkeypatch.setattr(
+        navidrome, "starred_songs",
+        lambda: [navidrome._song(child("s1", starred="2024-03-11T21:04:07Z")),
+                 navidrome._song(child("s2", artist="B", title="T2",
+                                       starred="2024-03-11T21:04:07Z"))],
+    )
+    history.sync_navidrome()
+
+    monkeypatch.setattr(
+        navidrome, "starred_songs",
+        lambda: [navidrome._song(child("s2", artist="B", title="T2",
+                                       starred="2024-03-11T21:04:07Z"))],
+    )
+    history.sync_navidrome()
+    history.sync_navidrome()
+
+    with db.connect() as conn:
+        rows = {r["id"]: r["starred"] for r in conn.execute("SELECT id, starred FROM navidrome_tracks")}
+    assert rows == {"s1": 0, "s2": 1}
 
 
 def test_a_failure_is_recorded_and_never_raised(monkeypatch, navidrome_credentials):

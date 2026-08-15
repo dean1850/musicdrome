@@ -150,6 +150,73 @@ def test_appending_writes_the_entry_for_the_configured_folder(playlists_at):
     assert lines[2] == "Radiohead/OK Computer/06 - Karma Police.opus"
 
 
+# ─── Paths that collide with m3u syntax ────────────────────────────────────
+
+
+def test_an_artist_starting_with_a_hash_is_not_written_as_a_comment(playlists_at):
+    """"#1 Dads" at the library root would otherwise be read back as a remark.
+
+    The track is not mis-filed by that, it is gone: nothing plays it, nothing
+    counts it, and the file still looks perfectly well-formed.
+    """
+    playlists_at(".")
+    entry = download.playlist_entry(track("#1 Dads", "Album", "01 - Song.opus"))
+
+    assert not entry.startswith("#")
+    assert entry == "./#1 Dads/Album/01 - Song.opus"
+
+
+def test_a_hash_artist_needs_no_help_when_the_entry_already_climbs(playlists_at):
+    playlists_at("playlist")
+    assert download.playlist_entry(track("#1 Dads", "Album", "01 - Song.opus")) == (
+        "../#1 Dads/Album/01 - Song.opus"
+    )
+
+
+def test_a_hash_artist_survives_a_move_to_the_root(playlists_at):
+    """The round trip that lost the track outright."""
+    seed_legacy("../#1 Dads/Album/01 - Song.opus")
+    new_dir = playlists_at(".")
+
+    download.migrate_playlist_folder()
+
+    playlist = new_dir / f"{config.PLAYLIST_NAME}.m3u"
+    assert entries_of(playlist) == ["./#1 Dads/Album/01 - Song.opus"]
+
+
+def test_a_hash_entry_still_resolves_to_the_right_file():
+    old, new = config.MUSIC_DIR / "_playlists", config.MUSIC_DIR
+    rewritten = download.rewrite_entry("../#1 Dads/Album/01 - Song.opus", old, new)
+    assert Path(os.path.normpath(new / rewritten)) == config.MUSIC_DIR / "#1 Dads" / "Album" / "01 - Song.opus"
+
+
+def test_a_hash_entry_is_read_back_as_a_path_not_a_comment(playlists_at):
+    """Musicdrome's own parser is one of the parsers that would drop it."""
+    new_dir = playlists_at(".")
+    new_dir.mkdir(parents=True, exist_ok=True)
+    playlist = new_dir / f"{config.PLAYLIST_NAME}.m3u"
+    playlist.write_text("#EXTM3U\n#EXTINF:1,A - B\n./#1 Dads/Album/01 - Song.opus\n")
+
+    assert download.playlist_paths(playlist) == {"./#1 Dads/Album/01 - Song.opus"}
+    assert download._parse_playlist(playlist) == [
+        ("#EXTINF:1,A - B", "./#1 Dads/Album/01 - Song.opus")
+    ]
+
+
+def test_a_hash_track_is_not_appended_twice(playlists_at):
+    """Dedup compares the written form, so it has to be stable."""
+    playlists_at(".")
+    path = track("#1 Dads", "Album", "01 - Song.opus")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    meta = {"artist": "#1 Dads", "title": "Song", "duration": 1}
+
+    playlist = Path(download.append_to_playlist(path, meta))
+    download.append_to_playlist(path, meta)
+
+    assert entries_of(playlist) == ["./#1 Dads/Album/01 - Song.opus"]
+
+
 # ─── Rewriting an entry for a moved playlist ───────────────────────────────
 
 
@@ -259,6 +326,32 @@ def test_nothing_happens_when_the_folder_has_not_changed(playlists_at):
 def test_nothing_happens_when_there_is_no_old_folder(playlists_at):
     playlists_at("playlist")
     assert download.migrate_playlist_folder() == 0
+
+
+@pytest.mark.parametrize("name", ["Best [2024]", "Mix*", "What?"])
+def test_a_playlist_name_with_glob_syntax_moves_only_our_file(playlists_at, monkeypatch, name):
+    """MUSICDROME_PLAYLIST_NAME is free text; `glob` reads [, * and ? as syntax.
+
+    "Best [2024]" as a pattern is a character class: it does not match its own
+    file, and it does match "Best 2.m3u" — so the migration used to leave ours
+    behind and move somebody else's playlist instead, rewriting its paths on
+    the way.
+    """
+    monkeypatch.setattr(config, "PLAYLIST_NAME", name)
+    legacy = config.LEGACY_PLAYLIST_DIR
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / f"{name}.m3u").write_text("#EXTM3U\n../A/B/ours.opus\n")
+    for decoy in ("Best 2.m3u", "Mixtape.m3u", "WhatX.m3u"):
+        (legacy / decoy).write_text("#EXTM3U\n../Z/Z/theirs.opus\n")
+
+    new_dir = playlists_at("playlist")
+    assert download.migrate_playlist_folder() == 1
+
+    assert (new_dir / f"{name}.m3u").exists()
+    assert entries_of(new_dir / f"{name}.m3u") == ["../A/B/ours.opus"]
+    for decoy in ("Best 2.m3u", "Mixtape.m3u", "WhatX.m3u"):
+        assert (legacy / decoy).exists(), f"{decoy} was moved and is not ours"
+        assert not (new_dir / decoy).exists()
 
 
 def test_an_unreadable_old_folder_does_not_stop_the_boot(playlists_at):

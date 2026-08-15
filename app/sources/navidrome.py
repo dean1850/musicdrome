@@ -159,12 +159,34 @@ def ping() -> dict[str, Any]:
 # ─── Reading ───────────────────────────────────────────────────────────────
 
 
-def _song(entry: dict[str, Any]) -> dict[str, Any] | None:
+def _song_list(container: Any, key: str) -> list[Any]:
+    """The ``song`` array out of a response, however it was serialised.
+
+    Subsonic's JSON is a mechanical translation of its XML, and the translation
+    is not consistent about arrays across implementations: a response carrying
+    exactly one song comes back from several servers as a bare object where a
+    list was expected. Navidrome itself always emits a list, so this is not
+    working around Navidrome — it is the difference between one starred track
+    being read and the whole sync dying on ``'str' object has no attribute
+    'get'``, because iterating a dict yields its keys.
+    """
+    if not isinstance(container, dict):
+        return []
+    value = container.get(key)
+    if isinstance(value, dict):
+        return [value]
+    return value if isinstance(value, list) else []
+
+
+def _song(entry: Any) -> dict[str, Any] | None:
     """One Subsonic ``Child`` as the fields we store, or ``None`` if unusable.
 
     ``starred`` is an ISO timestamp when set and absent otherwise, so its
     presence *is* the flag — there is no boolean to read.
     """
+    if not isinstance(entry, dict):
+        return None
+
     artist = str(entry.get("artist") or entry.get("displayArtist") or "").strip()
     title = str(entry.get("title") or entry.get("name") or "").strip()
     if not artist or not title:
@@ -240,7 +262,7 @@ def starred_songs() -> list[dict[str, Any]]:
     expressed.
     """
     data = _get("getStarred2.view")
-    entries = (data.get("starred2") or {}).get("song") or []
+    entries = _song_list(data.get("starred2"), "song")
     songs = [song for song in (_song(entry) for entry in entries) if song]
     for song in songs:
         # getStarred2 returns these *because* they are starred, and older
@@ -286,7 +308,7 @@ def library_songs(
                 "albumCount": 0,
             },
         )
-        entries = (data.get("searchResult3") or {}).get("song") or []
+        entries = _song_list(data.get("searchResult3"), "song")
         if not entries:
             return
 
