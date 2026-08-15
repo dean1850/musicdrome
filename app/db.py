@@ -68,7 +68,15 @@ CREATE TABLE IF NOT EXISTS suggestions (
     album          TEXT    NOT NULL DEFAULT '',
     year           TEXT    NOT NULL DEFAULT '',
     track_no       INTEGER NOT NULL DEFAULT 0,
+    -- `match` is what the card shows and what auto-download compares against:
+    -- the model's own confidence plus whatever the Navidrome hearts added.
+    -- The two parts are kept alongside it so the blend can be explained rather
+    -- than just asserted, and so turning Navidrome off later does not leave
+    -- boosted numbers behind with nothing to attribute them to.
     match          INTEGER NOT NULL DEFAULT 0,
+    match_base     INTEGER NOT NULL DEFAULT 0,
+    affinity       INTEGER NOT NULL DEFAULT 0,
+    affinity_reason TEXT   NOT NULL DEFAULT '',
     reason         TEXT    NOT NULL DEFAULT '',
     seed           TEXT    NOT NULL DEFAULT '',
     tags           TEXT    NOT NULL DEFAULT '',
@@ -127,6 +135,33 @@ CREATE TABLE IF NOT EXISTS excluded_files (
     artist_key TEXT    NOT NULL
 );
 
+-- What Navidrome knows that the scrobble services do not: which tracks you
+-- hearted, and how often you have played them from your own library.
+--
+-- Deliberately *not* merged into `plays`. Navidrome reports a count and a
+-- last-played date, not the individual listens behind them, so writing them as
+-- play rows would mean inventing timestamps — which would then be charted on
+-- the stats page as if someone had really listened at those moments. The
+-- aggregate is kept as an aggregate, and the taste profile reads it as one.
+CREATE TABLE IF NOT EXISTS navidrome_tracks (
+    id          TEXT    PRIMARY KEY,   -- Navidrome's own song id
+    artist      TEXT    NOT NULL,
+    title       TEXT    NOT NULL,
+    album       TEXT    NOT NULL DEFAULT '',
+    artist_key  TEXT    NOT NULL,
+    track_key   TEXT    NOT NULL,
+    genre       TEXT    NOT NULL DEFAULT '',
+    year        INTEGER NOT NULL DEFAULT 0,
+    starred     INTEGER NOT NULL DEFAULT 0,
+    starred_at  INTEGER NOT NULL DEFAULT 0,
+    -- Navidrome's 1-5 star rating. Stored because the same response carries it
+    -- and a column costs nothing; nothing reads it yet.
+    rating      INTEGER NOT NULL DEFAULT 0,
+    play_count  INTEGER NOT NULL DEFAULT 0,
+    played_at   INTEGER NOT NULL DEFAULT 0,  -- last played, not every play
+    synced_at   INTEGER NOT NULL
+);
+
 -- How far each history source has been read: the timestamp of the newest play
 -- stored, so a sync only ever asks for what it has not seen.
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -149,6 +184,10 @@ CREATE INDEX IF NOT EXISTS suggestions_scan ON suggestions (scan_id);
 CREATE INDEX IF NOT EXISTS downloads_status ON downloads (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS downloads_track_key ON downloads (track_key);
 CREATE INDEX IF NOT EXISTS excluded_track_key ON excluded_files (track_key);
+CREATE INDEX IF NOT EXISTS navidrome_track_key ON navidrome_tracks (track_key);
+CREATE INDEX IF NOT EXISTS navidrome_artist_key ON navidrome_tracks (artist_key);
+CREATE INDEX IF NOT EXISTS navidrome_starred ON navidrome_tracks (starred, starred_at DESC);
+CREATE INDEX IF NOT EXISTS navidrome_plays ON navidrome_tracks (play_count DESC);
 """
 
 SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
@@ -158,7 +197,9 @@ SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
 #   1 → the original single-listener schema
 #   2 → per-user plays, suggestions, scans, downloads and sync cursors
 #   3 → single listener again; the users table and every user_id column removed
-SCHEMA_VERSION = 3
+#   4 → Navidrome hearts and library play counts, and the match breakdown on
+#       suggestions that records what the model said before they were applied
+SCHEMA_VERSION = 4
 
 # The tables :func:`_reset_to_single_user` clears, in the order it drops them.
 # `downloads` is deliberately absent: those rows describe files that are on
@@ -225,6 +266,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "suggestions": [
             ("recording_mbid", "TEXT NOT NULL DEFAULT ''"),
             ("track_no", "INTEGER NOT NULL DEFAULT 0"),
+            # What the model itself said, before the Navidrome hearts were
+            # applied, and what they added.
+            ("match_base", "INTEGER NOT NULL DEFAULT 0"),
+            ("affinity", "INTEGER NOT NULL DEFAULT 0"),
+            ("affinity_reason", "TEXT NOT NULL DEFAULT ''"),
         ],
         "downloads": [
             ("progress", "INTEGER NOT NULL DEFAULT 0"),
@@ -235,12 +281,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("encoded", "TEXT NOT NULL DEFAULT ''"),
         ],
     }
+    added: set[str] = set()
     for table, columns in additions.items():
         for name, definition in columns:
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                added.add(f"{table}.{name}")
             except sqlite3.OperationalError:
                 pass
+
+    # Cards that existed before the breakdown did were scored by the model
+    # alone, so their base score is their score. This runs once, in the boot
+    # that adds the column, and never again — a blanket "where match_base = 0"
+    # on every boot would overwrite the real base of any card the model
+    # genuinely scored at zero and the hearts then lifted.
+    if "suggestions.match_base" in added:
+        conn.execute("UPDATE suggestions SET match_base = match")
 
 
 def _table_ddl(table: str) -> str:

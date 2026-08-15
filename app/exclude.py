@@ -1,11 +1,20 @@
 """The "don't suggest this" index.
 
-Four things disqualify a track from ever appearing as a recommendation:
+Five things disqualify a track from ever appearing as a recommendation:
 
 * it is in your scrobble history — you already have a way to play it
 * Musicdrome already downloaded it
 * you dismissed it with ✕
 * it was found in ``EXCLUDE_MUSIC_DIR``, an existing library you point at
+* you hearted it in Navidrome, which means you own it and thought so hard
+  about it that you went and starred it
+
+Only *hearted* Navidrome tracks are excluded, not everything Navidrome knows
+about. The play-count walk reads the whole library, so excluding all of it
+would be a one-line change — and a much larger decision than it looks, since it
+would silently suppress every recommendation of anything already on the disk
+whether or not you had ever played it. ``EXCLUDE_MUSIC_DIR`` is the setting for
+that, and it is opt-in for exactly that reason.
 
 The folder scan reads artist and title tags and nothing else. No library
 database is built, no files are moved, and the directory is never written to.
@@ -50,6 +59,12 @@ def build() -> set[str]:
             )
         )
         keys.update(row[0] for row in conn.execute("SELECT DISTINCT track_key FROM excluded_files"))
+        keys.update(
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT track_key FROM navidrome_tracks WHERE starred = 1"
+            )
+        )
     keys.discard("")
     return keys
 

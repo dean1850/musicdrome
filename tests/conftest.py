@@ -22,6 +22,9 @@ os.environ.update(
     LASTFM_API_KEY="",
     LASTFM_USER="",
     LISTENBRAINZ_USER="",
+    NAVIDROME_URL="",
+    NAVIDROME_USER="",
+    NAVIDROME_PASSWORD="",
     AI_PROVIDER="ollama",
     TZ="UTC",
 )
@@ -66,6 +69,50 @@ def play():
                 (artist, title, artist_key(artist), track_key(artist, title),
                  at if at is not None else db.now(), source),
             )
+
+    return add
+
+
+@pytest.fixture
+def navidrome_credentials(monkeypatch):
+    """Make ``navidrome.configured()`` true without touching the network."""
+    monkeypatch.setattr(config, "NAVIDROME_URL", "http://navidrome.test:4533")
+    monkeypatch.setattr(config, "NAVIDROME_USER", "listener")
+    monkeypatch.setattr(config, "NAVIDROME_PASSWORD", "hunter2")
+    return {"url": "http://navidrome.test:4533", "user": "listener", "password": "hunter2"}
+
+
+@pytest.fixture
+def navidrome_track():
+    """Insert a row in navidrome_tracks. Returns the Navidrome song id used."""
+    from app.norm import artist_key, track_key
+
+    counter = {"n": 0}
+
+    def add(
+        artist: str,
+        title: str,
+        starred: bool = False,
+        play_count: int = 0,
+        genre: str = "",
+        starred_at: int | None = None,
+        rating: int = 0,
+    ) -> str:
+        counter["n"] += 1
+        song_id = f"nd-{counter['n']}"
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO navidrome_tracks (id, artist, title, album, artist_key, "
+                "track_key, genre, year, starred, starred_at, rating, play_count, "
+                "played_at, synced_at) VALUES (?, ?, ?, '', ?, ?, ?, 0, ?, ?, ?, ?, 0, ?)",
+                (
+                    song_id, artist, title, artist_key(artist), track_key(artist, title),
+                    genre, int(starred),
+                    starred_at if starred_at is not None else (db.now() if starred else 0),
+                    rating, play_count, db.now(),
+                ),
+            )
+        return song_id
 
     return add
 

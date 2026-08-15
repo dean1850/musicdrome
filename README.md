@@ -2,9 +2,10 @@
 
 AI music discovery that downloads what it recommends.
 
-Musicdrome reads what you already listen to from Last.fm and ListenBrainz, asks
-an AI what you would like next, scores every suggestion with a match percentage,
-and downloads the ones you pick as tagged MP3s at 320 kbps.
+Musicdrome reads what you already listen to from Last.fm and ListenBrainz —
+and, optionally, what you have *hearted* in Navidrome — asks an AI what you
+would like next, scores every suggestion with a match percentage, and downloads
+the ones you pick as tagged MP3s at 320 kbps.
 
 Single container: FastAPI plus vanilla HTML, CSS and JavaScript. No database
 server, no build step, no telemetry, no third-party embeds. Dark only.
@@ -14,7 +15,7 @@ server, no build step, no telemetry, no third-party embeds. Dark only.
  Last.fm ─┐                     │                      │
           ├──▶ SQLite ──▶ 40 ranked tracks ──▶  ↓ download  ♥ save  ✕ hide
  ListenBrainz ┘           + match % + why            │
-                                                     ▼
+ Navidrome ♥ ┘                                       ▼
                               YouTube Music ─▶ yt-dlp ─▶ Opus ~160
                                                      │
                                 MusicBrainz tags, cover art, and
@@ -68,6 +69,9 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
   and no API secret. Whatever you already listen with keeps scrobbling as it does.
 - **ListenBrainz** — just your username, for a public profile.
 
+**Optionally, Navidrome.** Your hearted tracks, which are a much better signal
+than your plays — see [What you hearted](#what-you-hearted).
+
 **An AI backend.** One of:
 
 | `AI_PROVIDER` | Needs | Notes |
@@ -79,22 +83,124 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ## How a scan works
 
 1. **Sync.** New scrobbles are pulled from every configured source. Each keeps
-   its own cursor, so only new plays are fetched.
+   its own cursor, so only new plays are fetched. Navidrome's hearts are
+   re-read at the same time.
 2. **Profile.** Your most-played artists, most-played tracks and most recently
-   discovered artists over the listening window.
+   discovered artists over the listening window — plus everything you hearted.
 3. **Ask.** One AI call returns the whole batch — 40 tracks by default, each with
    an artist, a title, a match percentage and a one-line reason naming what in
    your history led there.
 4. **Resolve.** Each answer goes to MusicBrainz for the canonical artist, album,
    year and recording length, then to Last.fm for cover art and genre tags.
-5. **Filter.** Anything you already have is dropped — see below.
-6. **Show.** What survives becomes cards you can download, save or hide.
+5. **Score.** The match percentage is the model's confidence plus whatever your
+   hearts add to it.
+6. **Filter.** Anything you already have is dropped — see below.
+7. **Show.** What survives becomes cards you can download, save or hide.
 
 Downloads then search YouTube Music through `ytmusicapi`, score candidates on
 artist, title and duration against the MusicBrainz recording, and fall back to a
 plain YouTube search when YouTube Music does not carry the track. A card that
 cannot be matched confidently is marked failed rather than guessed at — a wrong
 file in your library is worse than a missing one.
+
+## What you hearted
+
+Scrobbles are a big, noisy signal. A high play count can mean a record you love
+or an album that was on in the background for a fortnight, and nothing in the
+data tells the two apart. Musicdrome has always had to guess.
+
+A **starred track in Navidrome is not a guess**. Nobody hearts something by
+accident, or because it was next in the queue. There are two orders of magnitude
+fewer of them than there are scrobbles, and that scarcity is exactly what makes
+them worth having. Point Musicdrome at your Navidrome and it reads them:
+
+```sh
+NAVIDROME_URL=http://navidrome:4533
+NAVIDROME_USER=you
+NAVIDROME_PASSWORD=your-navidrome-password
+```
+
+Leave `NAVIDROME_URL` empty and nothing changes; everything below is optional.
+
+### There is no Navidrome API key
+
+Worth saying plainly, because it is the first thing you will go looking for.
+Navidrome's Subsonic API authenticates a **user** — its
+[`validateCredentials`](https://github.com/navidrome/navidrome/blob/master/server/subsonic/middlewares.go)
+accepts a plaintext password, a hex-encoded one, an MD5 of the password salted
+per request, or a session JWT, and nothing else. The native REST API takes a
+JWT that its own documentation calls unstable and asks you not to use. So this
+is your Navidrome login, not a token you mint somewhere.
+
+**The password is never sent.** Every request carries an MD5 of it hashed
+against fresh random bytes, which is the same scheme every Subsonic client
+uses — so it stays out of Navidrome's access log, out of any proxy in front of
+it, and out of Musicdrome's own logs. The salt is regenerated per request, not
+per session, so one captured request is not a reusable credential.
+
+Musicdrome only ever reads: `ping`, `getStarred2` and `search3`. None of the
+three writes anything. Navidrome has no scoped tokens, though, so the
+credential is as privileged as the account behind it — if that matters to you,
+make an ordinary non-admin Navidrome user for this. Hearts are per-user, so
+star from the same account you name here or there will be nothing to read.
+
+### What it changes
+
+**The AI is told.** The prompt gains your hearted artists, hearted tracks and
+hearted genres, labelled as the stronger evidence and placed *above* the play
+counts — a model reading a long prompt weights the top of it more heavily, and
+that is the whole point of the ordering.
+
+**And the score is adjusted afterwards.** Being told is not the same as
+listening: one AI call per scan is what makes a local 8B model a reasonable
+backend here, and an 8B model handed a new section of the prompt will sometimes
+use it and sometimes paraphrase it back at you without letting it move the
+number. So the hearts are applied twice — once in the prompt, and again in
+arithmetic that does not depend on the model having cooperated:
+
+| Signal | Adds |
+|---|---|
+| The suggested artist is one you have hearted | +12 |
+| It came from an artist you have hearted | +8 |
+| The artist is among your most played in Navidrome | +6 |
+| Its genre is one you heart | +4 |
+
+Capped at **+15 combined**, which is deliberately not enough to carry a bad
+recommendation into auto-download territory on its own. The model has heard
+your whole listening history; this has heard which artists you starred. It is a
+thumb on the scale, and a thumb is the right amount of pressure — a larger
+boost would turn every scan into a list of tracks by the six artists you have
+hearted, which is the opposite of discovery.
+
+Cards that were lifted say so. The match pill carries a ♥ and hovering it gives
+the breakdown — `82% from the model, +12 from what you heart — you have hearted
+3 tracks by Boards of Canada` — so the second signal is something you can check
+rather than take on trust. Both halves are stored, so the number is never
+asserted without being accountable for.
+
+**And hearted tracks are never suggested back to you.** You own them, and you
+thought about them enough to star them.
+
+### Play counts
+
+Navidrome also knows how often you have played each track from your own
+library, which catches listening that never scrobbled at all. Those are read
+too, and they are the one expensive part: Subsonic has no "songs I have played"
+endpoint, so they come from paging through the whole library with `search3` —
+about 40 requests for 20,000 tracks. That walk is cached for six hours
+(`NAVIDROME_LIBRARY_MAX_AGE`) rather than repeated every scan; hearts are one
+request and refresh every time. Set `NAVIDROME_LIBRARY_PAGE=0` to skip the walk
+entirely and use hearts alone.
+
+They are kept as an aggregate rather than merged into your scrobble history,
+and that is deliberate. Navidrome reports *34 plays, most recently Tuesday* —
+not the 34 listens behind it. Writing those as play rows would mean inventing
+timestamps, which the stats page would then chart as if someone had really
+listened at those moments. So the stats tab still counts only real scrobbles;
+the taste profile reads the aggregate as the aggregate it is.
+
+Un-hearting in Navidrome takes effect on the next scan: the flag is cleared,
+the boost stops, and the track becomes suggestable again.
 
 ## What it will never suggest
 
@@ -103,7 +209,14 @@ A track is excluded if any of these is true:
 - it is anywhere in your scrobble history
 - Musicdrome already downloaded it
 - you dismissed it with ✕
+- you hearted it in Navidrome
 - it was found in `EXCLUDE_MUSIC_DIR`, which is your library
+
+Only *hearted* Navidrome tracks are excluded, not everything Navidrome knows
+about — the play-count walk reads your whole library, but suppressing every
+recommendation of anything already on the disk is a much larger decision than
+it looks. `EXCLUDE_MUSIC_DIR` is the setting for that, and it is opt-in for
+exactly that reason.
 
 That last one is the collection you already have. Compose points it at `/music`,
 the same directory downloads are filed into, which is the point: everything you
@@ -123,6 +236,11 @@ have no default and describe your machine: `MUSIC_LOCATION`, your library, and
 always `/music` and `/config`; `docker-compose.yml` sets that and you never need
 to. See [`.env.example`](.env.example).
 
+Your Navidrome credentials live there too, alongside the Last.fm key rather
+than in the Settings tab — so no password is ever written to the database or
+served back over HTTP. Changing them needs a container restart; the Connections
+panel in Settings shows whether they are working.
+
 Everything you would want to change while using it lives in the **Settings** tab
 and applies immediately, no restart:
 
@@ -139,9 +257,10 @@ and applies immediately, no restart:
 
 ## One listener
 
-Musicdrome recommends for one person. `LASTFM_USER` and `LISTENBRAINZ_USER` in
-`.env` are who that is, and there is nothing else to set up — no accounts, no
-profiles, no picker.
+Musicdrome recommends for one person. `LASTFM_USER`, `LISTENBRAINZ_USER` and
+`NAVIDROME_USER` in `.env` are who that is, and there is nothing else to set
+up — no accounts, no profiles, no picker. Navidrome's hearts are per-user, so
+that name decides whose hearts are read.
 
 This was briefly a household app, with a users table and per-person suggestions.
 It was more machinery than the job needed: one library, one queue and one taste
@@ -414,6 +533,12 @@ kept rather than the scan being thrown away, and the log says so. Lowering
 Musicdrome has **no authentication**, by design — it is meant for a trusted home
 network. Put it behind a VPN or an authenticating reverse proxy if you need to
 reach it from outside.
+
+`NAVIDROME_PASSWORD` is the one real secret in `.env`. It never leaves the
+container in a request — only a per-request salted MD5 of it does — and the API
+never serves it back: `/api/status` reports the URL, the username and whether
+the last sync worked, and nothing else. Navidrome has no scoped tokens, so an
+ordinary non-admin Navidrome user is the right account to give it.
 
 ## Notes
 

@@ -28,6 +28,12 @@ const serverEnv = {
   LASTFM_USER: '',
   LISTENBRAINZ_USER: '',
   EXCLUDE_MUSIC_DIR: '',
+  // Configured, so the Connections panel has a Navidrome row to render. No
+  // request is ever made to it: MUSICDROME_TESTING keeps the scheduler off, and
+  // nothing else in the request path talks to Navidrome.
+  NAVIDROME_URL: 'http://navidrome.invalid:4533',
+  NAVIDROME_USER: 'e2e',
+  NAVIDROME_PASSWORD: 'e2e',
   TZ: 'UTC',
 };
 
