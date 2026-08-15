@@ -102,6 +102,14 @@ async def lifespan(app: FastAPI):
     if problem:
         log.error("youtube downloads will be degraded: %s", problem)
 
+    # And for the cookie file, which is what YouTube's bot check sends everyone
+    # looking for. A path that does not resolve inside the container is the
+    # quiet version of this: the setting is there, yt-dlp never opens it, and
+    # the downloads keep failing with the message it was set to fix.
+    problem = download.cookies_problem()
+    if problem:
+        log.error("youtube cookies will not be used: %s", problem)
+
     # And for the TLS fingerprint, which decides whether YouTube answers the
     # media fetch at all from a VPN or a datacenter address.
     log.info("tls:     %s", download.impersonation_status())

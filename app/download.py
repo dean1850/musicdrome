@@ -37,6 +37,16 @@ order they get a chance to:
 4. and once several downloads in a row have 403'd, the queue pauses instead of
    converting every remaining track into a failure at dequeue speed.
 
+**On the bot check.** "Sign in to confirm you're not a bot" is a different
+animal from a 403 and is handled separately. It arrives as an extraction error
+rather than an HTTP status, and it is issued against *the connection* — so
+unlike a refused media URL there is nothing to retry, no other upload that
+would be served instead, and no reason to believe the next track will fare
+better. The only useful response is to stop the queue and say which lever
+fixes it, which is what :func:`_note_bot_check` and :func:`explain_bot_check`
+do. Left unhandled it is worse than a 403: the whole queue drains into
+failures in the time it takes the workers to dequeue it.
+
 Downloads run on a small pool of worker threads draining the ``downloads``
 table, so the queue survives a restart: anything left mid-flight is requeued at
 boot by :func:`start_workers`.
@@ -106,11 +116,13 @@ _ytmusic_lock = threading.Lock()
 # moment would otherwise interleave an #EXTINF with somebody else's path.
 _playlist_lock = threading.Lock()
 
-# How many downloads have 403'd in a row, and when the queue may resume. Shared
-# across the worker pool, hence the lock.
-_403_lock = threading.Lock()
+# How many downloads have 403'd in a row, and when the queue may resume. The
+# clock is not named after the 403 because a bot check sets it too, and from a
+# worker's point of view both mean the same thing: not yet. Shared across the
+# pool, hence the lock.
+_hold_lock = threading.Lock()
 _403_streak = 0
-_403_until = 0.0
+_hold_until = 0.0
 
 _UNSET = object()
 _impersonate_cache: Any = _UNSET
@@ -129,6 +141,24 @@ _FORBIDDEN = re.compile(r"\b403\b")
 # fetched, so it fails searches and downloads alike.
 _NO_IMPERSONATION = re.compile(r"impersonate target.{0,80}?is not available", re.IGNORECASE | re.DOTALL)
 
+# YouTube's bot gate: "Sign in to confirm you're not a bot."
+#
+# Two details decide whether this matches anything in practice. The apostrophe
+# yt-dlp emits is U+2019, not ASCII, so the obvious substring test silently
+# never fires — hence `\S{0,3}`, which covers both without depending on which
+# one arrives. And the leading "Sign in to confirm" is deliberately not part of
+# the pattern: YouTube opens its *age* gate with the same four words, and that
+# one really is per-video, so matching them would pause the whole queue over a
+# single track nobody can watch signed out.
+_BOT_CHECK = re.compile(r"confirm\s+(?:you\S{0,3}re|you\s+are)\s+not\s+a\s+bot", re.IGNORECASE)
+
+# The rest of that message is three lines of yt-dlp's own advice and two wiki
+# links, repeated verbatim on every failed row in the downloads table. The
+# advice is sound and belongs in the README, not in a table cell forty times
+# over — :func:`explain_bot_check` cuts it here and says the same thing once,
+# in terms of the settings this app actually has.
+_BOT_CHECK_ADVICE = re.compile(r"\s*Use\s+--cookies.*", re.IGNORECASE | re.DOTALL)
+
 
 class DownloadError(RuntimeError):
     pass
@@ -137,6 +167,18 @@ class DownloadError(RuntimeError):
 def is_forbidden(error: BaseException | str) -> bool:
     """Whether an error is YouTube refusing the connection rather than us."""
     return bool(_FORBIDDEN.search(str(error)))
+
+
+def is_bot_check(error: BaseException | str) -> bool:
+    """Whether YouTube answered with its "are you a bot" challenge.
+
+    Kept apart from :func:`is_forbidden` because the two want opposite
+    handling. A 403 is worth retrying, worth trying another upload for, and
+    worth counting before drawing a conclusion. A bot check is worth none of
+    those: the challenge is issued against whoever is asking, so the retry, the
+    other upload and the next track in the queue all fail identically.
+    """
+    return bool(_BOT_CHECK.search(str(error)))
 
 
 def is_impersonation_unavailable(error: BaseException | str) -> bool:
@@ -271,6 +313,55 @@ class _YtdlpLogger:
     @staticmethod
     def error(message: str) -> None:
         log.debug("yt-dlp: %s", message)  # the caller reports the failure itself
+
+
+def cookies_problem() -> str:
+    """Why the configured cookie file will not work, or ``""`` if it will.
+
+    Checked at boot because of when people set it. A cookie file is what
+    YouTube's bot check drives everyone towards, so it tends to be configured
+    at the worst possible moment — downloads already failing, one variable
+    changed, a restart, and then no way to tell whether it helped, because a
+    cookie file yt-dlp cannot open produces exactly the failure it was meant to
+    fix. Container paths make that easy to hit: a path is only the same inside
+    the container if it was mounted there.
+
+    Says so and nothing more. A bad cookie file is a reason to stop guessing,
+    not a reason to refuse to start — downloads without one still work for
+    anything YouTube is not challenging.
+    """
+    configured = config.YTDLP_COOKIES_FILE.strip()
+    if not configured:
+        return ""
+
+    path = Path(configured)
+    if not path.exists():
+        return (
+            f"YTDLP_COOKIES_FILE is {configured}, which does not exist inside the "
+            f"container — the file has to be mounted in, not merely present on "
+            f"the host"
+        )
+    if not path.is_file():
+        return f"YTDLP_COOKIES_FILE is {configured}, which is a directory"
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            first = handle.readline()
+    except OSError as exc:
+        return f"YTDLP_COOKIES_FILE at {configured} cannot be read ({exc})"
+
+    if not first.strip():
+        return f"YTDLP_COOKIES_FILE at {configured} is empty"
+    # Netscape format is either commented ("# Netscape HTTP Cookie File") or
+    # straight into tab-separated fields. Anything else is the other thing
+    # browser extensions export — JSON — which yt-dlp rejects outright.
+    if not first.lstrip().startswith("#") and "\t" not in first:
+        return (
+            f"YTDLP_COOKIES_FILE at {configured} is not in Netscape format, which "
+            f"is the only one yt-dlp reads — export it as cookies.txt rather than "
+            f"as JSON"
+        )
+    return ""
 
 
 def js_runtime_problem() -> str:
@@ -702,6 +793,13 @@ def search_youtube(artist: str, title: str, limit: int = 5) -> list[Candidate]:
             download=False,
         )
     except Exception as exc:
+        # A bot check here is not "nothing was found" — the search never
+        # happened. Swallowing it files the one failure with a fix under the
+        # one without: the track is reported as unmatchable, which is what a
+        # misspelled AI recommendation looks like, and the exit address that
+        # actually caused it is never mentioned. So it is raised.
+        if is_bot_check(exc):
+            raise
         log.warning("YouTube search failed for %s - %s: %s", artist, title, exc)
         return []
 
@@ -1318,7 +1416,13 @@ def fetch(download_id: int) -> None:
 
     except Exception as exc:
         message = str(exc)
-        if is_forbidden(exc):
+        # The bot check first: it is the more specific diagnosis, and its
+        # message can carry a video id full of digits that has no business
+        # being read as a status code.
+        if is_bot_check(exc):
+            message = explain_bot_check(message)
+            _note_bot_check()
+        elif is_forbidden(exc):
             message = explain_forbidden(message)
             _note_403()
         message = message[:500]
@@ -1352,19 +1456,47 @@ def explain_forbidden(message: str) -> str:
     )
 
 
+def explain_bot_check(message: str) -> str:
+    """Turn YouTube's bot challenge into the one sentence that acts on it.
+
+    yt-dlp's own version of this message is three lines of instructions and two
+    wiki links, written for somebody at a command line with a browser on the
+    same machine — which is nobody running this in a container. Worse, it reads
+    as advice about *this download*, when the challenge was issued against the
+    connection and every other track in the queue is about to fail identically.
+
+    So the boilerplate is cut and replaced with what can actually be changed
+    here, in the names this app uses for it.
+
+    What is kept is capped, because the row it lands in is truncated at 500
+    characters and the advice is at the end of it. A future yt-dlp wording that
+    ran long would otherwise push the only actionable half of this message off
+    the edge of the column.
+    """
+    trimmed = _BOT_CHECK_ADVICE.sub("", message.strip()).strip().rstrip(".")[:160]
+    return (
+        f"{trimmed} — YouTube is challenging the connection, not this track, so "
+        f"every download will fail the same way until the identity behind it "
+        f"changes. Downloads are paused meanwhile. Route them outside the VPN, "
+        f"move gluetun to a different endpoint, or give yt-dlp a signed-in "
+        f"identity: YTDLP_COOKIES_FILE (a Netscape cookies.txt) or "
+        f"YTDLP_PO_TOKEN."
+    )
+
+
 def _note_403() -> None:
     """Count a refusal, and pause the queue once they start arriving in a run."""
-    global _403_streak, _403_until
+    global _403_streak, _hold_until
 
     if config.YTDLP_403_COOLDOWN <= 0 or config.YTDLP_403_STREAK <= 0:
         return
 
-    with _403_lock:
+    with _hold_lock:
         _403_streak += 1
         if _403_streak < config.YTDLP_403_STREAK:
             return
         _403_streak = 0
-        _403_until = time.time() + config.YTDLP_403_COOLDOWN
+        _hold_until = time.time() + config.YTDLP_403_COOLDOWN
 
     log.warning(
         "%d downloads refused in a row — pausing the queue for %d seconds. "
@@ -1373,18 +1505,58 @@ def _note_403() -> None:
     )
 
 
+def _note_bot_check() -> None:
+    """Hold the queue on YouTube's bot challenge. The first one is enough.
+
+    No streak here, unlike the 403 path. A 403 is counted before concluding
+    anything because a single one is usually just a signed URL that went stale,
+    and pausing on it would stall a queue that was about to succeed. A bot
+    check carries no such ambiguity: it is a statement about who is asking, and
+    the second one costs another track to learn what the first already said.
+
+    The hold is extended rather than reset, so a challenge that arrives while
+    the queue is already paused cannot shorten the pause it is confirming.
+    """
+    global _hold_until
+
+    if config.YTDLP_BOT_CHECK_COOLDOWN <= 0:
+        return
+
+    with _hold_lock:
+        was_held = _hold_until > time.time()
+        _hold_until = max(_hold_until, time.time() + config.YTDLP_BOT_CHECK_COOLDOWN)
+
+    # Once per pause, not once per track: the whole point is to stop repeating
+    # this, and a log that repeats it is the same failure in another form.
+    if not was_held:
+        log.warning(
+            "YouTube asked this connection to prove it is not a bot — pausing "
+            "downloads for %d seconds. This is the exit address, not the "
+            "tracks; it will not clear on its own. Route downloads outside the "
+            "VPN, or set YTDLP_COOKIES_FILE or YTDLP_PO_TOKEN.",
+            config.YTDLP_BOT_CHECK_COOLDOWN,
+        )
+
+
 def _note_download_ok() -> None:
-    """A completed download means whatever was refusing us has stopped."""
+    """A completed download means whatever was refusing us has stopped.
+
+    Only the 403 streak, deliberately — a bot-check pause is left to run out.
+    With two workers, the download that finishes here is regularly one that
+    started *before* the challenge arrived, so treating it as evidence the
+    challenge has lifted would end the pause on the strength of something that
+    happened earlier, and spend another track establishing it again.
+    """
     global _403_streak
-    with _403_lock:
+    with _hold_lock:
         _403_streak = 0
 
 
 def _wait_out_cooldown() -> None:
-    """Block until the 403 cooldown has expired. Called between downloads."""
+    """Block until a 403 or bot-check pause has expired. Called between downloads."""
     while True:
-        with _403_lock:
-            remaining = _403_until - time.time()
+        with _hold_lock:
+            remaining = _hold_until - time.time()
         if remaining <= 0:
             return
         # Short sleeps so a container stop is not held up by a long pause.
@@ -1400,6 +1572,10 @@ def _download_first_that_works(
     else — no formats, a bad encode, an unwritable library — will fail exactly
     the same way on the next candidate, so it is raised immediately rather than
     spending three searches to arrive at the same message.
+
+    A bot check belongs firmly in that second group even though it looks like a
+    refusal: it is aimed at the connection, so walking the candidates would
+    just collect the same challenge three times over.
     """
     last: Exception | None = None
 

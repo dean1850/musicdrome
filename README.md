@@ -561,6 +561,74 @@ Either route downloads outside the VPN, or give yt-dlp a signed-in identity:
 export cookies to a Netscape-format file (`YTDLP_COOKIES_FILE`) or supply a PO
 token (`YTDLP_PO_TOKEN`).
 
+### "Sign in to confirm you're not a bot"
+
+The 403's harder cousin, and the usual welcome from a VPN exit that has been
+flagged. It is not a 403 and is not handled like one: a 403 is often a single
+signed URL that went stale, whereas this is YouTube challenging **the
+connection**, so the same track from a different upload, a retry a minute
+later, and the next 30 tracks in the queue all get the identical answer.
+
+Musicdrome therefore **pauses the queue on the first one** rather than counting
+to three:
+
+```
+WARNING app.download: YouTube asked this connection to prove it is not a bot —
+pausing downloads for 1800 seconds. This is the exit address, not the tracks;
+it will not clear on its own.
+```
+
+That pause is the difference between one failed track and a Downloads tab where
+everything is red — which is what happened before this was recognised: 34
+tracks failed in 87 seconds, and `Retry all failed` reproduced it instantly.
+The length is `YTDLP_BOT_CHECK_COOLDOWN` (default 1800, `0` disables the pause).
+
+The pause buys time; it does not fix anything, because nothing about your
+connection changes while it waits. One of these does:
+
+**1. Give yt-dlp a signed-in identity — the reliable fix.** Export cookies for
+`youtube.com` in **Netscape format** (a `cookies.txt` browser extension, not a
+JSON export — yt-dlp reads only the former), mount the file into the container,
+and point `YTDLP_COOKIES_FILE` at the path *inside* it:
+
+```yaml
+volumes:
+  - ./cookies.txt:/config/cookies.txt:ro
+```
+```ini
+YTDLP_COOKIES_FILE=/config/cookies.txt
+```
+
+Export from a **private/incognito window**, and close that window without
+logging out. YouTube rotates the cookie on logout, which invalidates the file
+you just exported — the single most common reason a cookie file works for an
+hour and then stops. Use a throwaway account: these cookies are a live session.
+
+Musicdrome checks the file at boot and says so when it will not be used, since
+a path that was never mounted fails exactly like the problem it was set to fix:
+
+```
+ERROR app.download: youtube cookies will not be used: YTDLP_COOKIES_FILE is
+/config/cookies.txt, which does not exist inside the container — the file has
+to be mounted in, not merely present on the host
+```
+
+**2. Change the exit address.** Often enough the VPN endpoint is the whole
+problem: switch gluetun to a different server or country, and prefer a
+residential-grade endpoint over a datacenter one. If you do not need downloads
+anonymised, `YTDLP_PROXY` can route just yt-dlp somewhere else while the rest of
+the container stays on the VPN.
+
+**3. Supply a PO token** (`YTDLP_PO_TOKEN`), which is what the browser sends to
+prove the same thing. Generating one needs a provider such as
+[bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+running alongside; it is more setup than a cookie file and does not need an
+account.
+
+Cookies and a PO token together are the strongest combination, and neither
+helps if the address is blocked outright — check the boot log's `tls:` line is
+still reporting impersonation before assuming the identity is at fault.
+
 ### "no confident match on YouTube Music or YouTube"
 
 Not a download failure — nothing was downloaded because nothing credible was
@@ -568,6 +636,11 @@ found. Musicdrome refuses to file a track it cannot attribute to the right
 artist, on the grounds that a tribute band in your library is worse than a gap.
 If it happens constantly, the AI is probably recommending obscure or misspelled
 titles; a narrower listening window tends to help.
+
+It no longer hides a blocked search. A YouTube search that comes back with the
+bot check above used to be swallowed and reported as an unmatched track, which
+filed the one failure that has a fix under the one that does not — that error
+now surfaces as itself.
 
 ## When a scan fails
 
