@@ -283,7 +283,7 @@ embedded, and filed as:
 
 ```
 /music/Radiohead/OK Computer/06 - Karma Police.opus
-/music/_playlists/Musicdrome.m3u
+/music/playlist/Musicdrome.m3u
 ```
 
 Set `AUDIO_FORMAT=mp3` and `AUDIO_BITRATE=320` in `.env` for the old behaviour
@@ -314,7 +314,7 @@ something you have to take on trust. Downloads from before this shipped show
 would be indistinguishable from a measurement.
 
 **One playlist, appended to forever.** Every download lands in
-`_playlists/Musicdrome.m3u` with relative paths, so the folder can be moved
+`playlist/Musicdrome.m3u` with relative paths, so the folder can be moved
 without breaking it, and a re-download never doubles an entry. Navidrome, Plex
 and Jellyfin import it as a single playlist that grows — which is the point:
 per-scan playlists produced a wall of `musicdrome-scan-0001`, `-0002`, `-0003`
@@ -323,6 +323,73 @@ first time the new image boots. Rename it with `MUSICDROME_PLAYLIST_NAME`.
 
 Jellyfin, Navidrome, Plex and friends read this layout as-is — point them at the
 same directory.
+
+### Where the playlist goes
+
+`PLAYLIST_FOLDER` decides, and it is the setting most likely to determine
+whether your music server ever imports the thing. With
+`MUSIC_LOCATION=/mnt/lan-mount/media/music`:
+
+| `PLAYLIST_FOLDER` | Playlist written to |
+|---|---|
+| `playlist` *(default)* | `/mnt/lan-mount/media/music/playlist/Musicdrome.m3u` |
+| `media/playlists` | `/mnt/lan-mount/media/music/media/playlists/Musicdrome.m3u` |
+| `.` | `/mnt/lan-mount/media/music/Musicdrome.m3u` |
+| `/srv/playlists` | `/srv/playlists/Musicdrome.m3u` |
+
+`.` is the library root, and it is worth knowing as the fallback that works
+almost everywhere: it matches essentially any server's playlist path, and the
+entries need no `../` at all. Prefer `.` over leaving the value blank — both
+mean the root, but `.` survives every layer of docker's variable substitution
+and an empty value does not always.
+
+**This folder used to be `_playlists`, hardcoded.** If yours is still there, it
+moves on the next restart — and every path inside it is rewritten for the new
+location on the way across. That rewrite is the whole reason this is not a
+`mv`: the paths in an `.m3u` are relative to the folder holding it, so a
+playlist moved without recomputing them points at nothing, and a music server
+imports that as an *empty playlist* rather than reporting it as broken. From
+the outside that is indistinguishable from never having been imported. If both
+folders somehow hold a playlist, they are merged rather than one silently
+winning. Playlists you made yourself are never moved, and the old folder is
+only removed once it is empty.
+
+### Navidrome imports nothing
+
+Check these in order.
+
+**1. `ND_PLAYLISTSPATH` and `PLAYLIST_FOLDER` have to agree.** This is the
+common one. Unset, `ND_PLAYLISTSPATH` means *every* folder is searched — but
+the moment you set it, it means *only* the folders it names. So a playlist
+written perfectly to `playlist/` is simply never looked at if Navidrome was
+told `Playlists`. Either make the two match, or set `PLAYLIST_FOLDER=.` and
+put it at the root.
+
+**2. It is not the folder's name.** Worth ruling out explicitly, because it is
+the first thing everyone suspects. Navidrome's skip list, in
+`scanner/walk_dir_tree.go`, is exactly `$RECYCLE.BIN`, `#snapshot`,
+`@Recycle`, `@Recently-Snapshot`, `.git`, `.streams`, `lost+found`, plus
+anything beginning with a single dot. An underscore is not a dot, so
+`_playlists` was always scanned like any other folder.
+
+**3. The tracks have to resolve into Navidrome's library.** Entries are
+relative to the playlist's own folder, which Navidrome resolves exactly as you
+would expect — but only if it mounts your music at the same place Musicdrome
+does. If Musicdrome sees `/music` and Navidrome sees `/music/library`, the
+`../` climbs out of Navidrome's library and every line resolves to nothing.
+
+**4. Navidrome has to be able to read the file.** Musicdrome runs as root by
+default, so `Musicdrome.m3u` is root-owned. If Navidrome runs as another uid,
+set `PUID`/`PGID` to match it.
+
+**5. Navidrome only imports on a scan.** `AutoImportPlaylists` defaults to
+true, but nothing happens until it next scans. Trigger one from its UI.
+
+Musicdrome names the exact path at boot, so start there:
+
+```
+INFO  app.main: playlist: /music/playlist/Musicdrome.m3u
+```
 
 ## The stats tab
 

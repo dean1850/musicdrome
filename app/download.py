@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import queue
 import re
 import shutil
@@ -918,15 +919,37 @@ def target_path(artist: str, album: str, title: str, track_no: int = 0,
     raise DownloadError(f"too many files named {title_part} in {directory}")
 
 
-def playlist_entry(path: Path) -> str:
+def playlist_entry(path: Path, playlist_dir: Path | None = None) -> str:
     """Where a downloaded file sits, written relative to the playlist.
 
     Relative so the library can be moved, or mounted at a different path in
-    whatever plays it, without every line breaking.
+    whatever plays it, without every line breaking. Navidrome resolves a
+    relative entry against the folder the playlist itself is in, which is what
+    makes this the portable form rather than merely the shorter one.
+
+    Computed from the playlist's actual location rather than assumed. This used
+    to prepend a literal ``".."``, which was right for exactly one layout — the
+    hardcoded ``_playlists`` one level under the library — and silently wrong
+    for every other. At the library root it would climb out of the library
+    altogether; two levels down it would not climb far enough. Both produce a
+    playlist full of paths that resolve to nothing, which a music server
+    imports as an empty playlist rather than reporting as broken.
+
+    Absolute when the file and the playlist do not share the library, because
+    a relative path between two unrelated trees is a long chain of ``..`` that
+    breaks the moment either end moves.
     """
+    playlist_dir = config.PLAYLIST_DIR if playlist_dir is None else playlist_dir
     try:
-        return (Path("..") / path.relative_to(config.PLAYLIST_DIR.parent)).as_posix()
+        path.relative_to(config.MUSIC_DIR)
+        playlist_dir.relative_to(config.MUSIC_DIR)
     except ValueError:
+        return str(path)
+
+    try:
+        return Path(os.path.relpath(path, playlist_dir)).as_posix()
+    except ValueError:
+        # Different drives on Windows: no relative path exists between them.
         return str(path)
 
 
@@ -1001,6 +1024,112 @@ def _parse_playlist(playlist: Path) -> list[tuple[str, str]]:
         entries.append((extinf, stripped))
         extinf = ""
     return entries
+
+
+def rewrite_entry(entry: str, old_dir: Path, new_dir: Path) -> str:
+    """One playlist line, re-expressed for a playlist that has moved.
+
+    The lines in an m3u are relative to the folder holding it, so moving the
+    file without touching them changes what every one of them points at. The
+    old line is resolved against where it used to live, and written out again
+    against where it lives now.
+
+    An absolute line is left exactly as it is — it did not depend on the
+    playlist's location and rewriting it could only make it worse.
+    """
+    if not entry or entry.startswith("#"):
+        return entry
+    if Path(entry).is_absolute() or "://" in entry:
+        return entry
+
+    absolute = Path(os.path.normpath(old_dir / entry))
+    return playlist_entry(absolute, playlist_dir=new_dir)
+
+
+def migrate_playlist_folder() -> int:
+    """Carry the playlist across when PLAYLIST_FOLDER has changed.
+
+    Runs at boot. The old hardcoded ``_playlists`` folder is the only source,
+    and only files this app writes are moved — ``<PLAYLIST_NAME>.m3u`` and the
+    ``musicdrome-scan-NNNN.m3u`` files a much older version left behind. A
+    playlist somebody made by hand and dropped in there is not ours to move.
+
+    Every entry is rewritten for the new depth on the way across, because the
+    paths inside are relative to the playlist's own folder. Moving the file and
+    leaving them alone is the trap this function exists to avoid: the result
+    imports as an empty playlist, which looks exactly like not importing at
+    all.
+
+    Merging rather than overwriting, for the case where both folders hold a
+    playlist — that is two real histories, and picking one to delete is not a
+    decision this should make silently.
+
+    Returns the number of files moved. Zero is the normal answer.
+    """
+    old_dir, new_dir = config.LEGACY_PLAYLIST_DIR, config.PLAYLIST_DIR
+    if old_dir == new_dir or not old_dir.is_dir():
+        return 0
+
+    # Guarded because this runs inside the boot lifespan: an unreadable old
+    # folder is a reason to skip the migration, never a reason for the
+    # container to fail to start.
+    try:
+        ours = sorted(
+            {
+                *old_dir.glob(f"{config.PLAYLIST_NAME}.m3u"),
+                *old_dir.glob("musicdrome-scan-[0-9]*.m3u"),
+            }
+        )
+    except OSError as exc:
+        log.warning("could not read the old playlist folder %s: %s", old_dir, exc)
+        return 0
+    if not ours:
+        return 0
+
+    moved = 0
+    with _playlist_lock:
+        try:
+            new_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("could not create the playlist folder %s: %s", new_dir, exc)
+            return 0
+
+        for source in ours:
+            target = new_dir / source.name
+            try:
+                entries = _parse_playlist(source)
+                seen = playlist_paths(target)
+                new_file = not target.exists()
+                with target.open("a", encoding="utf-8") as handle:
+                    if new_file:
+                        handle.write("#EXTM3U\n")
+                    for extinf, entry in entries:
+                        rewritten = rewrite_entry(entry, old_dir, new_dir)
+                        if rewritten in seen:
+                            continue
+                        seen.add(rewritten)
+                        if extinf:
+                            handle.write(f"{extinf}\n")
+                        handle.write(f"{rewritten}\n")
+                source.unlink()
+                moved += 1
+            except OSError as exc:
+                log.warning("could not move %s to %s: %s", source, target, exc)
+
+    # Only when we emptied it. Somebody else's playlists sitting in there are
+    # reason enough to leave the folder exactly where it is.
+    try:
+        if not any(old_dir.iterdir()):
+            old_dir.rmdir()
+    except OSError as exc:
+        log.debug("left %s in place: %s", old_dir, exc)
+
+    if moved:
+        log.info(
+            "moved %d playlist(s) from %s to %s, rewriting their paths for the new location",
+            moved, old_dir, new_dir,
+        )
+    return moved
 
 
 def consolidate_scan_playlists() -> int:

@@ -39,6 +39,20 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
+def _env_present(*names: str) -> str | None:
+    """The first value that is *set*, even when it is empty, else ``None``.
+
+    Distinct from :func:`_env` because for one setting empty is a real answer
+    rather than an absent one: ``PLAYLIST_FOLDER=`` means the library root, and
+    collapsing that into "unset, use the default" would make the root
+    unreachable.
+    """
+    for name in names:
+        if name in os.environ:
+            return os.environ[name].strip()
+    return None
+
+
 def _int(name: str, default: int) -> int:
     try:
         return int(_env(name, default=str(default)))
@@ -69,7 +83,49 @@ STATIC_DIR = _path("MUSICDROME_STATIC_DIR", default=Path(__file__).resolve().par
 EXCLUDE_MUSIC_DIR = _env("EXCLUDE_MUSIC_DIR")
 
 DB_PATH = DATA_DIR / "musicdrome.db"
-PLAYLIST_DIR = MUSIC_DIR / "_playlists"
+
+# Where the playlist is written, and the setting most likely to decide whether
+# your music server ever imports it.
+#
+# The folder used to be `_playlists`, hardcoded. That is not a name any server
+# refuses — Navidrome's skip list is `$RECYCLE.BIN`, `#snapshot`, `@Recycle`,
+# `@Recently-Snapshot`, `.git`, `.streams`, `lost+found` and anything starting
+# with a single dot, and an underscore is none of those. But a hardcoded folder
+# cannot be pointed at whatever a given server has been told to look in, and
+# Navidrome's `ND_PLAYLISTSPATH` is exactly such a setting: left unset it means
+# every folder, and the moment it is set it means *only* the folders it names.
+#
+# So this is the knob that makes the two agree. Four forms:
+#
+#   playlist            → MUSIC_DIR/playlist    (the default)
+#   media/playlists     → MUSIC_DIR/media/playlists
+#   "" or "."           → MUSIC_DIR itself, the library root — the most
+#                         universally importable spot, since it matches almost
+#                         any PlaylistsPath and needs no "../" in any entry
+#   /srv/playlists      → used exactly as given, outside the library
+#
+# Prefer `.` over an empty value for the root: `docker compose` substitutes its
+# own default for an empty variable when the compose file says `${VAR:-...}`,
+# so an empty one does not always survive the trip.
+PLAYLIST_FOLDER = _env_present("MUSICDROME_PLAYLIST_FOLDER", "PLAYLIST_FOLDER")
+if PLAYLIST_FOLDER is None:
+    PLAYLIST_FOLDER = "playlist"
+
+
+def _playlist_dir(folder: str) -> Path:
+    cleaned = (folder or "").strip().strip('"').strip("'")
+    if not cleaned or cleaned == ".":
+        return MUSIC_DIR
+    path = Path(cleaned).expanduser()
+    return path if path.is_absolute() else MUSIC_DIR / path
+
+
+PLAYLIST_DIR = _playlist_dir(PLAYLIST_FOLDER)
+
+# Where it used to go, so an existing install's playlist can be carried across
+# instead of stranded. See :func:`app.download.migrate_playlist_folder`.
+LEGACY_PLAYLIST_DIR = MUSIC_DIR / "_playlists"
+
 # One playlist, appended to for the life of the install. It used to be one file
 # per scan, which turned a library server's playlist list into a wall of
 # musicdrome-scan-0001, -0002, -0003 that nobody ever opened twice.

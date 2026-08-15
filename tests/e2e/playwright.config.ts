@@ -34,6 +34,9 @@ const serverEnv = {
   NAVIDROME_URL: 'http://navidrome.invalid:4533',
   NAVIDROME_USER: 'e2e',
   NAVIDROME_PASSWORD: 'e2e',
+  // Pinned so a PLAYLIST_FOLDER in the developer's shell cannot move where the
+  // test server writes.
+  PLAYLIST_FOLDER: 'playlist',
   TZ: 'UTC',
 };
 

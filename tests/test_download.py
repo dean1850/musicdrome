@@ -10,12 +10,26 @@ from app.download import Candidate
 
 @pytest.fixture(autouse=True)
 def empty_playlist_dir():
-    """The music directory outlives a test; the playlists must not."""
+    """The music directory outlives a test; the playlists must not.
+
+    Refuses to run when the two are the same directory, which
+    ``PLAYLIST_FOLDER=.`` makes them: clearing the playlist folder would then
+    be clearing the library. conftest pins the value so this cannot happen,
+    and the guard is here because the consequence of being wrong is losing the
+    whole tree rather than one file.
+    """
     import shutil
 
-    shutil.rmtree(config.PLAYLIST_DIR, ignore_errors=True)
+    def clear():
+        if config.PLAYLIST_DIR == config.MUSIC_DIR:
+            for stray in config.PLAYLIST_DIR.glob("*.m3u"):
+                stray.unlink()
+            return
+        shutil.rmtree(config.PLAYLIST_DIR, ignore_errors=True)
+
+    clear()
     yield
-    shutil.rmtree(config.PLAYLIST_DIR, ignore_errors=True)
+    clear()
 
 
 def candidate(**overrides) -> Candidate:
