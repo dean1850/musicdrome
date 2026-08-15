@@ -416,6 +416,96 @@ docker compose exec musicdrome pip install --no-cache-dir --pre --upgrade yt-dlp
 docker compose restart musicdrome
 ```
 
+## Signing downloads in with cookies
+
+Optional, and worth nothing at all until you need it — at which point it is the
+only thing that helps. Downloads are anonymous by default, and YouTube tolerates
+that from a home address. From a VPN or a datacenter exit it eventually stops
+tolerating it and starts answering
+[**"Sign in to confirm you're not a bot"**](#sign-in-to-confirm-youre-not-a-bot)
+instead, which no amount of retrying gets past.
+
+Cookies are the answer that lets you **stay behind gluetun**: they give YouTube
+an account to attach the request to, instead of an anonymous request from an
+address it has decided it does not trust.
+
+### Setting it up
+
+**1. Export the cookies.** In your browser, install a `cookies.txt` extension —
+one that exports **Netscape format**, which is the only format yt-dlp reads. A
+JSON export will not work, and Musicdrome will tell you so at boot rather than
+letting you find out from the download failures.
+
+Do the export like this, because the details are what make it last:
+
+- Use a **throwaway Google account**, not your main one. This file is a live
+  session — anyone who reads it is signed in as that account.
+- Open a **private/incognito window**, sign in, go to `youtube.com`, export.
+- **Close the window without logging out.** Logging out rotates the session
+  server-side and invalidates the file you just exported. This is the single
+  most common reason cookies work for an hour and then stop.
+
+**2. Drop the file in.** Put it in the folder you already mount as `/config` —
+the same one holding `musicdrome.db` — named `cookies.txt`:
+
+```
+<your DATA_LOCATION>/cookies.txt
+```
+
+That is the whole step. No compose edit, no environment variable, no restart:
+`/config` is already mounted, the file is picked up on the next download, and a
+queue paused by a bot check resumes as soon as it lands:
+
+```
+INFO  app.download: new cookies — resuming downloads without waiting out the pause
+```
+
+Keep the export somewhere else if you prefer — mount it wherever and point
+`YTDLP_COOKIES_FILE` at the path *inside* the container. Read-only is fine.
+
+**3. Check the boot log.** Musicdrome says what it found, on its own line:
+
+```
+INFO  app.main: cookies: /config/cookies.txt — 14 youtube.com cookies, working copy in /config
+```
+
+and when the file will not be used, it says why instead of failing quietly:
+
+```
+cookies: not in use — /config/cookies.txt does not exist inside the container — the
+         file has to be mounted in, not merely present on the host
+cookies: not in use — /config/cookies.txt holds no cookies in Netscape format … export
+         it with a cookies.txt extension rather than as JSON
+cookies: not in use — /config/cookies.txt has cookies for example.com but none for
+         youtube.com — export it with youtube.com open and signed in
+cookies: not in use — /config/cookies.txt has 14 youtube.com cookies and every one of
+         them has expired — export a fresh one
+```
+
+### Your export is never modified
+
+Worth knowing, because it is the difference between cookies that keep working
+and cookies that die overnight. yt-dlp does not only *read* the cookie file — it
+**writes it back** when a download finishes, since YouTube rotates the session
+cookie as it is used. Pointed at the file you mounted, that goes wrong in both
+directions: read-only, the save fails; writable, yt-dlp is editing the only copy
+of an export you cannot regenerate without going back to a browser.
+
+So Musicdrome copies your export to a working file (`.cookies-active.txt`, in
+the data directory) and hands yt-dlp *that*. Your file is only ever read, the
+rotation lands somewhere writable, and the session stays alive across downloads.
+
+### When they expire
+
+They will — a few weeks, or sooner if the account signs out anywhere. You will
+see the bot check come back. Export again and drop the new file in on top of the
+old one; the change is noticed on the next download, and any pause ends early.
+Nothing to restart.
+
+Cookies and a PO token together are the strongest combination, and neither helps
+if the address is blocked outright — check the boot log's `tls:` line still
+reports impersonation before assuming the identity is at fault.
+
 ## When downloads fail
 
 Two failures account for almost all of it, and neither says what it means.
@@ -584,50 +674,15 @@ tracks failed in 87 seconds, and `Retry all failed` reproduced it instantly.
 The length is `YTDLP_BOT_CHECK_COOLDOWN` (default 1800, `0` disables the pause).
 
 The pause buys time; it does not fix anything, because nothing about your
-connection changes while it waits. One of these does:
+connection changes while it waits. **[Sign the downloads in with
+cookies](#signing-downloads-in-with-cookies)** and they resume on their own,
+without leaving the VPN — that is the fix.
 
-**1. Give yt-dlp a signed-in identity — the reliable fix.** Export cookies for
-`youtube.com` in **Netscape format** (a `cookies.txt` browser extension, not a
-JSON export — yt-dlp reads only the former), mount the file into the container,
-and point `YTDLP_COOKIES_FILE` at the path *inside* it:
-
-```yaml
-volumes:
-  - ./cookies.txt:/config/cookies.txt:ro
-```
-```ini
-YTDLP_COOKIES_FILE=/config/cookies.txt
-```
-
-Export from a **private/incognito window**, and close that window without
-logging out. YouTube rotates the cookie on logout, which invalidates the file
-you just exported — the single most common reason a cookie file works for an
-hour and then stops. Use a throwaway account: these cookies are a live session.
-
-Musicdrome checks the file at boot and says so when it will not be used, since
-a path that was never mounted fails exactly like the problem it was set to fix:
-
-```
-ERROR app.download: youtube cookies will not be used: YTDLP_COOKIES_FILE is
-/config/cookies.txt, which does not exist inside the container — the file has
-to be mounted in, not merely present on the host
-```
-
-**2. Change the exit address.** Often enough the VPN endpoint is the whole
-problem: switch gluetun to a different server or country, and prefer a
-residential-grade endpoint over a datacenter one. If you do not need downloads
-anonymised, `YTDLP_PROXY` can route just yt-dlp somewhere else while the rest of
-the container stays on the VPN.
-
-**3. Supply a PO token** (`YTDLP_PO_TOKEN`), which is what the browser sends to
-prove the same thing. Generating one needs a provider such as
-[bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
-running alongside; it is more setup than a cookie file and does not need an
-account.
-
-Cookies and a PO token together are the strongest combination, and neither
-helps if the address is blocked outright — check the boot log's `tls:` line is
-still reporting impersonation before assuming the identity is at fault.
+The alternatives, if you would rather not: a different exit address (another
+gluetun endpoint or country, or `YTDLP_PROXY` to route only yt-dlp off the VPN),
+or a PO token via
+[bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider),
+which proves the same thing without an account but is more to set up.
 
 ### "no confident match on YouTube Music or YouTube"
 

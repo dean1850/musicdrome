@@ -896,9 +896,22 @@ def test_the_bot_check_message_replaces_yt_dlps_boilerplate():
     assert "2ahIw-OkjQ8" in message, "the video it happened on is worth keeping"
     assert "--cookies-from-browser" not in message
     assert "wiki" not in message
-    assert "YTDLP_COOKIES_FILE" in message
-    assert "VPN" in message
     assert len(message) <= 500, "longer than this is truncated into the database"
+
+
+def test_the_bot_check_message_names_the_file_to_create():
+    """"Give yt-dlp an identity" is advice; a path is an instruction."""
+    message = download.explain_bot_check(BOT_CHECK)
+
+    assert str(config.DATA_DIR / "cookies.txt") in message
+    assert "cookies.txt" in message
+
+
+def test_the_advice_points_at_the_path_that_is_actually_configured(tmp_path, monkeypatch):
+    """Sending somebody who set the path to a different directory is worse than useless."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(tmp_path / "mine.txt"))
+
+    assert str(tmp_path / "mine.txt") in download.explain_bot_check(BOT_CHECK)
 
 
 def test_a_bot_check_is_not_retried(tmp_path, monkeypatch):
@@ -973,16 +986,37 @@ def test_a_bot_checked_download_is_explained_and_holds_the_queue(suggestion, mon
         ).fetchone()
 
     assert row["status"] == "failed"
-    assert "YTDLP_COOKIES_FILE" in row["error"]
+    assert "cookies.txt" in row["error"], "the row has to say what to do about it"
     assert "wiki" not in row["error"]
     assert download._hold_until > time.time(), "the queue must stop, not drain"
 
 
 # ─── Cookie files ──────────────────────────────────────────────────────────
 #
-# Checked at boot because of when people set this: downloads already failing,
-# one variable changed, restart, and no way to tell whether it took — a cookie
-# file yt-dlp cannot open fails exactly like the problem it was set to fix.
+# Signing downloads in is the answer to the bot check for anyone who intends to
+# keep using a VPN. Every check below is a mistake that is otherwise invisible:
+# from the outside, a cookie file that never mounted, was exported as JSON, or
+# expired last week all look identical to having set nothing at all.
+
+FRESH = time.time() + 86_400
+
+
+def cookie_file(path, *, domain=".youtube.com", expiry=None, name="SID"):
+    """Write a Netscape cookie file and return it."""
+    expiry = FRESH if expiry is None else expiry
+    path.write_text(
+        "# Netscape HTTP Cookie File\n"
+        f"{domain}\tTRUE\t/\tTRUE\t{int(expiry)}\t{name}\tvalue\n"
+    )
+    return path
+
+
+@pytest.fixture(autouse=True)
+def no_cookie_state():
+    """The working copy is cached across calls; tests must not inherit one."""
+    yield
+    download._cookie_jar = None
+    download._cookie_stamp = None
 
 
 def test_no_cookie_file_is_not_a_problem(monkeypatch):
@@ -991,17 +1025,23 @@ def test_no_cookie_file_is_not_a_problem(monkeypatch):
 
 
 def test_a_netscape_cookie_file_is_accepted(tmp_path, monkeypatch):
-    path = tmp_path / "cookies.txt"
-    path.write_text("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tid\tv\n")
-    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
-
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt")))
     assert download.cookies_problem() == ""
 
 
 def test_a_headerless_cookie_file_is_accepted(tmp_path, monkeypatch):
     """Plenty of exporters skip the comment and start straight into fields."""
-    path = tmp_path / "cookies.txt"
-    path.write_text(".youtube.com\tTRUE\t/\tTRUE\t0\tid\tv\n")
+    path = tmp_path / "c.txt"
+    path.write_text(f".youtube.com\tTRUE\t/\tTRUE\t{int(FRESH)}\tSID\tv\n")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert download.cookies_problem() == ""
+
+
+def test_httponly_cookies_are_not_mistaken_for_comments(tmp_path, monkeypatch):
+    """The prefix is part of the format, and it is on half of YouTube's."""
+    path = tmp_path / "c.txt"
+    path.write_text(f"#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t{int(FRESH)}\tSID\tv\n")
     monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
 
     assert download.cookies_problem() == ""
@@ -1030,6 +1070,169 @@ def test_an_empty_cookie_file_says_it_is_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
 
     assert "empty" in download.cookies_problem()
+
+
+def test_an_expired_export_is_named_as_expired(tmp_path, monkeypatch):
+    """"It worked yesterday" looks exactly like no cookies from the outside."""
+    path = cookie_file(tmp_path / "c.txt", expiry=time.time() - 3600)
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert "expired" in download.cookies_problem()
+
+
+def test_a_session_cookie_does_not_count_as_expired(tmp_path, monkeypatch):
+    """Expiry 0 means a session cookie, not one that lapsed in 1970."""
+    monkeypatch.setattr(
+        config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt", expiry=0))
+    )
+    assert download.cookies_problem() == ""
+
+
+def test_an_export_from_the_wrong_site_says_which_site(tmp_path, monkeypatch):
+    path = cookie_file(tmp_path / "c.txt", domain=".example.com")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    problem = download.cookies_problem()
+    assert "none for youtube.com" in problem
+    assert "example.com" in problem
+
+
+# ─── The working copy ──────────────────────────────────────────────────────
+#
+# yt-dlp writes the cookie file back when a download finishes, because YouTube
+# rotates the session cookie as it is used. Handing it the mounted export fails
+# read-only and rewrites the original when writable — both of which present as
+# "the cookies worked for an hour and then stopped".
+
+
+def test_yt_dlp_is_given_a_copy_and_never_the_original(tmp_path, monkeypatch):
+    source = cookie_file(tmp_path / "cookies.txt")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(source))
+
+    jar = download.cookie_jar()
+
+    assert jar != source, "yt-dlp rewrites this file; the export is not its to edit"
+    assert jar.read_text() == source.read_text()
+    assert str(jar) == download._ydl_options()["cookiefile"]
+
+
+def test_a_re_export_is_picked_up_without_a_restart(tmp_path, monkeypatch):
+    """The whole recovery path: drop a fresh file in, downloads work again."""
+    source = cookie_file(tmp_path / "cookies.txt", name="OLD")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(source))
+    download.cookie_jar()
+
+    cookie_file(source, name="NEW")
+    jar = download.cookie_jar()
+
+    assert "NEW" in jar.read_text()
+
+
+def test_an_unchanged_export_is_not_copied_again(tmp_path, monkeypatch):
+    """Once per download, not a file copy per candidate."""
+    source = cookie_file(tmp_path / "cookies.txt")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(source))
+
+    copies = []
+    monkeypatch.setattr(download.shutil, "copyfile", lambda *a: copies.append(a))
+    download.cookie_jar()
+    download.cookie_jar()
+    download.cookie_jar()
+
+    assert len(copies) == 1
+
+
+def test_no_cookie_file_means_no_cookiefile_option(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", "")
+    monkeypatch.setattr(config, "cookies_file", lambda: None)
+
+    assert download.cookie_jar() is None
+    assert "cookiefile" not in download._ydl_options()
+
+
+def test_a_cookies_txt_in_the_data_directory_is_found_without_configuring_it(
+    tmp_path, monkeypatch
+):
+    """Drop it next to the database and it works — one step, not three."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", "")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    cookie_file(tmp_path / "cookies.txt")
+
+    assert config.cookies_file() == tmp_path / "cookies.txt"
+    assert download.cookies_problem() == ""
+
+
+def test_new_cookies_end_the_bot_check_pause_early(tmp_path, monkeypatch):
+    """Having done the thing the error asked for, nobody should still wait."""
+    source = cookie_file(tmp_path / "cookies.txt", name="OLD")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(source))
+    monkeypatch.setattr(download.time, "sleep", lambda seconds: None)
+
+    download._note_bot_check()
+    assert download._hold_until > time.time()
+
+    cookie_file(source, name="NEW")
+    download._wait_out_cooldown()
+
+    assert download._hold_until == 0.0
+
+
+def test_the_pause_still_holds_when_the_cookies_have_not_changed(tmp_path, monkeypatch):
+    """The same cookies that were just refused are not a reason to resume."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt")))
+    monkeypatch.setattr(config, "YTDLP_BOT_CHECK_COOLDOWN", 12)
+
+    download.cookie_jar()   # as every download attempt does, before it fails
+    download._note_bot_check()
+
+    slept = []
+    # One pass of the loop, then the hold is lifted by hand so the test ends
+    # rather than sitting out the pause it is asserting the existence of.
+    monkeypatch.setattr(
+        download.time, "sleep",
+        lambda seconds: (slept.append(seconds), setattr(download, "_hold_until", 0.0)),
+    )
+    download._wait_out_cooldown()
+
+    assert slept, "it must wait rather than treat unchanged cookies as new"
+
+
+def test_cookies_that_arrive_where_there_were_none_end_the_pause(tmp_path, monkeypatch):
+    """The commonest version: no cookies at all, then the error tells you to."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", "")
+    monkeypatch.setattr(download.time, "sleep", lambda seconds: None)
+
+    download._note_bot_check()
+    assert download._hold_until > time.time()
+
+    cookie_file(tmp_path / "cookies.txt")   # what the error message asked for
+    download._wait_out_cooldown()
+
+    assert download._hold_until == 0.0
+
+
+def test_the_boot_line_says_where_the_cookies_came_from(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt")))
+
+    status = download.cookies_status()
+    assert "1 youtube.com cookies" in status
+    assert str(tmp_path / "c.txt") in status
+
+
+def test_the_boot_line_says_what_to_do_when_there_are_none(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", "")
+    monkeypatch.setattr(config, "cookies_file", lambda: None)
+
+    status = download.cookies_status()
+    assert "none" in status
+    assert "YTDLP_COOKIES_FILE" in status
+
+
+def test_the_boot_line_leads_with_the_problem_when_there_is_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(tmp_path / "missing.txt"))
+
+    assert "not in use" in download.cookies_status()
 
 
 # ─── Browser impersonation ─────────────────────────────────────────────────

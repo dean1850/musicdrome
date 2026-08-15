@@ -15,10 +15,12 @@
 #    * A VPN exit address is a common cause of "HTTP Error 403" and of "Sign in
 #      to confirm you're not a bot" on downloads. Musicdrome impersonates a
 #      browser TLS fingerprint, retries, and pauses the queue rather than
-#      draining it into failures (see the notes in .env.example) — but neither
-#      makes a flagged exit address acceptable to YouTube. If downloads still
-#      fail, mount a cookies.txt and set YTDLP_COOKIES_FILE, or change the
-#      gluetun endpoint.
+#      draining it into failures (see the notes in .env.example) — but none of
+#      that makes a flagged exit address acceptable to YouTube. The fix that
+#      keeps downloads on the VPN is a cookie file: export cookies.txt in
+#      Netscape format and drop it into your DATA_LOCATION folder, beside the
+#      database. It is mounted as /config below, so there is nothing to add
+#      here and nothing to restart.
 #
 #  Not using gluetun? Delete `network_mode` and `networks`, then add:
 #
@@ -57,7 +59,10 @@ services:
       # so it has to be writable — a read-only mount fails every download at
       # the last step, after the audio has been fetched and encoded.
       - ${MUSIC_LOCATION:-./data/music}:/music
-      # The SQLite database, and nothing else.
+      # The SQLite database — and, if YouTube starts asking this address to
+      # prove it is not a bot, a cookies.txt you drop in beside it. Both are
+      # picked up from here, so signing downloads in needs no change to this
+      # file.
       - ${DATA_LOCATION:-./data/config}:/config
 
 networks: {}
