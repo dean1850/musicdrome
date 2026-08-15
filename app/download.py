@@ -1070,12 +1070,19 @@ def migrate_playlist_folder() -> int:
     if old_dir == new_dir or not old_dir.is_dir():
         return 0
 
-    ours = sorted(
-        {
-            *old_dir.glob(f"{config.PLAYLIST_NAME}.m3u"),
-            *old_dir.glob("musicdrome-scan-[0-9]*.m3u"),
-        }
-    )
+    # Guarded because this runs inside the boot lifespan: an unreadable old
+    # folder is a reason to skip the migration, never a reason for the
+    # container to fail to start.
+    try:
+        ours = sorted(
+            {
+                *old_dir.glob(f"{config.PLAYLIST_NAME}.m3u"),
+                *old_dir.glob("musicdrome-scan-[0-9]*.m3u"),
+            }
+        )
+    except OSError as exc:
+        log.warning("could not read the old playlist folder %s: %s", old_dir, exc)
+        return 0
     if not ours:
         return 0
 

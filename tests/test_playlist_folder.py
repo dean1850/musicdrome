@@ -261,6 +261,31 @@ def test_nothing_happens_when_there_is_no_old_folder(playlists_at):
     assert download.migrate_playlist_folder() == 0
 
 
+def test_an_unreadable_old_folder_does_not_stop_the_boot(playlists_at):
+    """This runs inside the boot lifespan; raising here means the app never starts.
+
+    The refusal is injected rather than produced with ``chmod``, because the
+    container these tests usually run in is root and root reads a 000 directory
+    quite happily — the test would then pass by never reaching the code it is
+    aimed at.
+    """
+    seed_legacy("../A/B/x.opus")
+    playlists_at("playlist")
+
+    def refuse(self, pattern):
+        raise PermissionError(13, "Permission denied")
+
+    original = Path.glob
+    Path.glob = refuse
+    try:
+        assert download.migrate_playlist_folder() == 0
+    finally:
+        Path.glob = original
+
+    # And the playlist is still where it was, not half-moved.
+    assert (config.LEGACY_PLAYLIST_DIR / f"{config.PLAYLIST_NAME}.m3u").is_file()
+
+
 def test_migrating_twice_is_harmless(playlists_at):
     seed_legacy("../A/B/x.opus")
     new_dir = playlists_at("playlist")
