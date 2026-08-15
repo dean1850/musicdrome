@@ -73,6 +73,9 @@ async def lifespan(app: FastAPI):
     log.info("Musicdrome %s starting", __version__)
     log.info("music:   %s", config.MUSIC_DIR)
     log.info("data:    %s", config.DATA_DIR)
+    # Named at boot because "my music server does not see the playlist" is
+    # answered first by knowing where the playlist actually is.
+    log.info("playlist: %s", config.PLAYLIST_PATH)
     log.info("history: %s", ", ".join(config.history_sources()) or "none configured")
 
     # Before db.init(), because db.init() is what fails if this is wrong, and
@@ -103,6 +106,11 @@ async def lifespan(app: FastAPI):
     # media fetch at all from a VPN or a datacenter address.
     log.info("tls:     %s", download.impersonation_status())
     log.info("audio:   %s", download.audio_status())
+
+    # Before the consolidation below, not after: a playlist still sitting in the
+    # old `_playlists` folder has to arrive in the current one before anything
+    # goes looking there for files to merge.
+    download.migrate_playlist_folder()
 
     # One playlist, not one per scan. Installs that predate that have their old
     # per-scan files folded into it here, once.

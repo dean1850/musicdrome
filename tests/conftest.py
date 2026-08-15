@@ -25,6 +25,12 @@ os.environ.update(
     NAVIDROME_URL="",
     NAVIDROME_USER="",
     NAVIDROME_PASSWORD="",
+    # Pinned rather than left to the default, so a PLAYLIST_FOLDER exported in
+    # the shell cannot change where the tests write. It matters more than it
+    # looks: a value of "." puts the playlist directory *at* the music
+    # directory, and the fixtures that clear it between tests would then be
+    # clearing the whole library.
+    PLAYLIST_FOLDER="playlist",
     AI_PROVIDER="ollama",
     TZ="UTC",
 )
