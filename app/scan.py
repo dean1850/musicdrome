@@ -19,9 +19,9 @@ import re
 import threading
 from typing import Any
 
-from . import ai, db, exclude, history
+from . import affinity, ai, db, exclude, history
 from .norm import artist_key, track_key
-from .sources import lastfm, musicbrainz
+from .sources import lastfm, musicbrainz, navidrome
 
 log = logging.getLogger(__name__)
 
@@ -33,9 +33,21 @@ _state: dict[str, Any] = {
 
 SYSTEM_PROMPT = """You are a music recommender for one listener's personal collection.
 
-You are given that listener's recent scrobbles: their most-played artists, their
-most-played tracks, and the artists they discovered most recently. Recommend
-individual studio tracks they do not yet have but would plausibly love.
+You are given two different kinds of evidence about that listener, and they are
+not worth the same.
+
+PLAYS are what they listened to: most-played artists, most-played tracks, and
+the artists they discovered most recently. This is a large, noisy signal. A high
+play count can mean a record they love or an album that was on in the background
+for a fortnight, and nothing in the data distinguishes the two.
+
+HEARTS are what they went back and starred in their own music library. There are
+far fewer of these and every one of them is deliberate — nobody stars a track by
+accident, or because it was next in the queue. Treat a hearted artist or genre
+as a much stronger statement of taste than any play count, and weight it
+accordingly when you choose what to recommend and how confident you are.
+
+Recommend individual studio tracks they do not yet have but would plausibly love.
 
 Rules:
 - Recommend real, released, individually downloadable studio recordings. Never
@@ -49,9 +61,14 @@ Rules:
 - At most two tracks by any one artist.
 - "match" is your confidence, 0-100, that this specific listener will like this
   specific track. Use the whole range honestly — a speculative pick belongs in
-  the 50s, and 90+ should mean you would be surprised if they disliked it.
+  the 50s, and 90+ should mean you would be surprised if they disliked it. Let
+  the hearts move this number, not just the choice of track: something in the
+  same territory as what they heart deserves more confidence than the same
+  track would earn from the play counts alone.
 - "reason" is one short sentence in second person, naming what in their history
-  led you here. "seed" is the single artist from their history it came from.
+  led you here. Say so when it was something they hearted, rather than
+  something they merely played. "seed" is the single artist from their history
+  it came from.
 """
 
 # Enforced, not merely described. Ollama compiles this into a grammar, so
@@ -92,8 +109,22 @@ def state() -> dict[str, Any]:
     return dict(_state)
 
 
+# How much of the hearted set the prompt carries. Hearts are scarce enough that
+# most libraries fit under this several times over; a listener who has starred
+# two thousand tracks gets the most recent slice, which is the part that says
+# where their taste is now.
+LOVED_TRACKS_IN_PROMPT = 60
+LOVED_ARTISTS_IN_PROMPT = 25
+
+
 def build_prompt(profile: dict[str, Any], excluded_titles: list[str], batch_size: int) -> str:
     """The user turn: the listener's profile plus what not to suggest.
+
+    The hearted sections come *before* the play counts, and are labelled as the
+    stronger evidence in both places. Position is not a decoration here: a model
+    reading a long prompt weights the top of it more heavily, and the whole
+    point of the Navidrome data is that fifty deliberate hearts say more than
+    fifty thousand plays.
 
     The exclusion list is truncated because a library of 20,000 tracks does not
     fit in a prompt and would drown the profile if it did. The full set is still
@@ -102,13 +133,47 @@ def build_prompt(profile: dict[str, Any], excluded_titles: list[str], batch_size
     lines = [
         f"Listening window: the last {profile['days']} days "
         f"({profile['plays']} plays across {profile['artists']} artists).",
-        "",
-        "MOST PLAYED ARTISTS:",
     ]
+
+    loved_tracks = profile.get("loved_tracks") or []
+    loved_artists = profile.get("loved_artists") or []
+    loved_genres = profile.get("loved_genres") or []
+    library_top = profile.get("library_top_tracks") or []
+
+    if loved_artists:
+        lines += ["", "── HEARTS (deliberate, and the strongest signal here) ──"]
+        lines += ["", "ARTISTS THEY HAVE HEARTED MOST:"]
+        lines += [
+            f"  {a['artist']} ({a['hearts']} hearted)"
+            for a in loved_artists[:LOVED_ARTISTS_IN_PROMPT]
+        ]
+
+    if loved_tracks:
+        lines += ["", "TRACKS THEY HEARTED (most recently hearted first):"]
+        lines += [
+            f"  {t['artist']} — {t['title']}" for t in loved_tracks[:LOVED_TRACKS_IN_PROMPT]
+        ]
+
+    if loved_genres:
+        lines += ["", "GENRES THEY HEART:"]
+        lines += [f"  {g['genre']} ({g['hearts']})" for g in loved_genres[:12]]
+
+    if loved_artists or loved_tracks:
+        lines += ["", "── PLAYS (larger, noisier) ──"]
+
+    lines += ["", "MOST PLAYED ARTISTS:"]
     lines += [f"  {a['artist']} ({a['plays']})" for a in profile["top_artists"][:30]] or ["  (none)"]
 
     lines += ["", "MOST PLAYED TRACKS:"]
     lines += [f"  {t['artist']} — {t['title']} ({t['plays']})" for t in profile["top_tracks"][:30]] or ["  (none)"]
+
+    if library_top:
+        lines += [
+            "",
+            "MOST PLAYED FROM THEIR OWN LIBRARY (all time, counted by their music "
+            "server rather than scrobbled):",
+        ]
+        lines += [f"  {t['artist']} — {t['title']} ({t['play_count']})" for t in library_top[:20]]
 
     if profile["recent_discoveries"]:
         lines += ["", "RECENTLY DISCOVERED ARTISTS (newest first):"]
@@ -229,6 +294,10 @@ def run(trigger: str = "manual") -> dict[str, Any]:
 
         _state["step"] = "reading scrobbles"
         history.sync()
+
+        if navidrome.configured():
+            _state["step"] = "reading your Navidrome hearts"
+            history.sync_navidrome()
 
         _state["step"] = "indexing your library"
         exclude.scan_library()
@@ -407,10 +476,20 @@ def _match_percent(value: Any) -> int:
 
 
 def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int:
-    """Enrich and insert, skipping anything excluded before or after enrichment."""
+    """Enrich and insert, skipping anything excluded before or after enrichment.
+
+    The hearts are applied here rather than earlier because the boost is scored
+    against the *enriched* artist and genre tags. The model's spelling of an
+    artist is whatever it remembered; MusicBrainz's is the one that will match
+    what Navidrome has on disk, and matching those two strings is the entire
+    mechanism.
+    """
     kept = 0
     seen: set[str] = set()
     per_artist: dict[str, int] = {}
+    # Read once. A scan scores forty of these against tables nothing else is
+    # writing to while it runs.
+    hearts = affinity.load()
 
     for index, item in enumerate(items):
         _state["done"] = index
@@ -436,25 +515,37 @@ def _store(scan_id: int, items: list[dict[str, Any]], excluded: set[str]) -> int
         seen.update({key, canonical})
         per_artist[akey] = per_artist.get(akey, 0) + 1
 
-        match = _match_percent(item.get("match"))
+        seed = str(item.get("seed", ""))[:120]
+        scored = affinity.apply(
+            _match_percent(item.get("match")),
+            enriched["artist"],
+            seed=seed,
+            tags=enriched["tags"],
+            picture=hearts,
+        )
 
         with db.connect() as conn:
             conn.execute(
                 "INSERT INTO suggestions (scan_id, track_key, artist, title, album, year, "
-                "track_no, match, reason, seed, tags, cover_url, duration, recording_mbid, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "track_no, match, match_base, affinity, affinity_reason, reason, seed, tags, "
+                "cover_url, duration, recording_mbid, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 # A re-suggested track refreshes the card it already has rather
                 # than making a second one, and only while it is still 'new' —
                 # so something you hid can never come back.
                 "ON CONFLICT (track_key) DO UPDATE SET "
                 "  scan_id = excluded.scan_id, match = excluded.match, "
+                "  match_base = excluded.match_base, affinity = excluded.affinity, "
+                "  affinity_reason = excluded.affinity_reason, "
                 "  reason = excluded.reason, seed = excluded.seed, "
                 "  created_at = excluded.created_at "
                 "WHERE suggestions.status = 'new'",
                 (
                     scan_id, canonical, enriched["artist"], enriched["title"],
-                    enriched["album"], enriched["year"], enriched["track_no"], match,
-                    str(item.get("reason", ""))[:400], str(item.get("seed", ""))[:120],
+                    enriched["album"], enriched["year"], enriched["track_no"],
+                    scored["match"], scored["match_base"], scored["affinity"],
+                    scored["affinity_reason"],
+                    str(item.get("reason", ""))[:400], seed,
                     ",".join(enriched["tags"]), enriched["cover_url"],
                     enriched["duration"], enriched["recording_mbid"], db.now(),
                 ),

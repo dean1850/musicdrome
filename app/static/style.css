@@ -317,6 +317,18 @@ input[type="checkbox"] { accent-color: var(--accent); width: 17px; height: 17px;
 .match.tier-low  { color: var(--warn); }
 .match.tier-weak { color: var(--faint); }
 
+/* A match the Navidrome hearts lifted. The heart keeps the tier colour of the
+   number it belongs to rather than introducing a fifth one — it is saying
+   "part of this came from your hearts", not "this is a different kind of
+   score". Hover for the breakdown. */
+.match.is-hearted { cursor: help; }
+.match.is-hearted i {
+  font-style: normal;
+  margin-left: 0.28rem;
+  font-size: 0.72em;
+  opacity: 0.85;
+}
+
 .badge {
   position: absolute;
   top: 0.55rem;

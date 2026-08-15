@@ -420,3 +420,50 @@ def test_an_original_database_is_not_backed_up(original_database):
     """Nothing destructive runs, so there is nothing to insure against."""
     db.init()
     assert not config.DB_PATH.with_suffix(".db.pre-single-user").exists()
+
+
+# ─── Navidrome hearts ──────────────────────────────────────────────────────
+
+
+def test_an_older_database_gains_the_navidrome_table(original_database):
+    db.init()
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO navidrome_tracks (id, artist, title, artist_key, track_key, synced_at) "
+            "VALUES ('s1', 'Aphex Twin', 'Xtal', 'aphex twin', 'k', 1700)"
+        )
+        row = conn.execute("SELECT starred, play_count FROM navidrome_tracks").fetchone()
+
+    assert (row["starred"], row["play_count"]) == (0, 0)
+
+
+def test_an_older_database_gains_the_match_breakdown(original_database):
+    db.init()
+
+    with db.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(suggestions)")}
+    assert {"match_base", "affinity", "affinity_reason"} <= columns
+
+
+def test_cards_scored_before_the_breakdown_keep_their_number_as_the_base(original_database):
+    """They were scored by the model alone, so their base score is their score."""
+    db.init()
+
+    with db.connect() as conn:
+        row = conn.execute("SELECT match, match_base, affinity FROM suggestions").fetchone()
+
+    assert row["match"] == 88 and row["match_base"] == 88 and row["affinity"] == 0
+
+
+def test_the_backfill_does_not_rerun_on_a_later_boot(original_database):
+    """A blanket backfill would overwrite the real base of a genuinely boosted card."""
+    db.init()
+    with db.connect() as conn:
+        conn.execute("UPDATE suggestions SET match = 82, match_base = 70, affinity = 12")
+
+    db.init()
+
+    with db.connect() as conn:
+        row = conn.execute("SELECT match_base, affinity FROM suggestions").fetchone()
+    assert row["match_base"] == 70 and row["affinity"] == 12

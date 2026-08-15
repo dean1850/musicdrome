@@ -174,12 +174,22 @@ function cardHtml(card) {
 
   const downloadable = !['downloaded', 'queued', 'downloading'].includes(card.status);
 
+  // A match the Navidrome hearts moved says so, and says by how much. The
+  // number on its own would be indistinguishable from one the model produced
+  // unaided, which would make the second signal impossible to check.
+  const boosted = Number(card.affinity) > 0;
+  const matchTitle = boosted
+    ? `${card.match_base}% from the model, +${card.affinity} from what you heart`
+      + (card.affinity_reason ? ` — ${card.affinity_reason}` : '')
+    : `${card.match}% match`;
+
   return `
     <article class="card" id="card-${card.id}">
       <div class="cover">
         ${cover}
         ${badge}
-        <span class="match ${tier(card.match)}">${card.match}%</span>
+        <span class="match ${tier(card.match)}${boosted ? ' is-hearted' : ''}"
+              title="${escapeHtml(matchTitle)}">${card.match}%${boosted ? '<i>♥</i>' : ''}</span>
       </div>
       <div class="card-body">
         <div class="card-title">${escapeHtml(card.title)}</div>
@@ -395,6 +405,22 @@ function renderConnections(status) {
     if (source.error) return [label, source.error, 'err'];
     return [label, `synced ${ago(source.synced_at)}`, 'ok'];
   });
+
+  const navidrome = status.history.navidrome || {};
+  if (!navidrome.configured) {
+    rows.push(['Navidrome', 'not configured', 'off']);
+  } else if (navidrome.error) {
+    rows.push(['Navidrome', navidrome.error, 'err']);
+  } else if (!navidrome.synced_at) {
+    rows.push(['Navidrome', 'configured — syncs on the next scan', 'ok']);
+  } else {
+    rows.push([
+      'Navidrome',
+      `${navidrome.hearts.toLocaleString()} hearted of `
+        + `${navidrome.tracks.toLocaleString()}, synced ${ago(navidrome.synced_at)}`,
+      'ok',
+    ]);
+  }
 
   rows.push(
     ['AI backend', `${status.ai.provider} · ${status.ai.model}`, status.ai.available ? 'ok' : 'err'],

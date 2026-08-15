@@ -89,6 +89,44 @@ LISTENBRAINZ_USER = _env("LISTENBRAINZ_USER")
 LISTENBRAINZ_TOKEN = _env("LISTENBRAINZ_TOKEN")
 LISTENBRAINZ_API_URL = _env("LISTENBRAINZ_API_URL", default="https://api.listenbrainz.org")
 
+# ─── Navidrome ─────────────────────────────────────────────────────────────
+#
+# The second signal. Scrobbles say what you played; Navidrome's ``starred`` flag
+# says what you went back and *hearted*, which is a different and much scarcer
+# statement — a track you loved on purpose rather than one that came up on
+# shuffle. Its play counts are the other half: plays that happened while nothing
+# was scrobbling still land there.
+#
+# **There is no such thing as a Navidrome API key.** Its Subsonic API accepts a
+# username with either a password or an MD5 token, and nothing else; the native
+# REST API takes a JWT its own documentation calls unstable and asks you not to
+# use. So this is a username and a password, and Musicdrome never sends the
+# password itself — see :func:`app.sources.navidrome.auth_params`, which hashes
+# it against a fresh random salt on every single request.
+#
+# The account only ever needs to read. Navidrome has no per-scope tokens, so the
+# credential is as privileged as the account behind it: make a second, ordinary
+# (non-admin) Navidrome user for this if that matters to you. Musicdrome calls
+# three endpoints — ping, getStarred2 and search3 — and none of them writes.
+NAVIDROME_URL = _env("NAVIDROME_URL").rstrip("/")
+NAVIDROME_USER = _env("NAVIDROME_USER")
+NAVIDROME_PASSWORD = _env("NAVIDROME_PASSWORD")
+
+# Hearts come back in one request. Play counts do not: Subsonic has no "list
+# every song I have played" call, so they are read by walking the library with
+# search3, which is the one expensive thing here — a 20,000-track library is
+# forty requests at the page size below.
+#
+# That walk is therefore cached rather than repeated. Hearts refresh on every
+# scan because they cost a single call and are the signal that actually moves;
+# the walk only re-runs once its results are older than this. Set it to 0 to
+# walk on every scan, or leave the URL set and NAVIDROME_LIBRARY_PAGE at 0 to
+# skip the walk entirely and use hearts alone.
+NAVIDROME_LIBRARY_MAX_AGE = _int("NAVIDROME_LIBRARY_MAX_AGE", 21600)  # 6 hours
+NAVIDROME_LIBRARY_PAGE = _int("NAVIDROME_LIBRARY_PAGE", 500)
+# A stop so a misconfigured or enormous library cannot walk forever.
+NAVIDROME_MAX_TRACKS = _int("NAVIDROME_MAX_TRACKS", 100000)
+
 MUSICBRAINZ_API_URL = _env("MUSICBRAINZ_API_URL", default="https://musicbrainz.org/ws/2")
 MUSICBRAINZ_USER_AGENT = _env(
     "MUSICBRAINZ_USER_AGENT",
@@ -360,3 +398,13 @@ def history_sources() -> list[str]:
     if LISTENBRAINZ_USER:
         sources.append("listenbrainz")
     return sources
+
+
+def navidrome_configured() -> bool:
+    """Whether Navidrome has all three of the things it needs.
+
+    All three, because two of them is not a degraded configuration — it is a
+    typo. A URL with no password fails every request with "wrong username or
+    password", which reads like a rejected credential rather than a missing one.
+    """
+    return bool(NAVIDROME_URL and NAVIDROME_USER and NAVIDROME_PASSWORD)

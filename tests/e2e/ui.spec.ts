@@ -35,7 +35,9 @@ test('the discover grid renders seeded cards, best match first', async ({ page }
 
   await expect(cards.first()).toContainText('Roygbiv');
   await expect(cards.first()).toContainText('Boards of Canada');
-  await expect(cards.first().locator('.match')).toHaveText('94%');
+  // toContainText, not toHaveText: a card the Navidrome hearts lifted carries a
+  // heart glyph in the same pill. The assertion here is about the number.
+  await expect(cards.first().locator('.match')).toContainText('94%');
 
   // The reason line is what makes a recommendation legible.
   await expect(cards.first()).toContainText('Massive Attack');
@@ -134,6 +136,32 @@ test('the scan progress bar appears only while a scan runs', async ({ page }) =>
   // prove the bar is driven by scan state rather than always painted.
   await page.locator('#scan-now').click();
   await expect(page.locator('#scan-progress')).toBeVisible({ timeout: 5000 });
+});
+
+test('a match the Navidrome hearts lifted says so, and says by how much', async ({ page }) => {
+  await page.goto('/');
+
+  // Boosted: 82 from the model, +12 from the hearts.
+  const boosted = page.locator('.card', { hasText: 'Roygbiv' }).locator('.match');
+  await expect(boosted).toHaveClass(/is-hearted/);
+  await expect(boosted).toContainText('94%');
+  await expect(boosted).toHaveAttribute(
+    'title',
+    '82% from the model, +12 from what you heart — you have hearted 3 tracks by Boards of Canada',
+  );
+
+  // Unboosted cards must look exactly as they always did.
+  const plain = page.locator('.card', { hasText: 'Fade Into You' }).locator('.match');
+  await expect(plain).not.toHaveClass(/is-hearted/);
+  await expect(plain).toHaveAttribute('title', '88% match');
+});
+
+test('the connections panel reports Navidrome', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('tab', { name: 'Settings' }).click();
+
+  const row = page.locator('#connections div', { hasText: 'Navidrome' });
+  await expect(row).toContainText('3 hearted of 4');
 });
 
 test('settings persist across a reload', async ({ page }) => {
