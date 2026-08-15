@@ -429,32 +429,73 @@ Cookies are the answer that lets you **stay behind gluetun**: they give YouTube
 an account to attach the request to, instead of an anonymous request from an
 address it has decided it does not trust.
 
+### Try a different exit address first
+
+Five minutes, nothing to export, and often enough on its own. The endpoints that
+get challenged are the popular ones — a busy US or Netherlands exit has thousands
+of people behind it and YouTube knows the range. Somewhere unfashionable is
+frequently untouched.
+
+Change `SERVER_COUNTRIES` or `SERVER_CITIES` on the **gluetun** service — not in
+Musicdrome's `.env`, which does not control the tunnel — then restart **both**:
+
+```bash
+docker compose up -d --force-recreate gluetun musicdrome
+```
+
+Musicdrome has to come along because it runs inside gluetun's network namespace
+(`network_mode: service:gluetun`). Recreating gluetun alone tears that namespace
+down underneath a container that is still using it. Then press **Retry all
+failed** in the Downloads tab.
+
+This buys time rather than settling anything — the new address is fine until it
+is not. Cookies are what stop it coming back, so if you find yourself doing this
+a second time, do the section below instead.
+
 ### Setting it up
 
-**1. Export the cookies.** In your browser, install a `cookies.txt` extension —
-one that exports **Netscape format**, which is the only format yt-dlp reads. A
-JSON export will not work, and Musicdrome will tell you so at boot rather than
-letting you find out from the download failures.
+**1. Find the folder.** It is the one you already mount as `/config`, holding
+`musicdrome.db` — the `DATA_LOCATION` line in your `.env`. If you are not sure,
+ask docker:
 
-Do the export like this, because the details are what make it last:
+```bash
+grep DATA_LOCATION .env
+# or, straight from the running container:
+docker inspect -f '{{range .Mounts}}{{.Source}} → {{.Destination}}{{"\n"}}{{end}}' musicdrome
+```
 
-- Use a **throwaway Google account**, not your main one. This file is a live
+So a `.env` reading `DATA_LOCATION=/home/you/arr/musicdrome/data` means the file
+goes at `/home/you/arr/musicdrome/data/cookies.txt`, and Musicdrome sees it as
+`/config/cookies.txt`.
+
+**2. Export the cookies.** Install a `cookies.txt` browser extension — one that
+exports **Netscape format**, the only format yt-dlp reads. *Get cookies.txt
+LOCALLY* (Chrome/Edge) and *cookies.txt* (Firefox) are the usual choices; prefer
+one that is open source and does not upload anything, since you are handing it a
+live session.
+
+Then do the export in this order, because the details are what make it last:
+
+- Use a **throwaway Google account**, not your main one. This file *is* a live
   session — anyone who reads it is signed in as that account.
-- Open a **private/incognito window**, sign in, go to `youtube.com`, export.
+- Open a **private/incognito window** and sign in there.
+- Go to `youtube.com`, let it finish loading while signed in, and export.
 - **Close the window without logging out.** Logging out rotates the session
   server-side and invalidates the file you just exported. This is the single
   most common reason cookies work for an hour and then stop.
 
-**2. Drop the file in.** Put it in the folder you already mount as `/config` —
-the same one holding `musicdrome.db` — named `cookies.txt`:
+**3. Drop the file in.** Name it `cookies.txt` and put it in the folder from
+step 1:
 
-```
-<your DATA_LOCATION>/cookies.txt
+```bash
+mv ~/Downloads/cookies.txt /home/you/arr/musicdrome/data/cookies.txt
 ```
 
-That is the whole step. No compose edit, no environment variable, no restart:
-`/config` is already mounted, the file is picked up on the next download, and a
-queue paused by a bot check resumes as soon as it lands:
+That is the whole step. No compose edit, no environment variable, no restart —
+`/config` is already mounted, and leaving `YTDLP_COOKIES_FILE` commented out is
+correct, because that path is where Musicdrome looks by default. The file is
+picked up on the next download, and a queue paused by a bot check resumes within
+about five seconds of it landing:
 
 ```
 INFO  app.download: new cookies — resuming downloads without waiting out the pause
@@ -463,7 +504,19 @@ INFO  app.download: new cookies — resuming downloads without waiting out the p
 Keep the export somewhere else if you prefer — mount it wherever and point
 `YTDLP_COOKIES_FILE` at the path *inside* the container. Read-only is fine.
 
-**3. Check the boot log.** Musicdrome says what it found, on its own line:
+**4. Check it took.** Two quick sanity checks on the file itself:
+
+```bash
+head -c 20 /home/you/arr/musicdrome/data/cookies.txt   # text, not "[{"  — JSON is unreadable to yt-dlp
+grep -c youtube /home/you/arr/musicdrome/data/cookies.txt   # should be well above zero
+```
+
+Then watch the log. There is no need to restart, but if you do, Musicdrome
+reports what it found on its own line at boot:
+
+```bash
+docker logs -f musicdrome | grep -i cookies
+```
 
 ```
 INFO  app.main: cookies: /config/cookies.txt — 14 youtube.com cookies, working copy in /config
@@ -481,6 +534,11 @@ cookies: not in use — /config/cookies.txt has cookies for example.com but none
 cookies: not in use — /config/cookies.txt has 14 youtube.com cookies and every one of
          them has expired — export a fresh one
 ```
+
+The line to worry about is `cookies: none`. That is not a broken file — it means
+there is no file at all, and downloads are still going out anonymously.
+
+Once it reads correctly, press **Retry all failed** in the Downloads tab.
 
 ### Your export is never modified
 
@@ -678,9 +736,10 @@ connection changes while it waits. **[Sign the downloads in with
 cookies](#signing-downloads-in-with-cookies)** and they resume on their own,
 without leaving the VPN — that is the fix.
 
-The alternatives, if you would rather not: a different exit address (another
-gluetun endpoint or country, or `YTDLP_PROXY` to route only yt-dlp off the VPN),
-or a PO token via
+The alternatives, if you would rather not: **[a different exit
+address](#try-a-different-exit-address-first)** — another gluetun endpoint or
+country, which is the five-minute version and buys time rather than settling it,
+or `YTDLP_PROXY` to route only yt-dlp off the VPN — or a PO token via
 [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider),
 which proves the same thing without an account but is more to set up.
 
