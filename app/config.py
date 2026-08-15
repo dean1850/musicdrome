@@ -307,6 +307,19 @@ YTDLP_403_RETRIES = _int("YTDLP_403_RETRIES", 2)
 YTDLP_403_STREAK = _int("YTDLP_403_STREAK", 3)
 YTDLP_403_COOLDOWN = _int("YTDLP_403_COOLDOWN", 300)
 
+# Seconds to hold the download queue after YouTube answers with its bot check —
+# "Sign in to confirm you're not a bot". Its own setting, and far longer than
+# the 403 cooldown, because the two failures are not the same shape. A 403 is
+# often one signed URL that went stale and the next track is fine; a bot check
+# is the *connection* being challenged, so it is never per-track and never
+# clears by trying again a minute later. One is a reason to pause; the other is
+# a reason to stop until something about the identity changes.
+#
+# There is no streak to reach either: the first one pauses the queue, because
+# the second failure only establishes the same thing at the cost of another
+# track. Set to 0 to disable the pause and let every remaining track fail.
+YTDLP_BOT_CHECK_COOLDOWN = _int("YTDLP_BOT_CHECK_COOLDOWN", 1800)
+
 # Escape hatches for networks, rate limits and bot checks — not everyday
 # settings. PO tokens look like "<client>.<context>+<token>", comma separated.
 YTDLP_PO_TOKEN = _env("YTDLP_PO_TOKEN")

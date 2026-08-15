@@ -645,7 +645,7 @@ def test_a_direct_download_without_a_url_still_gets_matched():
 def no_lingering_cooldown():
     """A test that trips the cooldown must not stall the next one."""
     yield
-    download._403_until = 0.0
+    download._hold_until = 0.0
     download._403_streak = 0
 
 
@@ -773,10 +773,10 @@ def test_a_streak_of_403s_pauses_the_queue(monkeypatch):
 
     download._note_403()
     download._note_403()
-    assert download._403_until == 0.0  # two is not a pattern
+    assert download._hold_until == 0.0  # two is not a pattern
 
     download._note_403()
-    assert download._403_until > time.time()
+    assert download._hold_until > time.time()
 
 
 def test_a_completed_download_clears_the_streak(monkeypatch):
@@ -788,7 +788,7 @@ def test_a_completed_download_clears_the_streak(monkeypatch):
     download._note_download_ok()
     download._note_403()
 
-    assert download._403_until == 0.0
+    assert download._hold_until == 0.0
 
 
 def test_the_cooldown_can_be_switched_off(monkeypatch):
@@ -796,7 +796,7 @@ def test_the_cooldown_can_be_switched_off(monkeypatch):
 
     for _ in range(10):
         download._note_403()
-    assert download._403_until == 0.0
+    assert download._hold_until == 0.0
 
 
 def test_the_403_message_names_the_likely_cause():
@@ -821,6 +821,215 @@ def test_refusals_are_recognised(message):
 ])
 def test_other_failures_are_not_mistaken_for_refusals(message):
     assert not download.is_forbidden(message)
+
+
+# ─── YouTube's bot check ───────────────────────────────────────────────────
+#
+# The failure behind these: routed through gluetun, YouTube answered the player
+# call with "Sign in to confirm you're not a bot" and the queue turned 34
+# tracks into failures in 87 seconds, because nothing recognised the message.
+
+# Exactly as yt-dlp emits it — note the U+2019 apostrophe, which is the whole
+# reason the obvious substring test does not work.
+BOT_CHECK = (
+    "ERROR: [youtube] 2ahIw-OkjQ8: Sign in to confirm you’re not a bot. Use "
+    "--cookies-from-browser or --cookies for the authentication. See "
+    "https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp "
+    "for how to manually pass cookies. Also see "
+    "https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies "
+    "for tips on effectively exporting YouTube cookies"
+)
+
+
+@pytest.mark.parametrize("message", [
+    BOT_CHECK,
+    "Sign in to confirm you're not a bot",       # ASCII apostrophe
+    "Sign in to confirm you are not a bot",
+    "ERROR: [youtube] abc: Sign in to confirm you’re not a bot.",
+])
+def test_the_bot_check_is_recognised_whichever_apostrophe_arrives(message):
+    assert download.is_bot_check(message)
+
+
+@pytest.mark.parametrize("message", [
+    # The age gate opens with the same four words and really is per-video.
+    # Pausing the whole queue over one track nobody can watch signed out would
+    # be a worse bug than the one being fixed.
+    "ERROR: [youtube] abc: Sign in to confirm your age. This video may be "
+    "inappropriate for some users.",
+    "HTTP Error 403: Forbidden",
+    "no confident match on YouTube Music or YouTube",
+])
+def test_other_failures_are_not_mistaken_for_the_bot_check(message):
+    assert not download.is_bot_check(message)
+
+
+def test_the_first_bot_check_pauses_the_queue():
+    """Unlike a 403, there is nothing to learn from the second one."""
+    download._note_bot_check()
+    assert download._hold_until > time.time()
+
+
+def test_the_bot_check_pause_is_extended_rather_than_reset(monkeypatch):
+    """A challenge arriving mid-pause must not shorten the pause it confirms."""
+    monkeypatch.setattr(config, "YTDLP_BOT_CHECK_COOLDOWN", 1800)
+    download._note_bot_check()
+    first = download._hold_until
+
+    monkeypatch.setattr(config, "YTDLP_BOT_CHECK_COOLDOWN", 60)
+    download._note_bot_check()
+
+    assert download._hold_until == first
+
+
+def test_the_bot_check_pause_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_BOT_CHECK_COOLDOWN", 0)
+
+    for _ in range(10):
+        download._note_bot_check()
+    assert download._hold_until == 0.0
+
+
+def test_the_bot_check_message_replaces_yt_dlps_boilerplate():
+    message = download.explain_bot_check(BOT_CHECK)
+
+    assert "2ahIw-OkjQ8" in message, "the video it happened on is worth keeping"
+    assert "--cookies-from-browser" not in message
+    assert "wiki" not in message
+    assert "YTDLP_COOKIES_FILE" in message
+    assert "VPN" in message
+    assert len(message) <= 500, "longer than this is truncated into the database"
+
+
+def test_a_bot_check_is_not_retried(tmp_path, monkeypatch):
+    """The challenge is against the connection; the same URL fares no better."""
+    monkeypatch.setattr(config, "YTDLP_403_RETRIES", 2)
+    fake = FakeYdl(failures=99, error=BOT_CHECK)
+
+    with pytest.raises(RuntimeError):
+        download._extract_with_retry(
+            fake, {}, download.Candidate(url="u", title="t"), tmp_path
+        )
+    assert fake.calls == 1
+
+
+def test_a_bot_check_does_not_walk_the_other_candidates(monkeypatch):
+    """Three uploads collect the same challenge three times."""
+    tried = []
+
+    def attempt(download_id, candidate, meta):
+        tried.append(candidate.url)
+        raise download.DownloadError(BOT_CHECK)
+
+    monkeypatch.setattr(download, "_download_audio", attempt)
+    candidates = [
+        download.Candidate(url="first", title="t"),
+        download.Candidate(url="second", title="t"),
+    ]
+
+    with pytest.raises(download.DownloadError):
+        download._download_first_that_works(1, candidates, {"artist": "A", "title": "T"})
+    assert tried == ["first"]
+
+
+def test_a_bot_checked_search_is_not_reported_as_a_failed_match(monkeypatch):
+    """Otherwise the one failure with a fix is filed under the one without."""
+    def blocked(*args, **kwargs):
+        raise RuntimeError(BOT_CHECK)
+
+    monkeypatch.setattr(download, "_extract_info", blocked)
+
+    with pytest.raises(RuntimeError, match="not a bot"):
+        download.search_youtube("Tinlicker", "Fall")
+
+
+def test_an_ordinary_search_failure_still_returns_nothing(monkeypatch):
+    """A search that breaks for any other reason is not worth failing over."""
+    def broken(*args, **kwargs):
+        raise RuntimeError("Unable to download API page: HTTP Error 500")
+
+    monkeypatch.setattr(download, "_extract_info", broken)
+
+    assert download.search_youtube("Tinlicker", "Fall") == []
+
+
+def test_a_bot_checked_download_is_explained_and_holds_the_queue(suggestion, monkeypatch):
+    """The whole fix, end to end: one track fails, the rest stop instead."""
+    monkeypatch.setattr(download, "ranked_matches", lambda *a, **k: [
+        download.Candidate(url="u", title="t", artist="Tinlicker", score=0.9)
+    ])
+
+    def challenged(*args, **kwargs):
+        raise download.DownloadError(BOT_CHECK)
+
+    monkeypatch.setattr(download, "_download_audio", challenged)
+
+    download_id = download.enqueue(suggestion("Tinlicker", "Fall"))
+    download.fetch(download_id)
+
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT status, error FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+
+    assert row["status"] == "failed"
+    assert "YTDLP_COOKIES_FILE" in row["error"]
+    assert "wiki" not in row["error"]
+    assert download._hold_until > time.time(), "the queue must stop, not drain"
+
+
+# ─── Cookie files ──────────────────────────────────────────────────────────
+#
+# Checked at boot because of when people set this: downloads already failing,
+# one variable changed, restart, and no way to tell whether it took — a cookie
+# file yt-dlp cannot open fails exactly like the problem it was set to fix.
+
+
+def test_no_cookie_file_is_not_a_problem(monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", "")
+    assert download.cookies_problem() == ""
+
+
+def test_a_netscape_cookie_file_is_accepted(tmp_path, monkeypatch):
+    path = tmp_path / "cookies.txt"
+    path.write_text("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tid\tv\n")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert download.cookies_problem() == ""
+
+
+def test_a_headerless_cookie_file_is_accepted(tmp_path, monkeypatch):
+    """Plenty of exporters skip the comment and start straight into fields."""
+    path = tmp_path / "cookies.txt"
+    path.write_text(".youtube.com\tTRUE\t/\tTRUE\t0\tid\tv\n")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert download.cookies_problem() == ""
+
+
+def test_an_unmounted_cookie_file_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(tmp_path / "nope.txt"))
+
+    problem = download.cookies_problem()
+    assert "does not exist" in problem
+    assert "mounted" in problem, "the fix is the mount, not the filename"
+
+
+def test_a_json_cookie_export_is_rejected(tmp_path, monkeypatch):
+    """The other thing browser extensions offer, which yt-dlp will not read."""
+    path = tmp_path / "cookies.json"
+    path.write_text('[{"domain": ".youtube.com", "name": "SID", "value": "x"}]')
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert "Netscape" in download.cookies_problem()
+
+
+def test_an_empty_cookie_file_says_it_is_empty(tmp_path, monkeypatch):
+    path = tmp_path / "cookies.txt"
+    path.write_text("")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert "empty" in download.cookies_problem()
 
 
 # ─── Browser impersonation ─────────────────────────────────────────────────
