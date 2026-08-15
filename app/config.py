@@ -333,6 +333,27 @@ YTDLP_FORCE_IPV4 = _env("YTDLP_FORCE_IPV4").lower() in {"1", "true", "yes"}
 DOWNLOAD_CONCURRENCY = _int("DOWNLOAD_CONCURRENCY", 2)
 
 
+def cookies_file() -> Path | None:
+    """The cookie export to sign downloads in with, or ``None`` for anonymous.
+
+    ``DATA_DIR/cookies.txt`` counts without being configured. That is the
+    directory already mounted for the database, so "drop the file in next to
+    it" is one step instead of three, and a cookie file is not something anyone
+    puts there by accident — it is the file YouTube's bot check sends everybody
+    looking for. Setting YTDLP_COOKIES_FILE still wins, and is still the way to
+    keep the export somewhere else.
+
+    A configured path is returned whether or not it exists, so
+    :func:`app.download.cookies_problem` can say what is wrong with it rather
+    than silently behaving as though nothing was configured at all.
+    """
+    configured = YTDLP_COOKIES_FILE.strip()
+    if configured:
+        return Path(configured)
+    default = DATA_DIR / "cookies.txt"
+    return default if default.is_file() else None
+
+
 def player_clients() -> list[str]:
     return [c.strip() for c in YTDLP_PLAYER_CLIENTS.split(",") if c.strip()]
 

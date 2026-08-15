@@ -123,6 +123,17 @@ _playlist_lock = threading.Lock()
 _hold_lock = threading.Lock()
 _403_streak = 0
 _hold_until = 0.0
+# The cookie generation the current pause was entered on — see _wait_out_cooldown.
+_hold_generation = 0
+
+# The working copy of the cookie export, and what the export looked like when
+# it was taken. Dotted because it sits in the data directory beside the
+# database, and it is a live session rather than something to be edited.
+_COOKIE_JAR_NAME = ".cookies-active.txt"
+_cookie_lock = threading.Lock()
+_cookie_jar: Path | None = None
+_cookie_stamp: tuple[int, int] | None = None
+_cookie_generation = 0
 
 _UNSET = object()
 _impersonate_cache: Any = _UNSET
@@ -315,53 +326,190 @@ class _YtdlpLogger:
         log.debug("yt-dlp: %s", message)  # the caller reports the failure itself
 
 
+def _cookie_lines(path: Path) -> list[list[str]]:
+    """The cookie records in a Netscape file, as split fields.
+
+    Comments and blank lines are dropped, along with the ``#HttpOnly_`` prefix
+    that browsers put in front of a domain — it is part of the format and not
+    part of the domain, and treating it as a comment loses roughly half the
+    cookies YouTube cares about.
+    """
+    records = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) >= 7:
+                records.append(fields)
+    return records
+
+
 def cookies_problem() -> str:
-    """Why the configured cookie file will not work, or ``""`` if it will.
+    """Why the cookie file will not work, or ``""`` if it will.
 
     Checked at boot because of when people set it. A cookie file is what
-    YouTube's bot check drives everyone towards, so it tends to be configured
-    at the worst possible moment — downloads already failing, one variable
-    changed, a restart, and then no way to tell whether it helped, because a
-    cookie file yt-dlp cannot open produces exactly the failure it was meant to
-    fix. Container paths make that easy to hit: a path is only the same inside
-    the container if it was mounted there.
+    YouTube's bot check drives everyone towards, so it tends to arrive at the
+    worst possible moment — downloads already failing, one thing changed, a
+    restart, and then no way to tell whether it helped, because a cookie file
+    yt-dlp cannot use fails in exactly the same way as the problem it was
+    meant to fix. Every check here is a mistake that is otherwise invisible:
+    the file never mounted, the wrong export format, a stale export, or an
+    export taken from a browser that was not signed in.
 
     Says so and nothing more. A bad cookie file is a reason to stop guessing,
     not a reason to refuse to start — downloads without one still work for
-    anything YouTube is not challenging.
+    everything YouTube is not challenging.
     """
-    configured = config.YTDLP_COOKIES_FILE.strip()
-    if not configured:
+    path = config.cookies_file()
+    if path is None:
         return ""
 
-    path = Path(configured)
     if not path.exists():
         return (
-            f"YTDLP_COOKIES_FILE is {configured}, which does not exist inside the "
-            f"container — the file has to be mounted in, not merely present on "
-            f"the host"
+            f"{path} does not exist inside the container — the file has to be "
+            f"mounted in, not merely present on the host"
         )
     if not path.is_file():
-        return f"YTDLP_COOKIES_FILE is {configured}, which is a directory"
+        return f"{path} is a directory, not a cookies.txt file"
 
     try:
+        records = _cookie_lines(path)
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             first = handle.readline()
     except OSError as exc:
-        return f"YTDLP_COOKIES_FILE at {configured} cannot be read ({exc})"
+        return f"{path} cannot be read ({exc})"
 
     if not first.strip():
-        return f"YTDLP_COOKIES_FILE at {configured} is empty"
+        return f"{path} is empty"
     # Netscape format is either commented ("# Netscape HTTP Cookie File") or
     # straight into tab-separated fields. Anything else is the other thing
     # browser extensions export — JSON — which yt-dlp rejects outright.
-    if not first.lstrip().startswith("#") and "\t" not in first:
+    if not records:
         return (
-            f"YTDLP_COOKIES_FILE at {configured} is not in Netscape format, which "
-            f"is the only one yt-dlp reads — export it as cookies.txt rather than "
+            f"{path} holds no cookies in Netscape format, which is the only one "
+            f"yt-dlp reads — export it with a cookies.txt extension rather than "
             f"as JSON"
         )
+
+    youtube = [r for r in records if "youtube" in r[0] or "google" in r[0]]
+    if not youtube:
+        domains = ", ".join(sorted({r[0].lstrip(".") for r in records})[:3])
+        return (
+            f"{path} has cookies for {domains} but none for youtube.com — export "
+            f"it with youtube.com open and signed in"
+        )
+
+    # Expiry is the fifth field, in Unix seconds; 0 means a session cookie,
+    # which a file export cannot meaningfully carry. An export where everything
+    # has lapsed is the "it worked for a day" case, and is worth naming as
+    # such: it looks identical to no cookies at all from the outside.
+    now = time.time()
+    live = [r for r in youtube if _cookie_expiry(r) == 0 or _cookie_expiry(r) > now]
+    if not live:
+        return (
+            f"{path} has {len(youtube)} youtube.com cookies and every one of them "
+            f"has expired — export a fresh one"
+        )
     return ""
+
+
+def _cookie_expiry(record: list[str]) -> float:
+    try:
+        return float(record[4])
+    except (IndexError, ValueError):
+        return 0.0
+
+
+def cookie_jar() -> Path | None:
+    """The cookie file to hand yt-dlp — a working copy, never the original.
+
+    yt-dlp does not only read this file, it writes it back. YouTube rotates the
+    session cookie as it is used, and the refreshed jar is saved over the
+    ``cookiefile`` when the download finishes. Handing it the file you mounted
+    goes wrong in two directions at once, and both present as "the cookies
+    worked for an hour and then stopped":
+
+    * mounted read-only, which is the sensible way to mount a credential, the
+      save fails; and
+    * mounted writable, yt-dlp is editing the only copy of an export that
+      cannot be regenerated without going back to a browser.
+
+    So the export is copied into the data directory and yt-dlp is given the
+    copy. The original is never written to, the rotation it needs to keep the
+    session alive lands somewhere writable, and re-exporting is a matter of
+    dropping the new file in — the source is re-read whenever it changes, so
+    that takes effect on the next download rather than at the next restart.
+    """
+    global _cookie_stamp, _cookie_jar, _cookie_generation
+
+    source = config.cookies_file()
+    if source is None:
+        return None
+    try:
+        stat = source.stat()
+    except OSError:
+        return None
+
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    with _cookie_lock:
+        if _cookie_jar is not None and _cookie_stamp == stamp:
+            return _cookie_jar
+
+        target = config.DATA_DIR / _COOKIE_JAR_NAME
+        first_time = _cookie_stamp is None
+        try:
+            # Somebody pointing the setting straight at the working copy would
+            # otherwise land in SameFileError on every download.
+            if source.resolve() == target.resolve():
+                raise shutil.SameFileError
+            config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(0o600)  # it is a live session, not a config file
+        except (OSError, shutil.SameFileError) as exc:
+            # A data directory that cannot be written to is already fatal and
+            # already reported; using the original directly is still better
+            # than downloading signed out.
+            if not isinstance(exc, shutil.SameFileError):
+                log.warning("could not copy the cookie file, using it directly: %s", exc)
+            _cookie_jar, _cookie_stamp = source, stamp
+            # Counted even here: a replaced export is a new identity whether or
+            # not it could be copied, and that is what ends a bot-check pause.
+            _cookie_generation += 1
+            return source
+
+        _cookie_jar, _cookie_stamp = target, stamp
+        _cookie_generation += 1
+
+    if first_time:
+        log.info("cookies: signed in from %s", source)
+    else:
+        log.info("cookies: picked up a new export from %s", source)
+    return target
+
+
+def cookies_status() -> str:
+    """One line for the boot log: whether downloads are signed in, and from where."""
+    problem = cookies_problem()
+    if problem:
+        return f"not in use — {problem}"
+
+    path = config.cookies_file()
+    if path is None:
+        return (
+            "none — downloads are anonymous, which is fine until YouTube starts "
+            f"asking this address to prove it is not a bot. Then: a cookies.txt "
+            f"in {config.DATA_DIR}, or YTDLP_COOKIES_FILE"
+        )
+
+    try:
+        youtube = [r for r in _cookie_lines(path) if "youtube" in r[0] or "google" in r[0]]
+    except OSError:
+        youtube = []
+    return f"{path} — {len(youtube)} youtube.com cookies, working copy in {config.DATA_DIR}"
 
 
 def js_runtime_problem() -> str:
@@ -758,8 +906,12 @@ def _ydl_options(**overrides) -> dict[str, Any]:
         options["source_address"] = "0.0.0.0"
     if config.YTDLP_PROXY:
         options["proxy"] = config.YTDLP_PROXY
-    if config.YTDLP_COOKIES_FILE:
-        options["cookiefile"] = config.YTDLP_COOKIES_FILE
+    # The working copy, not the export itself — see :func:`cookie_jar`. Read
+    # every time rather than once at boot, so a re-export takes effect on the
+    # next download.
+    jar = cookie_jar()
+    if jar is not None:
+        options["cookiefile"] = str(jar)
     if config.YTDLP_COOKIES_FROM_BROWSER:
         parts = config.YTDLP_COOKIES_FROM_BROWSER.split(":", 1)
         options["cookiesfrombrowser"] = tuple(parts)
@@ -1456,6 +1608,16 @@ def explain_forbidden(message: str) -> str:
     )
 
 
+def _cookie_target() -> Path:
+    """Where to tell somebody to put a cookie file.
+
+    Their configured path when they have one, so the advice does not send
+    somebody who already set YTDLP_COOKIES_FILE to a different directory than
+    the one they are using.
+    """
+    return config.cookies_file() or (config.DATA_DIR / "cookies.txt")
+
+
 def explain_bot_check(message: str) -> str:
     """Turn YouTube's bot challenge into the one sentence that acts on it.
 
@@ -1477,16 +1639,15 @@ def explain_bot_check(message: str) -> str:
     return (
         f"{trimmed} — YouTube is challenging the connection, not this track, so "
         f"every download will fail the same way until the identity behind it "
-        f"changes. Downloads are paused meanwhile. Route them outside the VPN, "
-        f"move gluetun to a different endpoint, or give yt-dlp a signed-in "
-        f"identity: YTDLP_COOKIES_FILE (a Netscape cookies.txt) or "
-        f"YTDLP_PO_TOKEN."
+        f"changes. Downloads are paused meanwhile. Sign them in: put a Netscape "
+        f"cookies.txt at {_cookie_target()} and they resume on their own. "
+        f"Failing that, a different exit address or YTDLP_PO_TOKEN."
     )
 
 
 def _note_403() -> None:
     """Count a refusal, and pause the queue once they start arriving in a run."""
-    global _403_streak, _hold_until
+    global _403_streak, _hold_until, _hold_generation
 
     if config.YTDLP_403_COOLDOWN <= 0 or config.YTDLP_403_STREAK <= 0:
         return
@@ -1497,6 +1658,7 @@ def _note_403() -> None:
             return
         _403_streak = 0
         _hold_until = time.time() + config.YTDLP_403_COOLDOWN
+        _hold_generation = _cookie_generation
 
     log.warning(
         "%d downloads refused in a row — pausing the queue for %d seconds. "
@@ -1517,7 +1679,7 @@ def _note_bot_check() -> None:
     The hold is extended rather than reset, so a challenge that arrives while
     the queue is already paused cannot shorten the pause it is confirming.
     """
-    global _hold_until
+    global _hold_until, _hold_generation
 
     if config.YTDLP_BOT_CHECK_COOLDOWN <= 0:
         return
@@ -1525,6 +1687,9 @@ def _note_bot_check() -> None:
     with _hold_lock:
         was_held = _hold_until > time.time()
         _hold_until = max(_hold_until, time.time() + config.YTDLP_BOT_CHECK_COOLDOWN)
+        # The identity that was just refused. Anything else arriving in the
+        # cookie file from here on is a different one, and a reason to resume.
+        _hold_generation = _cookie_generation
 
     # Once per pause, not once per track: the whole point is to stop repeating
     # this, and a log that repeats it is the same failure in another form.
@@ -1532,9 +1697,9 @@ def _note_bot_check() -> None:
         log.warning(
             "YouTube asked this connection to prove it is not a bot — pausing "
             "downloads for %d seconds. This is the exit address, not the "
-            "tracks; it will not clear on its own. Route downloads outside the "
-            "VPN, or set YTDLP_COOKIES_FILE or YTDLP_PO_TOKEN.",
-            config.YTDLP_BOT_CHECK_COOLDOWN,
+            "tracks, and it will not clear on its own: put a Netscape "
+            "cookies.txt at %s and downloads resume as soon as it lands.",
+            config.YTDLP_BOT_CHECK_COOLDOWN, _cookie_target(),
         )
 
 
@@ -1553,12 +1718,34 @@ def _note_download_ok() -> None:
 
 
 def _wait_out_cooldown() -> None:
-    """Block until a 403 or bot-check pause has expired. Called between downloads."""
+    """Block until a 403 or bot-check pause has expired. Called between downloads.
+
+    A new cookie export ends the pause early. The pause exists because nothing
+    about the connection was going to change on its own — but a fresh export is
+    exactly that change, and it is the response the error message asked for.
+    Making somebody wait out another 25 minutes after they have already done
+    the thing that fixes it would teach them the setting does not work.
+    """
+    global _hold_until
+
     while True:
         with _hold_lock:
             remaining = _hold_until - time.time()
+            since = _hold_generation
         if remaining <= 0:
             return
+
+        # Measured against the identity that was refused, not against the one
+        # in hand when the waiting started: a file dropped in between the
+        # failure and this loop is the commonest version of the whole scenario,
+        # and re-reading the baseline here would step straight over it.
+        cookie_jar()
+        if _cookie_generation != since:
+            with _hold_lock:
+                _hold_until = 0.0
+            log.info("new cookies — resuming downloads without waiting out the pause")
+            return
+
         # Short sleeps so a container stop is not held up by a long pause.
         time.sleep(min(remaining, 5.0))
 
