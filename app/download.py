@@ -947,10 +947,22 @@ def playlist_entry(path: Path, playlist_dir: Path | None = None) -> str:
         return str(path)
 
     try:
-        return Path(os.path.relpath(path, playlist_dir)).as_posix()
+        relative = Path(os.path.relpath(path, playlist_dir)).as_posix()
     except ValueError:
         # Different drives on Windows: no relative path exists between them.
         return str(path)
+
+    # A line beginning with "#" is a comment in m3u, so an artist whose name
+    # starts with one — "#1 Dads", "#####" — would be written as a path and
+    # read back as a remark, by every parser including this app's own. The
+    # track is not mis-filed, it is *gone*: nothing plays it, nothing counts
+    # it, and the file still looks well-formed.
+    #
+    # Only reachable when the entry has no "../" in front of it, which means a
+    # playlist sitting in the library root — the layout the README recommends
+    # as the most portable one, so this is not a corner nobody visits. "./" is
+    # a path again, and every resolver handles it.
+    return f"./{relative}" if relative.startswith("#") else relative
 
 
 def playlist_paths(playlist: Path) -> set[str]:
@@ -1073,10 +1085,19 @@ def migrate_playlist_folder() -> int:
     # Guarded because this runs inside the boot lifespan: an unreadable old
     # folder is a reason to skip the migration, never a reason for the
     # container to fail to start.
+    #
+    # The playlist is matched by name rather than globbed for, because
+    # MUSICDROME_PLAYLIST_NAME is free text and `glob` reads `[`, `*` and `?`
+    # as pattern syntax. A name like "Best [2024]" globs to a character class:
+    # it does not match its own file, and it *does* match "Best 2.m3u" —
+    # so the migration would leave ours behind and move somebody else's
+    # playlist instead, rewriting its paths on the way. Only the scan files,
+    # whose pattern is a fixed literal we wrote ourselves, are a real glob.
+    named = old_dir / f"{config.PLAYLIST_NAME}.m3u"
     try:
         ours = sorted(
             {
-                *old_dir.glob(f"{config.PLAYLIST_NAME}.m3u"),
+                *([named] if named.is_file() else []),
                 *old_dir.glob("musicdrome-scan-[0-9]*.m3u"),
             }
         )
