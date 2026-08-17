@@ -39,6 +39,45 @@ SUGGESTIONS = [
      "dubstep,downtempo", 61, 0, ""),
 ]
 
+# Finished downloads, so the table has rows to lay out. All of them succeeded:
+# a failed one would make the "retry all failed is hidden until something has
+# failed" test vacuous.
+#
+# The first is deliberately pathological. A DJ mix carries the whole tracklist
+# in its title and every credited artist in its artist field, which is how the
+# downloads table came to be 2583px wide at every viewport size — one row set
+# the width of a column and pushed the other seven off-screen. It is seeded so
+# that a regression in the column widths fails a test rather than a bug report.
+LONG_TITLE = (
+    "The Sound of Tropical House: Waves (Robin Schulz radio edit) / Sonnentanz "
+    "(Sun Don't Shine) (vocal radio edit) / Sugar / Changes / Perfect Strangers"
+)
+LONG_ARTIST = (
+    "Mr. Probz / Klangkarussell feat. Will Heard / Robin Schulz feat. Francesco "
+    "Yates / Faul & Wad vs. PNAU / Jonas Blue feat. JP Cooper"
+)
+
+DOWNLOADS = [
+    (LONG_ARTIST, LONG_TITLE, "Mastermix Issue 365",
+     f"/music/{LONG_ARTIST[:60]}/Mastermix Issue 365/{LONG_TITLE[:60]}.opus",
+     7_340_032, "opus", 133, "copied"),
+    ("Tinlicker", "Breathe", "Breathe", "/music/Tinlicker/Breathe/Breathe.opus",
+     4_718_592, "opus", 135, "copied"),
+    ("BUNT.", "Midnight City", "BUNT. EP", "/music/BUNT/BUNT. EP/Midnight City.opus",
+     3_774_874, "opus", 131, "converted"),
+    # No codec recorded, which is its own thing to render.
+    ("Solven", "Moments", "", "/music/Solven/Singles/Moments.opus", 3_565_158, "", 0, ""),
+    ("Robin Schulz", "Sugar", "Prayer", "/music/Robin Schulz/Prayer/Sugar.mp3",
+     8_912_896, "", 0, ""),
+    ("Kolya Funk", "Universe", "Universe", "/music/Kolya Funk/Universe/Universe.mp3",
+     6_081_740, "", 0, ""),
+    ("Cale", "Echoes", "Echoes", "/music/Cale/Echoes/Echoes.opus",
+     3_670_016, "opus", 148, "copied"),
+    # A single: no album, so the album cell has nothing to show.
+    ("Dream Chaos", "Heartbeat", "", "/music/Dream Chaos/Singles/Heartbeat.opus",
+     3_145_728, "opus", 130, "copied"),
+]
+
 # What Navidrome would have reported. Hearts feed the Connections panel and the
 # exclusion set; the un-hearted row is there so "owned" and "hearted" stay
 # visibly different things.
@@ -87,6 +126,17 @@ def main() -> None:
                  base, boost, why, reason, tags, now),
             )
 
+        # Older than anything queued during a test, so a newly queued download
+        # still sorts to the top of the table.
+        for index, (artist, title, album, path, size, codec, abr, encoded) in enumerate(DOWNLOADS):
+            conn.execute(
+                "INSERT INTO downloads (track_key, artist, title, album, path, bytes, "
+                "source_codec, source_abr, encoded, status, created_at, finished_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?)",
+                (track_key(artist, title), artist, title, album, path, size, codec, abr,
+                 encoded, now - 7200 - index * 60, now - 7100 - index * 60),
+            )
+
         for index, (artist, title, starred, plays) in enumerate(NAVIDROME_TRACKS):
             conn.execute(
                 "INSERT INTO navidrome_tracks (id, artist, title, album, artist_key, track_key, "
@@ -101,8 +151,8 @@ def main() -> None:
         )
 
     print(
-        f"seeded {len(SUGGESTIONS)} suggestions, {len(PLAYS) * 4} plays "
-        f"and {len(NAVIDROME_TRACKS)} Navidrome tracks"
+        f"seeded {len(SUGGESTIONS)} suggestions, {len(PLAYS) * 4} plays, "
+        f"{len(DOWNLOADS)} downloads and {len(NAVIDROME_TRACKS)} Navidrome tracks"
     )
 
 
