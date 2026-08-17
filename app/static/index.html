@@ -91,6 +91,12 @@
       </div>
 
       <div class="filter-group">
+        <label for="d-search">Search</label>
+        <input type="search" id="d-search" placeholder="Track, artist, album or file"
+               autocomplete="off" spellcheck="false">
+      </div>
+
+      <div class="filter-group">
         <label for="d-status">Show</label>
         <select id="d-status">
           <option value="all">Everything</option>
@@ -105,12 +111,20 @@
       <div id="download-summary" class="muted"></div>
     </div>
 
+    <!-- Every column carries a width, because the table is laid out `fixed`.
+         See the note above `.table` in style.css for why. -->
     <div class="table-scroll">
       <table id="downloads-table" class="table">
         <thead>
           <tr>
-            <th>Track</th><th>Album</th><th class="num">Match</th>
-            <th>Status</th><th>File</th><th>Audio</th><th class="num">Size</th><th></th>
+            <th data-sort="track"  aria-sort="none"><button type="button" class="th-sort">Track</button></th>
+            <th data-sort="album"  aria-sort="none"><button type="button" class="th-sort">Album</button></th>
+            <th data-sort="match"  aria-sort="none" class="num"><button type="button" class="th-sort">Match</button></th>
+            <th data-sort="status" aria-sort="none"><button type="button" class="th-sort">Status</button></th>
+            <th data-sort="file"   aria-sort="none"><button type="button" class="th-sort">File</button></th>
+            <th data-sort="audio"  aria-sort="none"><button type="button" class="th-sort">Audio</button></th>
+            <th data-sort="size"   aria-sort="none" class="num"><button type="button" class="th-sort">Size</button></th>
+            <th class="th-plain"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -238,6 +252,26 @@
   </section>
 
 </main>
+
+<!-- Replaces window.confirm() for the two destructive questions the UI asks.
+     A native dialog cannot say which track it is about, cannot offer the
+     "delete the file too" choice alongside the question, and looks like a
+     browser warning rather than part of the app. -->
+<div id="modal" class="modal" hidden>
+  <div id="modal-backdrop" class="modal-backdrop"></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title"></h2>
+    <p id="modal-body"></p>
+    <label id="modal-option" class="modal-option" hidden>
+      <input type="checkbox" id="modal-checkbox">
+      <span id="modal-checkbox-label"></span>
+    </label>
+    <div class="modal-actions">
+      <button type="button" id="modal-cancel" class="btn">Cancel</button>
+      <button type="button" id="modal-confirm" class="btn btn-primary">Confirm</button>
+    </div>
+  </div>
+</div>
 
 <div id="toast" class="toast" hidden></div>
 <script src="/app.js"></script>

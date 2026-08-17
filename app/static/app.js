@@ -18,6 +18,12 @@ const state = {
   sort: 'match',
   tag: '',
   downloadStatus: 'all',
+  // The rows the server last sent, kept so searching and re-sorting the
+  // downloads table are instant and do not cost a request.
+  downloadRows: [],
+  downloadActive: new Map(),
+  downloadSearch: '',
+  downloadSort: { key: 'newest', dir: 'desc' },
   days: 90,
   settings: {},
   scanning: false,
@@ -27,6 +33,19 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+
+const reducedMotion = () =>
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/** Stagger a freshly rendered list in. Capped, so a 200-row table does not
+ *  spend four seconds arriving. */
+function animateIn(elements) {
+  if (reducedMotion()) return;
+  elements.forEach((element, index) => {
+    element.style.animationDelay = `${Math.min(index, 14) * 16}ms`;
+    element.classList.add('is-entering');
+  });
+}
 
 // ─── API ────────────────────────────────────────────────────────────────
 
@@ -46,7 +65,101 @@ function toast(message, isError = false) {
   element.classList.toggle('bad', isError);
   element.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => { element.hidden = true; }, 4000);
+  clearTimeout(toast.hideTimer);
+  // Unhiding and adding the class in the same frame would skip the transition,
+  // because the element has no rendered "before" state to move from.
+  requestAnimationFrame(() => element.classList.add('is-on'));
+  toast.timer = setTimeout(() => {
+    element.classList.remove('is-on');
+    toast.hideTimer = setTimeout(() => { element.hidden = true; }, 220);
+  }, 4000);
+}
+
+// ─── Confirmation dialog ────────────────────────────────────────────────
+
+/**
+ * The in-app stand-in for window.confirm(). Resolves to
+ * `{ ok, checked }` — `checked` is the state of the optional extra choice,
+ * which is how the delete dialog asks about the file on disk in the same
+ * breath as asking about the row.
+ */
+function ask({ title, body, confirm = 'Confirm', danger = false, option = '' }) {
+  const modal = $('#modal');
+  const confirmButton = $('#modal-confirm');
+  const checkbox = $('#modal-checkbox');
+  const opener = document.activeElement;
+
+  $('#modal-title').textContent = title;
+  $('#modal-body').textContent = body;
+  confirmButton.textContent = confirm;
+  confirmButton.classList.toggle('btn-danger', danger);
+  confirmButton.classList.toggle('btn-primary', !danger);
+  $('#modal-option').hidden = !option;
+  $('#modal-checkbox-label').textContent = option;
+  checkbox.checked = false;
+
+  // A dialog opened while the previous one is still fading out would otherwise
+  // be hidden by that one's pending timer.
+  clearTimeout(ask.timer);
+  modal.hidden = false;
+  requestAnimationFrame(() => modal.classList.add('is-on'));
+  confirmButton.focus();
+
+  return new Promise((resolve) => {
+    const focusable = () =>
+      Array.from(modal.querySelectorAll('button, input'))
+        .filter((element) => element.offsetParent !== null);
+
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(false);
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      // Tab must not walk out of a modal dialog and into the page behind it.
+      const items = focusable();
+      const edge = event.shiftKey ? items[0] : items[items.length - 1];
+      if (document.activeElement === edge) {
+        event.preventDefault();
+        (event.shiftKey ? items[items.length - 1] : items[0]).focus();
+      }
+    };
+
+    const close = (ok) => {
+      modal.classList.remove('is-on');
+      modal.removeEventListener('keydown', onKey);
+      ask.timer = setTimeout(() => { modal.hidden = true; }, 180);
+      if (opener && opener.isConnected) opener.focus();
+      resolve({ ok, checked: checkbox.checked });
+    };
+
+    modal.addEventListener('keydown', onKey);
+    $('#modal-cancel').onclick = () => close(false);
+    $('#modal-backdrop').onclick = () => close(false);
+    confirmButton.onclick = () => close(true);
+  });
+}
+
+/** Musicdrome is usually served over plain HTTP on a LAN, where the async
+ *  clipboard API is unavailable. Fall back to the old selection trick. */
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch { /* fall through */ }
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+  document.body.appendChild(area);
+  area.select();
+  let copied = false;
+  try { copied = document.execCommand('copy'); } catch { copied = false; }
+  area.remove();
+  return copied;
 }
 
 // ─── Formatting ─────────────────────────────────────────────────────────
@@ -147,6 +260,7 @@ function renderCards(cards) {
 
   empty.hidden = true;
   container.innerHTML = cards.map(cardHtml).join('');
+  animateIn(Array.from(container.children));
   container.querySelectorAll('[data-action]').forEach((button) => {
     button.onclick = () => act(button.dataset.id, button.dataset.action, button);
   });
@@ -233,15 +347,41 @@ async function act(id, action, button) {
 
 // ─── Downloads ──────────────────────────────────────────────────────────
 
-async function loadDownloads() {
+const basename = (path) => String(path || '').split('/').pop();
+
+// What each sortable column sorts by. Everything is reduced to a string or a
+// number here so one comparator can handle the lot.
+const SORT_KEYS = {
+  newest: (row) => row.created_at || 0,
+  track: (row) => `${row.artist} ${row.title}`.toLowerCase(),
+  album: (row) => (row.album || '').toLowerCase(),
+  match: (row) => (row.match == null ? -1 : row.match),
+  // Ordered by what wants attention rather than alphabetically: in flight,
+  // then waiting, then broken, then finished and forgettable.
+  status: (row) => {
+    const rank = ['downloading', 'queued', 'failed', 'done'].indexOf(row.status);
+    return rank < 0 ? 9 : rank;
+  },
+  file: (row) => basename(row.path).toLowerCase(),
+  audio: (row) => `${row.source_codec || ''} ${String(row.source_abr || 0).padStart(4, '0')}`,
+  size: (row) => row.bytes || 0,
+};
+
+// Which way round a column reads first: names from the top, quantities from
+// the largest.
+const SORT_DIR = {
+  newest: 'desc', track: 'asc', album: 'asc', status: 'asc',
+  file: 'asc', audio: 'asc', match: 'desc', size: 'desc',
+};
+
+async function loadDownloads({ animate = true } = {}) {
+  if (!state.downloadRows.length) showDownloadSkeleton();
+
   const data = await api(
     `/downloads?${new URLSearchParams({ status: state.downloadStatus })}`);
-  const active = new Map(data.active.map((item) => [item.id, item]));
-  const body = $('#downloads-table tbody');
-  const empty = $('#downloads-empty');
 
-  $('#downloads-table').hidden = !data.downloads.length;
-  empty.hidden = data.downloads.length > 0;
+  state.downloadRows = data.downloads;
+  state.downloadActive = new Map(data.active.map((item) => [item.id, item]));
 
   const done = data.downloads.filter((row) => row.status === 'done');
   const failed = data.downloads.filter((row) => row.status === 'failed');
@@ -252,46 +392,178 @@ async function loadDownloads() {
     + (data.active.length ? ` · ${data.active.length} in flight` : '');
   $('#retry-failed').hidden = failed.length === 0;
 
-  body.innerHTML = data.downloads.map((row) => {
-    const live = active.get(row.id);
-    const status = live
-      ? `<span class="pill ${row.status}">${row.status}</span>
-         <div class="progress"><i style="width:${live.progress}%"></i></div>`
-      : `<span class="pill ${row.status}">${row.status}</span>`;
+  renderDownloads({ animate });
+  if (data.active.length) startFastPoll();
+}
 
-    return `
-      <tr>
-        <td><strong>${escapeHtml(row.title)}</strong><br><span class="muted">${escapeHtml(row.artist)}</span></td>
-        <td>${escapeHtml(row.album || '—')}</td>
-        <td class="num">${row.match != null ? `${row.match}%` : '—'}</td>
-        <td>${status}${row.error ? `<div class="card-error">${escapeHtml(row.error)}</div>` : ''}</td>
-        <td class="path" title="${escapeHtml(row.path)}">${escapeHtml(row.path || '—')}</td>
-        <td class="audio">${audio(row)}</td>
-        <td class="num">${bytes(row.bytes)}</td>
-        <td>
-          ${row.status === 'failed' ? `<button class="btn btn-icon" data-retry="${row.id}" title="Try again">↻</button>` : ''}
-          <button class="btn btn-icon" data-remove="${row.id}" title="Remove">🗑</button>
-        </td>
-      </tr>`;
-  }).join('');
+/** Filter, sort and draw from what the last request returned. Called without a
+ *  request when the search box or a column heading changes. */
+function renderDownloads({ animate = true } = {}) {
+  const body = $('#downloads-table tbody');
+  const empty = $('#downloads-empty');
+  const needle = state.downloadSearch.trim().toLowerCase();
+
+  const matching = needle
+    ? state.downloadRows.filter((row) =>
+      `${row.title} ${row.artist} ${row.album} ${row.path} ${row.status}`
+        .toLowerCase().includes(needle))
+    : state.downloadRows;
+
+  const rows = sortDownloads(matching);
+
+  $('.table-scroll').hidden = rows.length === 0;
+  empty.hidden = rows.length > 0;
+  if (!rows.length) {
+    empty.textContent = state.downloadRows.length
+      ? `Nothing matches “${state.downloadSearch.trim()}”.`
+      : 'Nothing downloaded yet.';
+  }
+
+  $$('#downloads-table th[data-sort]').forEach((th) => {
+    th.setAttribute('aria-sort', th.dataset.sort === state.downloadSort.key
+      ? (state.downloadSort.dir === 'asc' ? 'ascending' : 'descending')
+      : 'none');
+  });
+
+  body.innerHTML = rows.map(downloadRowHtml).join('');
+  if (animate) animateIn(Array.from(body.children));
+  wireDownloadRows(body);
+}
+
+function sortDownloads(rows) {
+  const pick = SORT_KEYS[state.downloadSort.key] || SORT_KEYS.newest;
+  const sign = state.downloadSort.dir === 'asc' ? 1 : -1;
+  // Decorated so equal keys keep the server's own newest-first order rather
+  // than shuffling between renders.
+  return rows
+    .map((row, index) => ({ row, index, key: pick(row) }))
+    .sort((a, b) => {
+      if (a.key < b.key) return -sign;
+      if (a.key > b.key) return sign;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.row);
+}
+
+function sortDownloadsBy(key) {
+  const current = state.downloadSort;
+  state.downloadSort = current.key === key
+    ? { key, dir: current.dir === 'asc' ? 'desc' : 'asc' }
+    : { key, dir: SORT_DIR[key] || 'asc' };
+  renderDownloads();
+}
+
+// Marks a cell as having nothing to say, so the stacked layout can leave it
+// out rather than print a labelled em-dash.
+const blank = (isBlank) => (isBlank ? ' data-empty="1"' : '');
+
+function downloadRowHtml(row) {
+  const live = state.downloadActive.get(row.id);
+  const album = row.album || '—';
+  const status = `<span class="pill ${row.status}">${row.status}</span>`
+    + (live ? `<div class="progress"><i style="width:${live.progress}%"></i></div>` : '')
+    + (row.error
+      ? `<div class="card-error" title="${escapeHtml(row.error)}">${escapeHtml(row.error)}</div>`
+      : '');
+
+  const file = row.path
+    ? `<button type="button" class="path" data-copy="${escapeHtml(row.path)}"
+               title="${escapeHtml(row.path)}">${escapeHtml(basename(row.path))}</button>`
+    : '<span class="muted">—</span>';
+
+  // The fold only earns its line when there is something in it: a failed
+  // download has no codec, and a second em-dash under the first says nothing.
+  const foldAudio = row.source_codec ? `<div class="fold fold-audio">${audio(row)}</div>` : '';
+  const foldAlbum = row.album ? `<div class="fold fold-album">${escapeHtml(row.album)}</div>` : '';
+
+  return `
+    <tr data-id="${row.id}">
+      <td class="cell-track" data-label="Track">
+        <div class="t-title" title="${escapeHtml(row.title)}">${escapeHtml(row.title)}</div>
+        <div class="t-artist" title="${escapeHtml(row.artist)}">${escapeHtml(row.artist)}</div>
+        ${foldAlbum}
+      </td>
+      <td class="cell-album" data-label="Album"${blank(!row.album)}
+          title="${escapeHtml(album)}">${escapeHtml(album)}</td>
+      <td class="num" data-label="Match"${blank(row.match == null)}>${
+        row.match != null ? `${row.match}%` : '—'}</td>
+      <td class="cell-status" data-label="Status">${status}</td>
+      <td class="cell-file" data-label="File"${blank(!row.path)}>${file}${foldAudio}</td>
+      <td class="audio" data-label="Audio"${blank(!row.source_codec)}>${audio(row)}</td>
+      <td class="num" data-label="Size"${blank(!row.bytes)}>${bytes(row.bytes)}</td>
+      <td class="cell-actions" data-label="">
+        ${row.status === 'failed'
+          ? `<button class="btn btn-icon" data-retry="${row.id}" title="Try again">↻</button>`
+          : ''}
+        <button class="btn btn-icon" data-remove="${row.id}" title="Remove">🗑</button>
+      </td>
+    </tr>`;
+}
+
+function wireDownloadRows(body) {
+  body.querySelectorAll('[data-copy]').forEach((button) => {
+    button.onclick = async () => {
+      const copied = await copyText(button.dataset.copy);
+      toast(copied ? 'Path copied' : button.dataset.copy, !copied);
+    };
+  });
 
   body.querySelectorAll('[data-retry]').forEach((button) => {
     button.onclick = async () => {
-      await api(`/downloads/${button.dataset.retry}/retry`, { method: 'POST' });
-      startFastPoll();
-      loadDownloads();
+      try {
+        await api(`/downloads/${button.dataset.retry}/retry`, { method: 'POST' });
+        startFastPoll();
+        loadDownloads();
+      } catch (error) {
+        toast(error.message, true);
+      }
     };
   });
 
   body.querySelectorAll('[data-remove]').forEach((button) => {
     button.onclick = async () => {
-      const alsoFile = confirm('Delete the downloaded file from disk as well?');
-      await api(`/downloads/${button.dataset.remove}?delete_file=${alsoFile}`, { method: 'DELETE' });
-      loadDownloads();
+      const id = Number(button.dataset.remove);
+      const row = state.downloadRows.find((item) => item.id === id);
+      const answer = await ask({
+        title: 'Remove this download?',
+        body: row
+          ? `${row.artist} — ${row.title} will be taken off the list.`
+          : 'This download will be taken off the list.',
+        // Only worth asking about when there is a file to delete.
+        option: row && row.path ? 'Also delete the file from disk' : '',
+        confirm: 'Remove',
+        danger: true,
+      });
+      if (!answer.ok) return;
+
+      try {
+        await api(`/downloads/${id}?delete_file=${answer.checked}`, { method: 'DELETE' });
+        toast(answer.checked ? 'Removed, and deleted from disk' : 'Removed from the list');
+        loadDownloads();
+      } catch (error) {
+        toast(error.message, true);
+      }
     };
   });
+}
 
-  if (data.active.length) startFastPoll();
+/** Something to look at for the width of one request, so switching to the tab
+ *  does not flash an empty frame first. */
+function showDownloadSkeleton(count = 6) {
+  $('.table-scroll').hidden = false;
+  $('#downloads-empty').hidden = true;
+  $('#downloads-table tbody').innerHTML = Array.from({ length: count }, () => `
+    <tr class="skeleton-row" aria-hidden="true">
+      <td><div class="skeleton skeleton-line" style="width:70%"></div>
+          <div class="skeleton skeleton-line" style="width:40%;margin-top:.35rem"></div></td>
+      <td><div class="skeleton skeleton-line" style="width:80%"></div></td>
+      <td><div class="skeleton skeleton-line" style="width:60%"></div></td>
+      <td><div class="skeleton skeleton-line" style="width:50%"></div></td>
+      <td><div class="skeleton skeleton-line" style="width:85%"></div></td>
+      <td><div class="skeleton skeleton-line" style="width:70%"></div></td>
+      <td><div class="skeleton skeleton-line" style="width:55%"></div></td>
+      <td><div class="skeleton skeleton-line" style="width:60%"></div></td>
+    </tr>`).join('');
 }
 
 // ─── Stats ──────────────────────────────────────────────────────────────
@@ -513,7 +785,9 @@ function startFastPoll() {
   if (state.fastPoll) return;
   state.fastPoll = setInterval(async () => {
     const { active } = await api('/downloads/active').catch(() => ({ active: [] }));
-    if (state.tab === 'downloads') loadDownloads();
+    // Without `animate: false` the whole table would re-enter every two
+    // seconds for as long as anything is downloading.
+    if (state.tab === 'downloads') loadDownloads({ animate: false });
     if (!active.length) {
       clearInterval(state.fastPoll);
       state.fastPoll = null;
@@ -558,17 +832,45 @@ function init() {
   $('#f-match').onchange = (event) => { state.minMatch = Number(event.target.value); loadDiscover(); };
 
   $('#download-visible').onclick = async () => {
-    if (!confirm(`Queue every new track at ${state.minMatch}% or above?`)) return;
-    const data = await api('/suggestions/download-all', {
-      method: 'POST',
-      body: JSON.stringify({ min_match: state.minMatch }),
+    const answer = await ask({
+      title: 'Download everything shown?',
+      body: `Every new suggestion matching ${state.minMatch}% or better will be `
+        + 'queued for download.',
+      confirm: 'Queue them',
     });
-    toast(`Queued ${data.queued} downloads`);
-    startFastPoll();
-    loadDiscover();
+    if (!answer.ok) return;
+
+    try {
+      const data = await api('/suggestions/download-all', {
+        method: 'POST',
+        body: JSON.stringify({ min_match: state.minMatch }),
+      });
+      toast(`Queued ${data.queued} downloads`);
+      startFastPoll();
+      loadDiscover();
+    } catch (error) {
+      toast(error.message, true);
+    }
   };
 
-  $('#d-status').onchange = (event) => { state.downloadStatus = event.target.value; loadDownloads(); };
+  $('#d-status').onchange = (event) => {
+    state.downloadStatus = event.target.value;
+    // A different server-side filter is a different set of rows, so the cached
+    // ones must not be reused as the skeleton's stand-in.
+    state.downloadRows = [];
+    loadDownloads();
+  };
+
+  // Searching and sorting work on rows already in hand — no request, so the
+  // table can keep up with typing.
+  $('#d-search').oninput = (event) => {
+    state.downloadSearch = event.target.value;
+    renderDownloads({ animate: false });
+  };
+
+  $$('#downloads-table th[data-sort]').forEach((th) => {
+    th.querySelector('.th-sort').onclick = () => sortDownloadsBy(th.dataset.sort);
+  });
 
   $('#paste-form').onsubmit = async (event) => {
     event.preventDefault();
@@ -610,9 +912,24 @@ function init() {
     input.onchange = () => saveSetting(input);
   });
 
+  measureTopbar();
+  // The bar changes height on its own: it wraps to two lines on a narrow
+  // window, and the scan label swaps short messages for long ones.
+  if (window.ResizeObserver) new ResizeObserver(measureTopbar).observe($('.topbar'));
+  else window.addEventListener('resize', measureTopbar);
+
   refreshStatus();
   showTab('discover');
   setStatusPoll();
+}
+
+/** The table header pins itself below the top bar, which is sticky and whose
+ *  height changes when it wraps to a second line on a narrow window. */
+function measureTopbar() {
+  const bar = $('.topbar');
+  if (!bar) return;
+  document.documentElement.style.setProperty(
+    '--topbar-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
 }
 
 document.addEventListener('DOMContentLoaded', init);

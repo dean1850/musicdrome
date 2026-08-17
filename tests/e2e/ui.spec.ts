@@ -128,6 +128,163 @@ test('retry all failed is hidden until something has failed', async ({ page }) =
   await expect(page.locator('#retry-failed')).toBeHidden();
 });
 
+/**
+ * The downloads table is laid out `fixed` precisely so that one row cannot
+ * decide how wide it is. The seed carries a DJ mix whose title and artist run
+ * to ~130 characters each; under the browser default of `auto` that row alone
+ * stretched the table to 2583px and pushed six of the eight columns off-screen
+ * at every viewport size. Widths are asserted at four, because the columns are
+ * folded away by media query as the window narrows and each band has to add up
+ * on its own.
+ */
+for (const width of [1440, 1280, 1024, 900]) {
+  test(`the downloads table fits a ${width}px window`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto('/');
+    await page.locator('.tab[data-tab="downloads"]').click();
+    await expect(page.locator('#downloads-table tbody tr').first()).toBeVisible();
+
+    const fit = await page.evaluate(() => {
+      const frame = document.querySelector('.table-scroll')!;
+      return {
+        overflows: frame.scrollWidth > frame.clientWidth,
+        page: document.documentElement.scrollWidth > window.innerWidth,
+        // Nothing may be clipped horizontally inside a cell either, except the
+        // values deliberately truncated with an ellipsis.
+        tallest: Math.max(...[...document.querySelectorAll('#downloads-table tbody tr')]
+          .map((row) => row.getBoundingClientRect().height)),
+      };
+    });
+
+    expect(fit.overflows).toBe(false);
+    expect(fit.page).toBe(false);
+    // A row is two lines of title over one of artist, not a wall of text.
+    expect(fit.tallest).toBeLessThan(130);
+  });
+}
+
+test('the long title is clamped but still readable in full on hover', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+
+  const title = page.locator('#downloads-table .t-title', { hasText: 'Tropical House' });
+  await expect(title).toHaveAttribute('title', /Perfect Strangers$/);
+  // Clamped to two lines: the full text needs more room than the cell gives it.
+  expect(await title.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+});
+
+test('the file column shows the filename and copies the path', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+
+  const file = page.locator('#downloads-table tr', { hasText: 'Breathe' })
+    .locator('.path').first();
+  await expect(file).toHaveText('Breathe.opus');
+  await expect(file).toHaveAttribute('title', '/music/Tinlicker/Breathe/Breathe.opus');
+});
+
+const SEEDED_DOWNLOADS = 8;
+
+test('searching narrows the table without a request', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+
+  await page.locator('#d-search').fill('tinlicker');
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(1);
+  await expect(page.locator('#downloads-table tbody tr')).toContainText('Breathe');
+
+  // The path is searchable too, which is the only way to find a track by where
+  // it landed.
+  await page.locator('#d-search').fill('/Singles/');
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(2);
+
+  await page.locator('#d-search').fill('nothing at all matches this');
+  await expect(page.locator('.table-scroll')).toBeHidden();
+  await expect(page.locator('#downloads-empty')).toContainText('Nothing matches');
+
+  await page.locator('#d-search').fill('');
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+});
+
+test('a column heading sorts the table and says which way', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+
+  const heading = page.locator('#downloads-table th[data-sort="size"]');
+  const megabytes = async () =>
+    (await page.locator('#downloads-table td[data-label="Size"]').allTextContents())
+      .map(parseFloat);
+
+  await heading.locator('.th-sort').click();
+  await expect(heading).toHaveAttribute('aria-sort', 'descending');
+  const descending = await megabytes();
+  expect(descending).toHaveLength(SEEDED_DOWNLOADS);
+  expect(descending).toEqual([...descending].sort((a, b) => b - a));
+
+  // Clicking the same heading again reverses it rather than re-sorting.
+  await heading.locator('.th-sort').click();
+  await expect(heading).toHaveAttribute('aria-sort', 'ascending');
+  expect(await megabytes()).toEqual(descending.slice().reverse());
+
+  // A different heading takes over, and the old one stops claiming the sort.
+  await page.locator('#downloads-table th[data-sort="track"] .th-sort').click();
+  await expect(heading).toHaveAttribute('aria-sort', 'none');
+  await expect(page.locator('#downloads-table th[data-sort="track"]'))
+    .toHaveAttribute('aria-sort', 'ascending');
+});
+
+test('removing a download asks in the page, names the track, and can be cancelled',
+  async ({ page }) => {
+    await page.goto('/');
+    await page.locator('.tab[data-tab="downloads"]').click();
+
+    const row = page.locator('#downloads-table tr', { hasText: 'Breathe' }).first();
+    await row.locator('[data-remove]').click();
+
+    // An in-page dialog, not window.confirm(): it can name the track and ask
+    // about the file on disk in the same breath.
+    await expect(page.locator('#modal-title')).toHaveText('Remove this download?');
+    await expect(page.locator('#modal-body')).toContainText('Tinlicker — Breathe');
+    await expect(page.locator('#modal-option')).toBeVisible();
+    await expect(page.locator('#modal-checkbox')).not.toBeChecked();
+
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#modal')).toBeHidden();
+    await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+
+    await row.locator('[data-remove]').click();
+    await page.locator('#modal-confirm').click();
+    await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS - 1);
+    await expect(page.locator('#toast')).toContainText('Removed from the list');
+  });
+
+test('the column headings pin under the top bar when the list is scrolled',
+  async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 500 });
+    await page.goto('/');
+    await page.locator('.tab[data-tab="downloads"]').click();
+    await expect(page.locator('#downloads-table tbody tr').first()).toBeVisible();
+
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await page.waitForTimeout(300);
+
+    const pinned = await page.evaluate(() => {
+      const heading = document.querySelector('#downloads-table thead th')!;
+      const bar = document.querySelector('.topbar')!;
+      return {
+        scrolled: window.scrollY,
+        heading: heading.getBoundingClientRect().top,
+        bar: bar.getBoundingClientRect().bottom,
+      };
+    });
+
+    // The page has to have moved far enough for the question to mean anything.
+    expect(pinned.scrolled).toBeGreaterThan(200);
+    // Flush against the bar: still on screen, and not hidden behind it.
+    expect(Math.abs(pinned.heading - pinned.bar)).toBeLessThan(2);
+  });
+
 test('the scan progress bar appears only while a scan runs', async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('#scan-progress')).toBeHidden();
