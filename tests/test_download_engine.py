@@ -6,6 +6,7 @@ and both fail with messages that name neither yt-dlp nor the real cause.
 """
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1000,15 +1001,33 @@ def test_a_bot_checked_download_is_explained_and_holds_the_queue(suggestion, mon
 
 FRESH = time.time() + 86_400
 
+# What yt-dlp actually looks for before it will treat a jar as an account —
+# see download._AUTH_COOKIE and download._SESSION_COOKIES. Named here so a
+# test that means "signed in" says so, rather than listing cookie names.
+SIGNED_IN = ("LOGIN_INFO", "__Secure-3PAPISID")
 
-def cookie_file(path, *, domain=".youtube.com", expiry=None, name="SID"):
-    """Write a Netscape cookie file and return it."""
+
+def cookie_file(path, *, domain=".youtube.com", expiry=None, name="SID", names=()):
+    """Write a Netscape cookie file and return it.
+
+    Deliberately *not* signed in by default: a jar of session cookies with no
+    LOGIN_INFO in it is what most of these tests are about, and it is what a
+    browser extension pointed at a signed-out tab produces.
+    """
     expiry = FRESH if expiry is None else expiry
     path.write_text(
         "# Netscape HTTP Cookie File\n"
-        f"{domain}\tTRUE\t/\tTRUE\t{int(expiry)}\t{name}\tvalue\n"
+        + "".join(
+            f"{domain}\tTRUE\t/\tTRUE\t{int(expiry)}\t{each}\tvalue\n"
+            for each in (names or (name,))
+        )
     )
     return path
+
+
+def signed_in_file(path, *, domain=".youtube.com", expiry=None, names=SIGNED_IN):
+    """A cookie file yt-dlp will draw an identity from."""
+    return cookie_file(path, domain=domain, expiry=expiry, names=names)
 
 
 @pytest.fixture(autouse=True)
@@ -1017,6 +1036,12 @@ def no_cookie_state():
     yield
     download._cookie_jar = None
     download._cookie_stamp = None
+    # Both counters, together. _wait_out_cooldown compares one against the
+    # other, so clearing the jar and leaving the generations where a previous
+    # test left them makes "have the cookies changed?" answer from the wrong
+    # baseline in whichever test runs next.
+    download._cookie_generation = 0
+    download._hold_generation = 0
 
 
 def test_no_cookie_file_is_not_a_problem(monkeypatch):
@@ -1213,11 +1238,13 @@ def test_cookies_that_arrive_where_there_were_none_end_the_pause(tmp_path, monke
 
 
 def test_the_boot_line_says_where_the_cookies_came_from(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt")))
+    path = signed_in_file(tmp_path / "c.txt")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
 
     status = download.cookies_status()
-    assert "1 youtube.com cookies" in status
-    assert str(tmp_path / "c.txt") in status
+    assert "signed in" in status
+    assert "2 youtube.com cookies" in status
+    assert str(path) in status
 
 
 def test_the_boot_line_says_what_to_do_when_there_are_none(monkeypatch):
@@ -1387,3 +1414,429 @@ def test_a_track_called_forbidden_is_not_mistaken_for_a_refusal():
     assert not download.is_forbidden(
         "ERROR: Requested format is not available: Forbidden Fruit (Official Video)"
     )
+
+
+# ─── Cookies that are read and still sign nothing in ───────────────────────
+#
+# The failure this whole section exists for: a cookie file that mounts, parses,
+# and is handed to yt-dlp on every request, which yt-dlp then draws no identity
+# from. It extracts anonymously instead — no warning, no refusal — and lands on
+# the clients YouTube puts the bot check in front of. So the download fails
+# with a message asking for cookies, to somebody who has had cookies mounted
+# for a week. Every check here is the difference between naming that and
+# sending them round the same loop again.
+
+
+def test_a_signed_in_export_is_recognised(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(signed_in_file(tmp_path / "c.txt")))
+    assert download.signed_in_problem() == ""
+    assert download.is_signed_in()
+
+
+def test_sapisid_alone_does_not_sign_a_session_in(tmp_path, monkeypatch):
+    """The session-id cookies sign the request; LOGIN_INFO is what says it lives."""
+    path = cookie_file(tmp_path / "c.txt", names=("SAPISID", "__Secure-1PAPISID", "YSC"))
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    problem = download.signed_in_problem()
+    assert "LOGIN_INFO" in problem
+    assert not download.is_signed_in()
+
+
+def test_login_info_alone_does_not_sign_a_session_in(tmp_path, monkeypatch):
+    path = cookie_file(tmp_path / "c.txt", names=("LOGIN_INFO", "YSC", "VISITOR_INFO1_LIVE"))
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    problem = download.signed_in_problem()
+    assert "SAPISID" in problem
+    assert not download.is_signed_in()
+
+
+def test_google_com_auth_cookies_do_not_sign_youtube_in(tmp_path, monkeypatch):
+    """The sharp edge, and the reason the domain test is not a substring match.
+
+    SAPISID is set on google.com as well as youtube.com, so a Google export
+    carries something that looks exactly like the cookie yt-dlp wants. It reads
+    the jar for www.youtube.com, where a google.com cookie is simply not
+    present — and LOGIN_INFO is never on google.com at all.
+    """
+    path = cookie_file(tmp_path / "c.txt", domain=".google.com", names=SIGNED_IN)
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert not download.is_signed_in()
+    assert "LOGIN_INFO" in download.signed_in_problem()
+
+
+def test_an_expired_login_info_signs_nothing_in(tmp_path, monkeypatch):
+    """Not caught by the expiry check above: the rest of the jar is still live."""
+    path = tmp_path / "c.txt"
+    path.write_text(
+        "# Netscape HTTP Cookie File\n"
+        f".youtube.com\tTRUE\t/\tTRUE\t{int(time.time() - 3600)}\tLOGIN_INFO\tvalue\n"
+        f".youtube.com\tTRUE\t/\tTRUE\t{int(FRESH)}\t__Secure-3PAPISID\tvalue\n"
+    )
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert download.cookies_problem() == "", "some cookies are live, so the file is usable"
+    assert "LOGIN_INFO" in download.signed_in_problem()
+
+
+def test_httponly_login_info_still_counts(tmp_path, monkeypatch):
+    """Browsers export LOGIN_INFO with the #HttpOnly_ prefix, and it is not a comment."""
+    path = tmp_path / "c.txt"
+    path.write_text(
+        "# Netscape HTTP Cookie File\n"
+        f"#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t{int(FRESH)}\tLOGIN_INFO\tvalue\n"
+        f".youtube.com\tTRUE\t/\tTRUE\t{int(FRESH)}\t__Secure-3PAPISID\tvalue\n"
+    )
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert download.signed_in_problem() == ""
+
+
+def test_a_file_that_cannot_be_used_at_all_is_left_to_the_other_check(tmp_path, monkeypatch):
+    """One problem, said once. Two diagnoses for one missing file help nobody."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(tmp_path / "missing.txt"))
+
+    assert download.cookies_problem() != ""
+    assert download.signed_in_problem() == ""
+
+
+def test_no_cookie_file_is_not_a_signed_out_export(monkeypatch):
+    monkeypatch.setattr(config, "cookies_file", lambda: None)
+    assert download.signed_in_problem() == ""
+    assert not download.is_signed_in()
+
+
+def test_the_boot_line_separates_signed_out_from_missing(tmp_path, monkeypatch):
+    """"Not in use" would send somebody to check a mount that is working fine."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt")))
+
+    status = download.cookies_status()
+    assert "signed out" in status
+    assert "LOGIN_INFO" in status
+    assert "not in use" not in status
+
+
+# ─── What the bot check tells you to do about it ───────────────────────────
+
+
+def test_the_bot_check_names_the_missing_cookie_when_a_file_is_mounted(tmp_path, monkeypatch):
+    """The regression that matters: do not ask for a file that is already there."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt")))
+
+    message = download.explain_bot_check("ERROR: [youtube] abc: Sign in to confirm you’re not a bot")
+    assert "LOGIN_INFO" in message
+    assert "signed out" in message
+    assert "put a Netscape cookies.txt" not in message
+
+
+def test_the_bot_check_points_at_the_exit_address_when_the_cookies_are_good(tmp_path, monkeypatch):
+    """Signed in and still challenged means the identity is not what is wrong."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(signed_in_file(tmp_path / "c.txt")))
+
+    message = download.explain_bot_check("Sign in to confirm you’re not a bot")
+    assert "VPN" in message or "exit address" in message
+    assert "YTDLP_PO_TOKEN" in message
+    assert "LOGIN_INFO" not in message
+
+
+def test_the_bot_check_still_asks_for_a_file_when_there_is_none(monkeypatch):
+    monkeypatch.setattr(config, "cookies_file", lambda: None)
+
+    message = download.explain_bot_check("Sign in to confirm you’re not a bot")
+    assert "cookies.txt" in message
+
+
+def test_the_bot_check_message_still_fits_the_downloads_column(tmp_path, monkeypatch):
+    """The row is truncated at 500 characters and the advice is at the end of it."""
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(cookie_file(tmp_path / "c.txt")))
+
+    message = download.explain_bot_check("Sign in to confirm you’re not a bot. " + "x" * 4000)
+    assert len(message) <= 500
+    # And it is yt-dlp's boilerplate that gave way, not the half worth reading.
+    assert message.endswith("they resume on their own.")
+    assert "LOGIN_INFO" in message
+
+
+# ─── The shared cookie jar, and the workers that used to shred it ──────────
+#
+# yt-dlp rewrites `cookiefile` when it closes, by truncating the file and
+# writing it out again — no lock, no temporary file, no atomic rename. One
+# caller is fine. Two download workers finishing together are not: the jar can
+# end up holding part of one write, and the part that goes missing takes
+# LOGIN_INFO with it. Nothing says so; every download after it extracts signed
+# out, and it presents as cookies that worked for a while and then stopped.
+
+
+def shared_jar(tmp_path, monkeypatch, *, signed_in=True):
+    """A working jar and an options dict pointing at it, as _ydl_options builds."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "TMP_DIR", tmp_path / "tmp")
+    jar = tmp_path / ".cookies-active.txt"
+    (signed_in_file if signed_in else cookie_file)(jar)
+    return jar, {"cookiefile": str(jar)}
+
+
+def test_each_call_downloads_against_its_own_copy(tmp_path, monkeypatch):
+    jar, options = shared_jar(tmp_path, monkeypatch)
+
+    with download._private_jar(options):
+        used = Path(options["cookiefile"])
+        assert used != jar, "a shared jar is what two workers corrupt"
+        assert used.read_text() == jar.read_text()
+
+
+def test_the_options_dict_gets_its_shared_path_back(tmp_path, monkeypatch):
+    """_extract_with_retry reuses the dict; a stale private path breaks attempt two."""
+    jar, options = shared_jar(tmp_path, monkeypatch)
+
+    with download._private_jar(options):
+        pass
+
+    assert options["cookiefile"] == str(jar)
+
+
+def test_a_rotated_jar_is_folded_back_over_the_shared_one(tmp_path, monkeypatch):
+    """Rotation is the reason yt-dlp is given a writable file at all."""
+    jar, options = shared_jar(tmp_path, monkeypatch)
+
+    with download._private_jar(options):
+        signed_in_file(Path(options["cookiefile"]), names=(*SIGNED_IN, "ROTATED"))
+
+    assert "ROTATED" in jar.read_text()
+
+
+def test_a_jar_that_comes_back_signed_out_is_not_folded_back(tmp_path, monkeypatch):
+    """A write that lost the account cookies is the failure, not the new truth."""
+    jar, options = shared_jar(tmp_path, monkeypatch)
+    before = jar.read_text()
+
+    with download._private_jar(options):
+        cookie_file(Path(options["cookiefile"]), names=("YSC",))
+
+    assert jar.read_text() == before
+
+
+def test_a_truncated_jar_is_not_folded_back(tmp_path, monkeypatch):
+    """The exact shape of the race: an empty file where a jar used to be."""
+    jar, options = shared_jar(tmp_path, monkeypatch)
+    before = jar.read_text()
+
+    with download._private_jar(options):
+        Path(options["cookiefile"]).write_text("")
+
+    assert jar.read_text() == before
+
+
+def test_a_jar_that_never_had_an_account_may_still_rotate(tmp_path, monkeypatch):
+    """The guard protects what was there; it does not invent a requirement."""
+    jar, options = shared_jar(tmp_path, monkeypatch, signed_in=False)
+
+    with download._private_jar(options):
+        cookie_file(Path(options["cookiefile"]), name="ROTATED")
+
+    assert "ROTATED" in jar.read_text()
+
+
+def test_downloads_without_cookies_are_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TMP_DIR", tmp_path / "tmp")
+    options = {"quiet": True}
+
+    with download._private_jar(options):
+        assert "cookiefile" not in options
+
+
+def test_concurrent_calls_never_leave_a_jar_that_is_not_a_jar(tmp_path, monkeypatch):
+    """The regression itself, run until it would have shown up."""
+    import threading
+
+    jar, _ = shared_jar(tmp_path, monkeypatch)
+    damaged = []
+
+    def worker(tag):
+        for _ in range(40):
+            options = {"cookiefile": str(jar)}
+            with download._private_jar(options):
+                private = Path(options["cookiefile"])
+                # What yt-dlp's save() does: truncate, then write it back out.
+                private.write_text("")
+                signed_in_file(private, names=(*SIGNED_IN, f"W{tag}"))
+            if not all(download._auth_cookies(download._cookie_lines(jar))):
+                damaged.append(jar.read_text())
+
+    threads = [threading.Thread(target=worker, args=(tag,)) for tag in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not damaged, "the shared jar lost its account cookies mid-run"
+    assert all(download._auth_cookies(download._cookie_lines(jar)))
+
+
+def test_the_sweeper_clears_private_jars_a_kill_left_behind(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TMP_DIR", tmp_path)
+    stale = tmp_path / f"{download._PRIVATE_JAR_PREFIX}1-abc.txt"
+    stale.write_text("# Netscape HTTP Cookie File\n")
+    import os
+    os.utime(stale, (0, 0))
+
+    download.sweep_temp()
+
+    assert not stale.exists()
+
+
+# ─── A pause that outlives the process that set it ─────────────────────────
+#
+# The bot check is issued against the connection, and restarting the container
+# does not change the connection. Dropping the pause on restart therefore did
+# not give the queue a fresh start; it gave it a fresh way to fail, because
+# restarting is the first thing anybody does when downloads stop.
+
+
+def test_a_bot_check_pause_survives_a_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(signed_in_file(tmp_path / "c.txt")))
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    download.cookie_jar()
+    download._note_bot_check()
+    held_until = download._hold_until
+
+    download._hold_until = 0.0          # what a restart used to amount to
+    download._cookie_generation = 0
+    download._cookie_jar = None
+    download._cookie_stamp = None
+
+    download.restore_hold()
+
+    assert download._hold_until == pytest.approx(held_until, abs=1)
+
+
+def test_a_restored_pause_is_not_resumed_by_its_own_first_check(tmp_path, monkeypatch):
+    """The subtle half: restoring must not read the cookies as newly arrived.
+
+    _wait_out_cooldown resumes when the cookie generation has moved since the
+    pause began. cookie_jar() moves it the first time it runs in a process, so
+    a restore that records the generation before taking the working copy hands
+    the very next check a change to find — and the pause ends silently, one
+    call after it was restored.
+    """
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(signed_in_file(tmp_path / "c.txt")))
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "YTDLP_BOT_CHECK_COOLDOWN", 12)
+
+    download.cookie_jar()
+    download._note_bot_check()
+
+    download._hold_until = 0.0
+    download._cookie_generation = 0
+    download._hold_generation = 0
+    download._cookie_jar = None
+    download._cookie_stamp = None
+    download.restore_hold()
+
+    slept = []
+    monkeypatch.setattr(
+        download.time, "sleep",
+        lambda seconds: (slept.append(seconds), setattr(download, "_hold_until", 0.0)),
+    )
+    download._wait_out_cooldown()
+
+    assert slept, "the restored pause was dropped by the first check that saw it"
+
+
+def test_a_new_cookie_export_voids_a_restored_pause(tmp_path, monkeypatch):
+    """Having done the thing the error asked for, a restart should not re-punish it."""
+    source = tmp_path / "c.txt"
+    signed_in_file(source)
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(source))
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    download.cookie_jar()
+    download._note_bot_check()
+
+    signed_in_file(source, names=(*SIGNED_IN, "FRESH_EXPORT"))
+    download._hold_until = 0.0
+    download._cookie_generation = 0
+    download._cookie_jar = None
+    download._cookie_stamp = None
+
+    download.restore_hold()
+
+    assert download._hold_until == 0.0
+
+
+def test_a_pause_that_has_run_out_is_not_restored(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(signed_in_file(tmp_path / "c.txt")))
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "YTDLP_BOT_CHECK_COOLDOWN", -1)
+
+    download._save_hold(time.time() - 60, "YouTube's bot check")
+    download.restore_hold()
+
+    assert download._hold_until == 0.0
+
+
+def test_nothing_to_restore_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", "")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    download.restore_hold()
+
+    assert download._hold_until == 0.0
+
+
+def test_new_cookies_clear_the_persisted_pause_too(tmp_path, monkeypatch):
+    """Resuming early in one process must not leave a pause for the next one."""
+    source = tmp_path / "c.txt"
+    signed_in_file(source)
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(source))
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(download.time, "sleep", lambda seconds: None)
+
+    download.cookie_jar()
+    download._note_bot_check()
+    signed_in_file(source, names=(*SIGNED_IN, "FRESH_EXPORT"))
+    download._wait_out_cooldown()
+
+    with db.connect() as conn:
+        assert conn.execute("SELECT * FROM download_hold WHERE id = 1").fetchone() is None
+
+
+def test_a_cookie_listed_twice_is_read_the_way_a_jar_reads_it(tmp_path, monkeypatch):
+    """Last line wins, because that is the only one the jar keeps.
+
+    Caught by checking this module's verdict against yt-dlp's own
+    is_authenticated across every combination of a pool of cookies: the only
+    shapes the two disagreed on were the ones naming a cookie twice, where
+    reading "any line with this name" saw a record the jar had discarded.
+    """
+    path = tmp_path / "c.txt"
+    path.write_text(
+        "# Netscape HTTP Cookie File\n"
+        f".youtube.com\tTRUE\t/\tTRUE\t{int(FRESH)}\tLOGIN_INFO\tstale-session\n"
+        f".youtube.com\tTRUE\t/\tTRUE\t{int(time.time() - 3600)}\tLOGIN_INFO\tsigned-out\n"
+        f".youtube.com\tTRUE\t/\tTRUE\t{int(FRESH)}\t__Secure-3PAPISID\tvalue\n"
+    )
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(path))
+
+    assert not download.is_signed_in()
+
+
+def test_the_export_itself_is_never_written_back_to(tmp_path, monkeypatch):
+    """cookie_jar() hands out the original when it cannot take a working copy.
+
+    A lost rotation is a far cheaper failure than a rewritten export: the file
+    is a live session nobody can regenerate without going back to a browser.
+    """
+    export = signed_in_file(tmp_path / "cookies.txt")
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FILE", str(export))
+    monkeypatch.setattr(config, "TMP_DIR", tmp_path / "tmp")
+    before = export.read_text()
+
+    options = {"cookiefile": str(export)}
+    with download._private_jar(options):
+        signed_in_file(Path(options["cookiefile"]), names=(*SIGNED_IN, "ROTATED"))
+
+    assert export.read_text() == before

@@ -162,6 +162,21 @@ CREATE TABLE IF NOT EXISTS navidrome_tracks (
     synced_at   INTEGER NOT NULL
 );
 
+-- Why the download queue is paused, and until when. One row, id 1.
+--
+-- Kept in the database rather than in memory because the pause outlives the
+-- process that set it. YouTube's bot check is issued against the connection,
+-- and a restart does not change the connection — so a pause that a restart
+-- clears is a pause that teaches the queue to walk straight back into the
+-- challenge and collect another one. `cookies` is a digest of the export that
+-- was refused: a different one is a different identity, and ends the pause.
+CREATE TABLE IF NOT EXISTS download_hold (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    hold_until INTEGER NOT NULL DEFAULT 0,
+    cookies    TEXT    NOT NULL DEFAULT '',
+    reason     TEXT    NOT NULL DEFAULT ''
+);
+
 -- How far each history source has been read: the timestamp of the newest play
 -- stored, so a sync only ever asks for what it has not seen.
 CREATE TABLE IF NOT EXISTS sync_state (

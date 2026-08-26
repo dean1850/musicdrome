@@ -47,6 +47,31 @@ fixes it, which is what :func:`_note_bot_check` and :func:`explain_bot_check`
 do. Left unhandled it is worse than a 403: the whole queue drains into
 failures in the time it takes the workers to dequeue it.
 
+The pause survives a restart (:func:`restore_hold`), because the connection
+does. And the lever it names depends on what is already configured
+(:func:`bot_check_lever`), because the commonest way to arrive here is with a
+cookie file already mounted — which brings us to the next part.
+
+**On cookies that are read and still sign nothing in.** yt-dlp only counts a
+cookie file as an account when the youtube.com jar carries ``LOGIN_INFO`` *and*
+one of the ``SAPISID`` family. Short of that it does not warn, refuse, or
+degrade gracefully — it extracts anonymously, which puts every download on
+``visionos`` and ``web``, and those are the clients the bot check sits in front
+of. The file parses, the log says cookies are in use, and every download fails
+with a message telling you to add cookies.
+
+:func:`signed_in_problem` exists to close that gap, and it is checked at boot
+alongside the rest. Two things then follow from it: the boot line distinguishes
+"signed in" from "read, but signed out", and :func:`bot_check_lever` stops
+recommending the step that is already done.
+
+One more thing can take those cookies away after they arrive. yt-dlp rewrites
+``cookiefile`` on close by truncating it, with no lock and no atomic rename, so
+two download workers finishing together could leave a jar with half of one in
+it — losing ``LOGIN_INFO``, and presenting as cookies that worked for a while
+and then stopped. :func:`_private_jar` gives each call its own copy and folds
+it back atomically.
+
 Downloads run on a small pool of worker threads draining the ``downloads``
 table, so the queue survives a restart: anything left mid-flight is requeued at
 boot by :func:`start_workers`.
@@ -55,6 +80,8 @@ boot by :func:`start_workers`.
 from __future__ import annotations
 
 import base64
+import contextlib
+import hashlib
 import logging
 import os
 import queue
@@ -65,7 +92,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
@@ -135,6 +162,23 @@ _cookie_jar: Path | None = None
 _cookie_stamp: tuple[int, int] | None = None
 _cookie_generation = 0
 
+# What yt-dlp needs before it treats a cookie file as a signed-in session,
+# taken from YoutubeBaseInfoExtractor._has_auth_cookies: the LOGIN_INFO cookie
+# *and* at least one of the SAPISID family, all scoped to youtube.com.
+#
+# The pair is not arbitrary and neither half is optional. LOGIN_INFO is the one
+# YouTube clears when it ends a session, so it is the liveness signal; the
+# SAPISID family is what the request signature is computed from. yt-dlp checks
+# for both and says nothing at all when it does not find them — it simply
+# extracts anonymously, and the first outward sign is the bot check.
+_AUTH_COOKIE = "LOGIN_INFO"
+_SESSION_COOKIES = ("SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")
+
+# Private per-call copies of the working jar — see :func:`_private_jar`. Named
+# for the sweeper in :func:`sweep_temp`, which is what clears the ones a
+# container killed mid-download leaves behind.
+_PRIVATE_JAR_PREFIX = "musicdrome-cookies-"
+
 _UNSET = object()
 _impersonate_cache: Any = _UNSET
 _impersonate_reason = ""
@@ -169,6 +213,13 @@ _BOT_CHECK = re.compile(r"confirm\s+(?:you\S{0,3}re|you\s+are)\s+not\s+a\s+bot",
 # over — :func:`explain_bot_check` cuts it here and says the same thing once,
 # in terms of the settings this app actually has.
 _BOT_CHECK_ADVICE = re.compile(r"\s*Use\s+--cookies.*", re.IGNORECASE | re.DOTALL)
+
+# What a downloads row stores, and how much of it :func:`bot_check_lever` may
+# have. The row is truncated from the end and the advice is at the end, so the
+# budget is enforced when the message is built rather than discovered when
+# somebody reads half a sentence in the table.
+_BOT_CHECK_ROW = 500
+_LEVER_ROOM = 260
 
 
 class DownloadError(RuntimeError):
@@ -424,6 +475,103 @@ def _cookie_expiry(record: list[str]) -> float:
         return 0.0
 
 
+def _is_youtube_domain(domain: str) -> bool:
+    """Whether yt-dlp will send this cookie to youtube.com.
+
+    Narrower than the ``"youtube" in domain or "google" in domain`` test the
+    checks above use, and deliberately so. When yt-dlp decides whether the
+    session is signed in it reads the jar for ``https://www.youtube.com``, and
+    a google.com cookie is not in that jar however much it looks like one from
+    out here. The distinction is load-bearing: SAPISID is set on both domains,
+    LOGIN_INFO only on youtube.com, so a Google export that is missing nothing
+    a human would notice can still be missing the half that matters.
+    """
+    host = domain.lstrip(".").lower()
+    return host == "youtube.com" or host.endswith(".youtube.com")
+
+
+def _auth_cookies(records: list[list[str]]) -> tuple[bool, bool]:
+    """Which halves of a signed-in session a cookie file carries.
+
+    ``(has_login_info, has_session_id)``. Expired records do not count: a
+    lapsed LOGIN_INFO signs nothing in, and calling it present would send
+    somebody looking for a problem they already have.
+    """
+    # Last record wins, the way a cookie jar does. A jar is keyed on
+    # (domain, path, name), so a file listing the same cookie twice keeps only
+    # the later line and that is all yt-dlp ever sees. Reading this as "any
+    # line carrying the name" calls a jar signed in on the strength of a record
+    # the jar itself threw away — which is the difference between agreeing with
+    # yt-dlp and merely usually agreeing with it.
+    jar: dict[tuple[str, str, str], list[str]] = {}
+    for record in records:
+        if _is_youtube_domain(record[0]):
+            jar[(record[0], record[2], record[5])] = record
+
+    now = time.time()
+    names = {
+        record[5]
+        for record in jar.values()
+        if _cookie_expiry(record) == 0 or _cookie_expiry(record) > now
+    }
+    return _AUTH_COOKIE in names, any(name in names for name in _SESSION_COOKIES)
+
+
+def signed_in_problem() -> str:
+    """Why yt-dlp will download signed out despite a perfectly readable cookie file.
+
+    Kept apart from :func:`cookies_problem` because it is a different failure
+    and needs saying differently. That one is about a file yt-dlp cannot use at
+    all — never mounted, exported as JSON, wholly expired. This one is about a
+    file it reads without complaint and then draws no identity from, which is
+    the case where somebody has already done the thing the error message asked
+    for and is being told to do it again.
+
+    It is worth its own check because of how much rides on it. With account
+    cookies yt-dlp extracts through ``web_embedded`` and ``tv_downgraded``,
+    neither of which wants a PO token. Without them it falls back to
+    ``visionos`` and ``web`` — where ``web`` requires a GVS PO token it has not
+    got, so its formats are dropped, and ``visionos`` is the client YouTube
+    puts the bot check in front of. So the missing cookies do not degrade
+    downloads slightly. They put every download on the one path that fails, and
+    no PO token or exit address fixes what a re-export would.
+    """
+    path = config.cookies_file()
+    if path is None or cookies_problem():
+        return ""
+
+    try:
+        records = _cookie_lines(path)
+    except OSError:
+        return ""
+
+    has_login, has_session = _auth_cookies(records)
+    if has_login and has_session:
+        return ""
+
+    wanted = ", ".join(_SESSION_COOKIES)
+    if not has_login and not has_session:
+        missing = f"neither {_AUTH_COOKIE} nor any of {wanted}"
+    elif not has_login:
+        missing = f"no {_AUTH_COOKIE}"
+    else:
+        missing = f"{_AUTH_COOKIE} but none of {wanted}"
+
+    return (
+        f"{path} has cookies, but not the ones that sign a session in — yt-dlp "
+        f"wants {_AUTH_COOKIE} and one of {wanted}, and this export has "
+        f"{missing}. It reads the file and downloads signed out anyway, which "
+        f"is the path YouTube's bot check sits on. Re-export with youtube.com "
+        f"open and signed in: a private window, signed in, then closed without "
+        f"signing out, is the export that keeps working"
+    )
+
+
+def is_signed_in() -> bool:
+    """Whether yt-dlp will treat the configured cookie file as an account."""
+    return config.cookies_file() is not None and not cookies_problem() and not signed_in_problem()
+
+
 def cookie_jar() -> Path | None:
     """The cookie file to hand yt-dlp — a working copy, never the original.
 
@@ -491,6 +639,97 @@ def cookie_jar() -> Path | None:
     return target
 
 
+@contextlib.contextmanager
+def _private_jar(options: dict[str, Any]) -> Iterator[None]:
+    """Give one yt-dlp call its own copy of the cookie jar, folded back after.
+
+    yt-dlp does not merely read ``cookiefile``. :meth:`YoutubeDL.close` writes
+    it back, and :meth:`YoutubeDLCookieJar.save` does that by truncating the
+    file and writing it out again — no lock, no temporary file, no atomic
+    rename. For one caller that is fine. For a pool of download workers sharing
+    one jar it is not: two closes that overlap leave a file holding part of one
+    jar, and often enough the part that goes missing is the account cookies.
+
+    From the outside that is indistinguishable from cookies that "worked for a
+    while and then stopped", because it presents as exactly that — every
+    download after the collision extracts signed out, and YouTube starts asking
+    the connection to prove it is not a bot. Nothing in the logs connects the
+    two, and re-exporting fixes it right up until the next collision.
+
+    So each call gets a private copy to rewrite and the result is moved back
+    over the shared jar with :func:`os.replace`, which is atomic. Two calls
+    finishing together are last-writer-wins, which is what two yt-dlp processes
+    have always been, and unlike a truncation it cannot leave behind something
+    that is not a cookie jar.
+    """
+    shared = options.get("cookiefile")
+    if not shared:
+        yield
+        return
+
+    shared_path = Path(shared)
+    private = config.TMP_DIR / f"{_PRIVATE_JAR_PREFIX}{os.getpid()}-{threading.get_ident():x}.txt"
+    try:
+        config.TMP_DIR.mkdir(parents=True, exist_ok=True)
+        with _cookie_lock:
+            shutil.copyfile(shared_path, private)
+        signed_in = all(_auth_cookies(_cookie_lines(private)))
+    except OSError as exc:
+        # Not worth failing a download over. The shared jar still works; it is
+        # only the race that goes unguarded, and that is the state this app
+        # shipped in for its whole life so far.
+        log.debug("could not take a private cookie jar (%s); sharing the working one", exc)
+        yield
+        return
+
+    options["cookiefile"] = str(private)
+    try:
+        yield
+    finally:
+        # Restored before the fold-back: :func:`_extract_with_retry` reuses this
+        # dict across attempts, and a stale private path in it would point the
+        # next attempt at a file this one has just moved away.
+        options["cookiefile"] = shared
+        _fold_jar_back(private, shared_path, signed_in)
+
+
+def _fold_jar_back(private: Path, shared: Path, was_signed_in: bool) -> None:
+    """Move a finished private jar over the shared one, unless it came back worse.
+
+    The guard is the point. A rewrite that lost the account cookies is either
+    YouTube ending the session or a write that did not finish, and the previous
+    jar is the better copy either way: a session YouTube has ended is no worse
+    for being a minute out of date, and a half-written one is worse than
+    useless. A jar that never had account cookies is held to the weaker test —
+    it only has to still be a file with something in it — because there is
+    nothing there to lose.
+    """
+    # Never over the export itself. :func:`cookie_jar` hands out the original
+    # when it cannot take a working copy, and that path used to mean yt-dlp
+    # wrote the one file nobody can regenerate without going back to a browser.
+    # A lost rotation is a cheaper failure than a mangled export, and this is
+    # the only place that choice can still be made.
+    if config.cookies_file() is not None and shared == config.cookies_file():
+        log.debug("the working jar is the export itself; not writing the rotation back")
+        private.unlink(missing_ok=True)
+        return
+
+    try:
+        if private.stat().st_size == 0:
+            log.debug("yt-dlp left the private cookie jar empty; keeping the working one")
+            private.unlink(missing_ok=True)
+            return
+        if was_signed_in and not all(_auth_cookies(_cookie_lines(private))):
+            log.debug("private cookie jar came back signed out; keeping the working one")
+            private.unlink(missing_ok=True)
+            return
+        with _cookie_lock:
+            os.replace(private, shared)
+    except OSError as exc:
+        log.debug("could not fold the cookie jar back (%s)", exc)
+        private.unlink(missing_ok=True)
+
+
 def cookies_status() -> str:
     """One line for the boot log: whether downloads are signed in, and from where."""
     problem = cookies_problem()
@@ -505,11 +744,24 @@ def cookies_status() -> str:
             f"in {config.DATA_DIR}, or YTDLP_COOKIES_FILE"
         )
 
+    signed_out = signed_in_problem()
+    if signed_out:
+        # Deliberately not phrased as "not in use": the file *is* handed to
+        # yt-dlp, and saying otherwise would send somebody back to check a
+        # mount that is working. What is missing is the identity, not the file.
+        return f"read, but downloads are signed out — {signed_out}"
+
     try:
-        youtube = [r for r in _cookie_lines(path) if "youtube" in r[0] or "google" in r[0]]
+        youtube = [r for r in _cookie_lines(path) if _is_youtube_domain(r[0])]
     except OSError:
         youtube = []
-    return f"{path} — {len(youtube)} youtube.com cookies, working copy in {config.DATA_DIR}"
+    # Counted on youtube.com alone. This used to count google.com too and still
+    # call the total "youtube.com cookies", which turned a Google export with
+    # nothing YouTube wants in it into a reassuring three-figure number.
+    return (
+        f"{path} — signed in, {len(youtube)} youtube.com cookies, "
+        f"working copy in {config.DATA_DIR}"
+    )
 
 
 def js_runtime_problem() -> str:
@@ -748,9 +1000,12 @@ def _extract_info(yt_dlp: Any, options: dict[str, Any], url: str, *, download: b
     request rather than degrading it, and it fails before a single byte is
     fetched. Retrying without it converts "nothing downloads" into "downloads
     work, with a python TLS fingerprint", which is strictly the better failure.
+
+    Also the one place a cookie jar is handed to yt-dlp, which is why
+    :func:`_private_jar` wraps both attempts rather than each caller.
     """
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
+        with _private_jar(options), yt_dlp.YoutubeDL(options) as ydl:
             return ydl.extract_info(url, download=download)
     except Exception as exc:
         if "impersonate" not in options or not is_impersonation_unavailable(exc):
@@ -760,7 +1015,7 @@ def _extract_info(yt_dlp: Any, options: dict[str, Any], url: str, *, download: b
         # :func:`_extract_with_retry` reuses these options, and would otherwise
         # put the dead target straight back on the wire on its next attempt.
         options.pop("impersonate", None)
-        with yt_dlp.YoutubeDL(options) as ydl:
+        with _private_jar(options), yt_dlp.YoutubeDL(options) as ydl:
             return ydl.extract_info(url, download=download)
 
 
@@ -1477,6 +1732,8 @@ def sweep_temp(max_age: int = 3600) -> int:
 
     cutoff = time.time() - max_age
     for entry in config.TMP_DIR.iterdir():
+        # Covers the private cookie jars too: _PRIVATE_JAR_PREFIX starts with
+        # the same "musicdrome-", which is exactly what it is named that way for.
         if not entry.name.startswith("musicdrome-"):
             continue
         try:
@@ -1635,13 +1892,61 @@ def explain_bot_check(message: str) -> str:
     ran long would otherwise push the only actionable half of this message off
     the edge of the column.
     """
-    trimmed = _BOT_CHECK_ADVICE.sub("", message.strip()).strip().rstrip(".")[:160]
+    lever = bot_check_lever()[:_LEVER_ROOM]
+    fixed = (
+        " — YouTube is challenging the connection, not this track, so every "
+        "download will fail the same way until the identity behind it changes. "
+        "Downloads are paused meanwhile. "
+    )
+    # yt-dlp's half is trimmed to whatever the actionable half leaves, never
+    # the other way round. It used to be a flat 160, which was fine while the
+    # advice was one fixed sentence and stopped being fine the moment the
+    # advice started naming a configured path: the row truncates from the end,
+    # so an overlong message loses precisely the part worth reading.
+    room = max(0, _BOT_CHECK_ROW - len(fixed) - len(lever))
+    trimmed = _BOT_CHECK_ADVICE.sub("", message.strip()).strip().rstrip(".")[:min(160, room)]
+    return f"{trimmed}{fixed}{lever}"
+
+
+def bot_check_lever() -> str:
+    """The one sentence worth acting on, given what is already configured.
+
+    The advice used to be the same either way: put a cookies.txt at this path.
+    Told to somebody who has had one mounted for a week, that is not advice —
+    it is the app failing to notice its own configuration, and it sends them to
+    re-do the one step that is already done while the real gap goes unnamed.
+
+    So the three states are said apart. No cookie file is the easy one. A
+    cookie file yt-dlp will not draw an identity from is the interesting one,
+    because it looks exactly like the first from the outside and is fixed by a
+    different action. And cookies that *are* signed in mean the identity is not
+    the problem, which leaves the exit address — at which point naming cookies
+    again would be actively misleading.
+    """
+    path = config.cookies_file()
+    if path is None or not path.exists():
+        return (
+            f"Sign them in: put a Netscape cookies.txt at {_cookie_target()} "
+            f"and they resume on their own. Failing that, a different exit "
+            f"address or YTDLP_PO_TOKEN."
+        )
+
+    problem = cookies_problem()
+    if problem:
+        # Trimmed rather than quoted whole: the boot log carries the full
+        # version, and this one is competing for a table cell.
+        return f"The cookie file cannot be used as it stands — {problem[:150]}."
+
+    if signed_in_problem():
+        return (
+            f"{_cookie_target()} is mounted but signed out — no {_AUTH_COOKIE} "
+            f"cookie, so yt-dlp downloads anonymously. Re-export with "
+            f"youtube.com open and signed in and they resume on their own."
+        )
+
     return (
-        f"{trimmed} — YouTube is challenging the connection, not this track, so "
-        f"every download will fail the same way until the identity behind it "
-        f"changes. Downloads are paused meanwhile. Sign them in: put a Netscape "
-        f"cookies.txt at {_cookie_target()} and they resume on their own. "
-        f"Failing that, a different exit address or YTDLP_PO_TOKEN."
+        "The cookies are signed in, so this is the exit address rather than "
+        "the identity: route downloads off the VPN, or set YTDLP_PO_TOKEN."
     )
 
 
@@ -1690,17 +1995,126 @@ def _note_bot_check() -> None:
         # The identity that was just refused. Anything else arriving in the
         # cookie file from here on is a different one, and a reason to resume.
         _hold_generation = _cookie_generation
+        deadline = _hold_until
+
+    # Outside the lock: this touches the database, and the workers waiting on
+    # the same lock have nothing to gain from queueing behind a write.
+    _save_hold(deadline, "YouTube's bot check")
 
     # Once per pause, not once per track: the whole point is to stop repeating
     # this, and a log that repeats it is the same failure in another form.
     if not was_held:
         log.warning(
             "YouTube asked this connection to prove it is not a bot — pausing "
-            "downloads for %d seconds. This is the exit address, not the "
-            "tracks, and it will not clear on its own: put a Netscape "
-            "cookies.txt at %s and downloads resume as soon as it lands.",
-            config.YTDLP_BOT_CHECK_COOLDOWN, _cookie_target(),
+            "downloads for %d seconds. This is the identity behind the "
+            "connection, not the tracks, and it will not clear on its own. %s",
+            config.YTDLP_BOT_CHECK_COOLDOWN, bot_check_lever(),
         )
+
+
+def _cookie_fingerprint() -> str:
+    """A digest of the cookie export, stable across restarts.
+
+    ``_cookie_generation`` counts replacements within one process, which is all
+    :func:`_wait_out_cooldown` ever needed. A pause that outlives the process
+    needs something the next one can compare against, and the export's own
+    bytes are it: a different export is a different identity, and that is
+    precisely what ends the pause early.
+    """
+    path = config.cookies_file()
+    if path is None:
+        return ""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _save_hold(until: float, reason: str) -> None:
+    """Record a pause so a restart does not walk straight back into it.
+
+    Best-effort throughout. A pause that fails to persist is the behaviour this
+    app had before, and losing it is not worth turning a download failure into
+    a crashed worker.
+    """
+    try:
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO download_hold (id, hold_until, cookies, reason) "
+                "VALUES (1, ?, ?, ?) "
+                "ON CONFLICT (id) DO UPDATE SET hold_until = excluded.hold_until, "
+                "cookies = excluded.cookies, reason = excluded.reason",
+                (int(until), _cookie_fingerprint(), reason),
+            )
+    except Exception as exc:
+        log.debug("could not persist the download pause: %s", exc)
+
+
+def _clear_hold() -> None:
+    try:
+        with db.connect() as conn:
+            conn.execute("DELETE FROM download_hold WHERE id = 1")
+    except Exception as exc:
+        log.debug("could not clear the persisted download pause: %s", exc)
+
+
+def restore_hold() -> None:
+    """Pick a bot-check pause back up after a restart. Called once, at boot.
+
+    The pause is a statement about the connection, and restarting the container
+    does not change the connection. Dropping it on restart therefore did not
+    give the queue a fresh start, it gave it a fresh way to fail: stop, start,
+    and twenty seconds later the same challenge, counted again. That is not a
+    hypothetical — it is what "I restarted to pick up the new yt-dlp and it
+    still failed" looks like from inside, and restarting is the first thing
+    anybody does when downloads stop.
+
+    A different cookie export voids it, on exactly the reasoning in
+    :func:`_wait_out_cooldown`: the identity that was refused is gone, so the
+    grounds for the pause are gone with it.
+    """
+    global _hold_until, _hold_generation
+
+    # Before the generation is read, not after. cookie_jar() takes the working
+    # copy and bumps the counter the first time it runs, so recording the
+    # counter first would have the very next _wait_out_cooldown see a change,
+    # call it a new export and resume — ending the restored pause immediately
+    # and quietly, which is the whole failure this function exists to stop.
+    cookie_jar()
+
+    try:
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM download_hold WHERE id = 1").fetchone()
+    except Exception as exc:
+        log.debug("could not read the persisted download pause: %s", exc)
+        return
+
+    if row is None:
+        return
+
+    remaining = float(row["hold_until"]) - time.time()
+    if remaining <= 0:
+        _clear_hold()
+        return
+
+    if row["cookies"] != _cookie_fingerprint():
+        log.info(
+            "the cookie file has changed since downloads were paused — "
+            "starting without waiting out the rest of it"
+        )
+        _clear_hold()
+        return
+
+    with _hold_lock:
+        _hold_until = max(_hold_until, float(row["hold_until"]))
+        _hold_generation = _cookie_generation
+
+    minutes = max(1, round(remaining / 60))
+    log.warning(
+        "downloads are still paused for another %d minute%s — %s from before "
+        "the restart. Restarting does not change the address YouTube refused. %s",
+        minutes, "" if minutes == 1 else "s", row["reason"] or "a pause", bot_check_lever(),
+    )
 
 
 def _note_download_ok() -> None:
@@ -1743,6 +2157,7 @@ def _wait_out_cooldown() -> None:
         if _cookie_generation != since:
             with _hold_lock:
                 _hold_until = 0.0
+            _clear_hold()
             log.info("new cookies — resuming downloads without waiting out the pause")
             return
 
@@ -2009,11 +2424,17 @@ def _worker() -> None:
 
 
 def start_workers() -> None:
-    """Start the pool, sweep old scratch files and requeue interrupted work."""
+    """Start the pool, sweep old scratch files and requeue interrupted work.
+
+    Also restores a bot-check pause the last run left behind — see
+    :func:`restore_hold`. It runs before the workers exist rather than inside
+    them, so the first one to dequeue finds the pause already in place.
+    """
     if _workers:
         return
 
     sweep_temp()
+    restore_hold()
 
     with db.connect() as conn:
         conn.execute("UPDATE downloads SET status = 'queued' WHERE status = 'downloading'")

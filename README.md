@@ -504,11 +504,13 @@ INFO  app.download: new cookies — resuming downloads without waiting out the p
 Keep the export somewhere else if you prefer — mount it wherever and point
 `YTDLP_COOKIES_FILE` at the path *inside* the container. Read-only is fine.
 
-**4. Check it took.** Two quick sanity checks on the file itself:
+**4. Check it took.** Three quick sanity checks on the file itself. The third is
+the one that catches the failure everything else misses:
 
 ```bash
 head -c 20 /home/you/arr/musicdrome/data/cookies.txt   # text, not "[{"  — JSON is unreadable to yt-dlp
-grep -c youtube /home/you/arr/musicdrome/data/cookies.txt   # should be well above zero
+grep -c youtube /home/you/arr/musicdrome/data/cookies.txt        # well above zero
+grep -c LOGIN_INFO /home/you/arr/musicdrome/data/cookies.txt     # must be at least 1
 ```
 
 Then watch the log. There is no need to restart, but if you do, Musicdrome
@@ -519,10 +521,11 @@ docker logs -f musicdrome | grep -i cookies
 ```
 
 ```
-INFO  app.main: cookies: /config/cookies.txt — 14 youtube.com cookies, working copy in /config
+INFO  app.main: cookies: /config/cookies.txt — signed in, 14 youtube.com cookies, working copy in /config
 ```
 
-and when the file will not be used, it says why instead of failing quietly:
+`signed in` is the word to look for. If the file cannot be used at all, the line
+says why instead of failing quietly:
 
 ```
 cookies: not in use — /config/cookies.txt does not exist inside the container — the
@@ -540,6 +543,51 @@ there is no file at all, and downloads are still going out anonymously.
 
 Once it reads correctly, press **Retry all failed** in the Downloads tab.
 
+### "I have a cookies.txt and it still says I am a bot"
+
+The one that wastes the most time, because every visible sign says the cookies
+are fine. The file mounts, it parses, the log says it is in use, and every
+download still fails asking for cookies.
+
+yt-dlp only counts a cookie file as an *account* when the youtube.com jar
+carries **`LOGIN_INFO`** *and* at least one of **`SAPISID`**,
+**`__Secure-1PAPISID`** or **`__Secure-3PAPISID`**. Short of that it does not
+warn and it does not refuse — it downloads anonymously, which puts every request
+on the clients YouTube's bot check sits in front of. A jar of a hundred
+youtube.com cookies with no `LOGIN_INFO` in it is, as far as YouTube is
+concerned, signed out.
+
+Musicdrome checks for exactly those cookies at boot and says so:
+
+```
+cookies: read, but downloads are signed out — /config/cookies.txt has cookies, but not
+         the ones that sign a session in — yt-dlp wants LOGIN_INFO and one of SAPISID,
+         __Secure-1PAPISID, __Secure-3PAPISID, and this export has neither …
+```
+
+It is a different message from `not in use` on purpose: the file *is* being read
+and handed to yt-dlp, so there is nothing wrong with the mount. What is missing
+is the identity.
+
+Three things produce it, in rough order of how often:
+
+- **The export was taken from a signed-out tab.** Common with a private window,
+  which is what the instructions above ask for — it is easy to open one, go to
+  youtube.com and export *before* signing in. Sign in first, let the page finish
+  loading, then export.
+- **The extension skipped the HttpOnly cookies.** `LOGIN_INFO` is HttpOnly.
+  Extensions that read cookies through the page rather than the browser's cookie
+  API cannot see it. Use one that writes `#HttpOnly_` lines — Musicdrome and
+  yt-dlp both read that prefix correctly.
+- **Only google.com was exported.** `SAPISID` lives on both google.com and
+  youtube.com, so a Google export looks convincing and is missing the half that
+  matters: `LOGIN_INFO` is never set on google.com.
+
+If the boot line says `signed in` and YouTube is *still* challenging the
+connection, then the cookies are not the problem and the exit address is — that
+is what a PO token or routing downloads off the VPN is for. The failure message
+in the Downloads tab says which of the two it thinks you are looking at.
+
 ### Your export is never modified
 
 Worth knowing, because it is the difference between cookies that keep working
@@ -552,6 +600,18 @@ of an export you cannot regenerate without going back to a browser.
 So Musicdrome copies your export to a working file (`.cookies-active.txt`, in
 the data directory) and hands yt-dlp *that*. Your file is only ever read, the
 rotation lands somewhere writable, and the session stays alive across downloads.
+
+There is a second edge on the same knife. yt-dlp writes the jar back by
+truncating it and writing it out again — no lock, no temporary file, no atomic
+rename — so two downloads finishing at the same moment could leave a jar holding
+part of one write. Often enough the part that went missing was `LOGIN_INFO`, and
+from then on every download extracted signed out. It presented as cookies that
+worked for a while and then stopped, which is indistinguishable from cookies
+that genuinely expired.
+
+Each download now gets its own copy of the working file to rewrite, and the
+result is moved back over the shared one atomically. Rotation still lands, and
+`DOWNLOAD_CONCURRENCY` above 1 can no longer cost you the session.
 
 ### When they expire
 
@@ -722,8 +782,8 @@ to three:
 
 ```
 WARNING app.download: YouTube asked this connection to prove it is not a bot —
-pausing downloads for 1800 seconds. This is the exit address, not the tracks;
-it will not clear on its own.
+pausing downloads for 1800 seconds. This is the identity behind the connection,
+not the tracks, and it will not clear on its own.
 ```
 
 That pause is the difference between one failed track and a Downloads tab where
@@ -731,10 +791,30 @@ everything is red — which is what happened before this was recognised: 34
 tracks failed in 87 seconds, and `Retry all failed` reproduced it instantly.
 The length is `YTDLP_BOT_CHECK_COOLDOWN` (default 1800, `0` disables the pause).
 
+The rest of that message names the lever, and **which lever depends on what you
+already have set**: no cookie file, a cookie file that yt-dlp will not draw an
+identity from, or cookies that are genuinely signed in and still being
+challenged are three different problems with three different fixes, and being
+told to add a cookies.txt you mounted last week helps with none of them.
+
+**The pause survives a restart**, and that is deliberate. Restarting is the
+first thing anyone does when downloads stop, and it used to clear the pause —
+so the container came back, dequeued, and collected the same challenge twenty
+seconds later. Restarting does not change the address YouTube refused. Dropping
+a new `cookies.txt` in *does*, and that ends the pause immediately, restart or
+no restart:
+
+```
+INFO  app.download: the cookie file has changed since downloads were paused —
+starting without waiting out the rest of it
+```
+
 The pause buys time; it does not fix anything, because nothing about your
 connection changes while it waits. **[Sign the downloads in with
 cookies](#signing-downloads-in-with-cookies)** and they resume on their own,
-without leaving the VPN — that is the fix.
+without leaving the VPN — that is the fix. If the boot line already says
+`signed in`, skip ahead: the identity is not what YouTube is objecting to, so
+it is the exit address, and the alternatives below are the whole list.
 
 The alternatives, if you would rather not: **[a different exit
 address](#try-a-different-exit-address-first)** — another gluetun endpoint or
