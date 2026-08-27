@@ -313,13 +313,37 @@ something you have to take on trust. Downloads from before this shipped show
 `—`: a finished file cannot say what it used to be, and a backfilled guess
 would be indistinguishable from a measurement.
 
-**One playlist, appended to forever.** Every download lands in
+**One playlist, kept in step with the library.** Every download lands in
 `playlist/Musicdrome.m3u` with relative paths, so the folder can be moved
 without breaking it, and a re-download never doubles an entry. Navidrome, Plex
 and Jellyfin import it as a single playlist that grows — which is the point:
 per-scan playlists produced a wall of `musicdrome-scan-0001`, `-0002`, `-0003`
 that nobody opened twice. Old per-scan files are merged into it and deleted the
 first time the new image boots. Rename it with `MUSICDROME_PLAYLIST_NAME`.
+
+Deleting a download's file removes its line from the playlist too. An entry
+whose file is gone is not inert: a music server imports it as a track, lists it
+like any other, and only admits it is missing when somebody presses play.
+
+**Clearing downloads out, in bulk.** Each row in the Downloads tab has a
+checkbox, and the one in the column heading takes everything the Show filter
+and the search box are currently showing. Shift-click a second box to fill the
+range between them. A bar appears above the table with the count and a **Delete
+selected**; it deletes the files from disk as well as the rows, prunes the
+matching playlist entries, and removes the `Artist/Album` folders left empty
+behind them. The library folder itself is never removed, and neither is any
+folder that still holds something.
+
+Queued and running downloads cannot be selected. The worker owns those rows,
+and deleting one does not stop the download — it only guarantees the file it
+finishes writing belongs to nothing. They are left in place and reported as
+skipped.
+
+**A deleted track becomes suggestable again**, exactly as removing one at a
+time has always done: "Musicdrome already downloaded it" stops being true when
+the row goes. If auto-download is on, a later scan may fetch the same music
+back. Hide the track from the Discover grid instead when the point is never to
+see it again.
 
 Jellyfin, Navidrome, Plex and friends read this layout as-is — point them at the
 same directory.

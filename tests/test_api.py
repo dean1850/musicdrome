@@ -167,6 +167,67 @@ def test_active_downloads_endpoint(client):
     assert client.get("/api/downloads/active").json() == {"active": []}
 
 
+def _finish(download_id: int) -> None:
+    """Mark a download done, so the bulk delete will act on it. A queued row
+    still belongs to a worker and is skipped on purpose."""
+    with db.connect() as conn:
+        conn.execute("UPDATE downloads SET status = 'done' WHERE id = ?", (download_id,))
+
+
+def test_downloads_can_be_deleted_in_one_request(client, suggestion):
+    ids = []
+    for title in ("One", "Two", "Three"):
+        client.post(f"/api/suggestions/{suggestion('A', title)}/download")
+    for row in client.get("/api/downloads").json()["downloads"]:
+        _finish(row["id"])
+        ids.append(row["id"])
+
+    body = client.post("/api/downloads/delete", json={"ids": ids}).json()
+
+    assert body["removed"] == 3
+    assert body["skipped"] == 0
+    assert client.get("/api/downloads").json()["downloads"] == []
+    # Every card is back in the grid, ready to be suggested again.
+    statuses = {row["status"] for row in client.get("/api/suggestions").json()["suggestions"]}
+    assert statuses == {"new"}
+
+
+def test_a_bulk_delete_leaves_the_queued_ones_alone(client, suggestion):
+    """One track a worker is holding must not stop the other two going."""
+    for title in ("One", "Two", "Three"):
+        client.post(f"/api/suggestions/{suggestion('A', title)}/download")
+    rows = client.get("/api/downloads").json()["downloads"]
+    _finish(rows[0]["id"])
+    _finish(rows[1]["id"])
+
+    body = client.post(
+        "/api/downloads/delete", json={"ids": [row["id"] for row in rows]}
+    ).json()
+
+    assert body["removed"] == 2
+    assert body["skipped"] == 1
+    assert [row["id"] for row in client.get("/api/downloads").json()["downloads"]] \
+        == [rows[2]["id"]]
+
+
+def test_deleting_nothing_is_a_400(client):
+    assert client.post("/api/downloads/delete", json={"ids": []}).status_code == 400
+
+
+def test_an_absurd_batch_is_a_400(client):
+    response = client.post("/api/downloads/delete", json={"ids": list(range(1001))})
+    assert response.status_code == 400
+
+
+def test_the_bulk_route_is_not_swallowed_by_the_id_route(client):
+    """`/downloads/delete` is a literal segment sharing a prefix with
+    `/downloads/{download_id}/retry`. Registered the other way round, "delete"
+    would be parsed as an id and never reach this endpoint."""
+    response = client.post("/api/downloads/delete", json={"ids": [9999]})
+    assert response.status_code == 200
+    assert response.json()["removed"] == 0
+
+
 # ─── Settings ──────────────────────────────────────────────────────────────
 
 

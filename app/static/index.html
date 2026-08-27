@@ -111,12 +111,25 @@
       <div id="download-summary" class="muted"></div>
     </div>
 
+    <!-- Only on screen while something is ticked, so the table looks exactly
+         as it did before selection existed until you start selecting. -->
+    <div id="d-selection" class="selection" hidden role="region" aria-label="Selected downloads">
+      <span id="d-selected-count" class="selection-count"></span>
+      <span id="d-selected-hidden" class="muted" hidden></span>
+      <button id="d-delete-selected" class="btn btn-danger">Delete selected</button>
+      <button id="d-clear-selection" class="btn">Clear</button>
+    </div>
+
     <!-- Every column carries a width, because the table is laid out `fixed`.
          See the note above `.table` in style.css for why. -->
     <div class="table-scroll">
       <table id="downloads-table" class="table">
         <thead>
           <tr>
+            <th class="th-plain cell-pick">
+              <input type="checkbox" id="d-select-all" disabled>
+              <label for="d-select-all" class="pick-label">Select all shown</label>
+            </th>
             <th data-sort="track"  aria-sort="none"><button type="button" class="th-sort">Track</button></th>
             <th data-sort="album"  aria-sort="none"><button type="button" class="th-sort">Album</button></th>
             <th data-sort="match"  aria-sort="none" class="num"><button type="button" class="th-sort">Match</button></th>

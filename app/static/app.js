@@ -24,6 +24,16 @@ const state = {
   downloadActive: new Map(),
   downloadSearch: '',
   downloadSort: { key: 'newest', dir: 'desc' },
+  // Selected download ids. Kept here rather than read back off the checkboxes
+  // because the fast poll rewrites the whole table every two seconds while
+  // anything is downloading — ticks living in the DOM would be wiped out
+  // mid-selection.
+  downloadSelection: new Set(),
+  // The rows as last drawn, in the order they were drawn: what "everything
+  // shown" means, and what a shift-click ranges over.
+  downloadVisible: [],
+  // The last row ticked, for shift-click ranges.
+  downloadAnchor: null,
   days: 90,
   settings: {},
   scanning: false,
@@ -374,6 +384,145 @@ const SORT_DIR = {
   file: 'asc', audio: 'asc', match: 'desc', size: 'desc',
 };
 
+// ─── Downloads: selecting rows ──────────────────────────────────────────
+
+/** Whether a row can be ticked. Queued and running downloads cannot: the
+ *  worker holds them, and deleting the row does not stop the download. */
+function selectable(row) {
+  return row.status !== 'queued' && row.status !== 'downloading';
+}
+
+/** Drop ids that the last response no longer justifies holding.
+ *
+ *  A row can leave the selection two ways: it stopped coming back from the
+ *  server — deleted here, or filtered out by a different status — or it went
+ *  back into flight because somebody retried it. Both would otherwise leave
+ *  the count claiming rows that Delete could not act on. */
+function pruneSelection() {
+  const keep = new Map(state.downloadRows.map((row) => [row.id, row]));
+  state.downloadSelection.forEach((id) => {
+    const row = keep.get(id);
+    if (!row || !selectable(row)) state.downloadSelection.delete(id);
+  });
+  if (state.downloadAnchor !== null && !keep.has(state.downloadAnchor)) {
+    state.downloadAnchor = null;
+  }
+}
+
+function clearSelection() {
+  state.downloadSelection.clear();
+  state.downloadAnchor = null;
+  paintSelection();
+}
+
+/** Push the selection back onto the checkboxes and the bar.
+ *
+ *  Separate from renderDownloads so ticking a box does not redraw the table:
+ *  a re-render would restart the row animation and lose the focus ring on the
+ *  box just clicked. */
+function paintSelection() {
+  const chosen = state.downloadSelection;
+  $$('#downloads-table tbody [data-pick]').forEach((input) => {
+    input.checked = chosen.has(Number(input.dataset.pick));
+  });
+
+  const shown = state.downloadVisible.filter(selectable);
+  const shownChosen = shown.filter((row) => chosen.has(row.id)).length;
+
+  // Indeterminate for a partial selection, so the header box reports the state
+  // of the list rather than only what clicking it would do next.
+  const all = $('#d-select-all');
+  all.disabled = shown.length === 0;
+  all.checked = shown.length > 0 && shownChosen === shown.length;
+  all.indeterminate = shownChosen > 0 && shownChosen < shown.length;
+
+  $('#d-selection').hidden = chosen.size === 0;
+  $('#d-selected-count').textContent = `${chosen.size} selected`;
+
+  // The search filters in the browser, so a selection can outlive the rows
+  // that made it. Saying so is the difference between deleting forty rows and
+  // deleting the five you can see.
+  const hidden = chosen.size - shownChosen;
+  const label = $('#d-selected-hidden');
+  label.hidden = hidden <= 0;
+  label.textContent = hidden > 0
+    ? `· ${hidden} not shown by the current filter`
+    : '';
+}
+
+/** Tick or untick one row, or a whole range of them when shift is held. */
+function pickRow(input, event) {
+  const id = Number(input.dataset.pick);
+  const rows = state.downloadVisible;
+  const index = rows.findIndex((row) => row.id === id);
+  const anchor = state.downloadAnchor === null
+    ? -1
+    : rows.findIndex((row) => row.id === state.downloadAnchor);
+
+  // Shift-click fills the range: the difference between selecting a hundred
+  // rows and clicking a hundred times.
+  const from = event.shiftKey && anchor > -1 ? Math.min(anchor, index) : index;
+  const to = event.shiftKey && anchor > -1 ? Math.max(anchor, index) : index;
+
+  for (let at = from; at <= to; at += 1) {
+    const row = rows[at];
+    if (!row || !selectable(row)) continue;
+    if (input.checked) state.downloadSelection.add(row.id);
+    else state.downloadSelection.delete(row.id);
+  }
+
+  state.downloadAnchor = id;
+  paintSelection();
+}
+
+/** "Everything shown" — the rows the status filter and the search box have
+ *  left on screen, minus the ones a worker is holding. */
+function selectAllShown(on) {
+  state.downloadVisible.filter(selectable).forEach((row) => {
+    if (on) state.downloadSelection.add(row.id);
+    else state.downloadSelection.delete(row.id);
+  });
+  state.downloadAnchor = null;
+  paintSelection();
+}
+
+async function deleteSelected() {
+  const ids = [...state.downloadSelection];
+  if (!ids.length) return;
+
+  const many = ids.length !== 1;
+  const answer = await ask({
+    title: `Delete ${ids.length} download${many ? 's' : ''}?`,
+    body: `${many ? 'They' : 'It'} will be taken off the list and `
+      + `${many ? 'their files' : 'its file'} deleted from disk. `
+      + `The track${many ? 's become' : ' becomes'} suggestable again, so a `
+      + 'later scan may offer the same music back.',
+    confirm: `Delete ${ids.length}`,
+    danger: true,
+  });
+  if (!answer.ok) return;
+
+  const button = $('#d-delete-selected');
+  button.disabled = true;
+  try {
+    const data = await api('/downloads/delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids, delete_file: true }),
+    });
+    clearSelection();
+    toast(
+      `Removed ${data.removed} · ${data.files_deleted} file`
+      + `${data.files_deleted === 1 ? '' : 's'} deleted`
+      + (data.skipped ? ` · ${data.skipped} still downloading, left alone` : ''),
+    );
+    loadDownloads();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function loadDownloads({ animate = true } = {}) {
   if (!state.downloadRows.length) showDownloadSkeleton();
 
@@ -382,6 +531,7 @@ async function loadDownloads({ animate = true } = {}) {
 
   state.downloadRows = data.downloads;
   state.downloadActive = new Map(data.active.map((item) => [item.id, item]));
+  pruneSelection();
 
   const done = data.downloads.filter((row) => row.status === 'done');
   const failed = data.downloads.filter((row) => row.status === 'failed');
@@ -410,6 +560,7 @@ function renderDownloads({ animate = true } = {}) {
     : state.downloadRows;
 
   const rows = sortDownloads(matching);
+  state.downloadVisible = rows;
 
   $('.table-scroll').hidden = rows.length === 0;
   empty.hidden = rows.length > 0;
@@ -428,6 +579,8 @@ function renderDownloads({ animate = true } = {}) {
   body.innerHTML = rows.map(downloadRowHtml).join('');
   if (animate) animateIn(Array.from(body.children));
   wireDownloadRows(body);
+  // Last, because it reads the checkboxes the line above just created.
+  paintSelection();
 }
 
 function sortDownloads(rows) {
@@ -476,8 +629,19 @@ function downloadRowHtml(row) {
   const foldAudio = row.source_codec ? `<div class="fold fold-audio">${audio(row)}</div>` : '';
   const foldAlbum = row.album ? `<div class="fold fold-album">${escapeHtml(row.album)}</div>` : '';
 
+  // A queued or running download belongs to a worker; see _IN_FLIGHT in
+  // download.py for why removing it mid-flight leaves audio behind. The box is
+  // disabled rather than absent so the column stays aligned and the reason is
+  // available on hover.
+  const pick = selectable(row)
+    ? `<input type="checkbox" data-pick="${row.id}"
+              aria-label="Select ${escapeHtml(row.artist)} — ${escapeHtml(row.title)}">`
+    : `<input type="checkbox" disabled title="Still downloading"
+              aria-label="${escapeHtml(row.title)} is still downloading">`;
+
   return `
     <tr data-id="${row.id}">
+      <td class="cell-pick" data-label="">${pick}</td>
       <td class="cell-track" data-label="Track">
         <div class="t-title" title="${escapeHtml(row.title)}">${escapeHtml(row.title)}</div>
         <div class="t-artist" title="${escapeHtml(row.artist)}">${escapeHtml(row.artist)}</div>
@@ -501,6 +665,10 @@ function downloadRowHtml(row) {
 }
 
 function wireDownloadRows(body) {
+  body.querySelectorAll('[data-pick]').forEach((input) => {
+    input.onclick = (event) => pickRow(input, event);
+  });
+
   body.querySelectorAll('[data-copy]').forEach((button) => {
     button.onclick = async () => {
       const copied = await copyText(button.dataset.copy);
@@ -554,6 +722,7 @@ function showDownloadSkeleton(count = 6) {
   $('#downloads-empty').hidden = true;
   $('#downloads-table tbody').innerHTML = Array.from({ length: count }, () => `
     <tr class="skeleton-row" aria-hidden="true">
+      <td class="cell-pick"></td>
       <td><div class="skeleton skeleton-line" style="width:70%"></div>
           <div class="skeleton skeleton-line" style="width:40%;margin-top:.35rem"></div></td>
       <td><div class="skeleton skeleton-line" style="width:80%"></div></td>
@@ -856,8 +1025,11 @@ function init() {
   $('#d-status').onchange = (event) => {
     state.downloadStatus = event.target.value;
     // A different server-side filter is a different set of rows, so the cached
-    // ones must not be reused as the skeleton's stand-in.
+    // ones must not be reused as the skeleton's stand-in — and a selection
+    // made against the old set has nothing left to refer to.
     state.downloadRows = [];
+    state.downloadVisible = [];
+    clearSelection();
     loadDownloads();
   };
 
@@ -897,6 +1069,10 @@ function init() {
       button.disabled = false;
     }
   };
+
+  $('#d-select-all').onclick = (event) => selectAllShown(event.target.checked);
+  $('#d-clear-selection').onclick = clearSelection;
+  $('#d-delete-selected').onclick = deleteSelected;
 
   $('#retry-failed').onclick = async () => {
     const data = await api('/downloads/retry-failed', { method: 'POST' });

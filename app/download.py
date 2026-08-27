@@ -1543,6 +1543,108 @@ def _parse_playlist(playlist: Path) -> list[tuple[str, str]]:
     return entries
 
 
+def prune_playlist(deleted: set[Path]) -> int:
+    """Drop the playlist entries pointing at files that have just been deleted.
+
+    The inverse of ``append_to_playlist``, and the reason it exists: an entry
+    whose file is gone is not an inert line. A music server imports it as a
+    track, shows it in the playlist, and only reports it as missing when
+    somebody presses play — so removing a hundred downloads without this
+    leaves a playlist that looks intact and is not.
+
+    Entries are matched by where they resolve, not by how they are written.
+    ``playlist_entry`` emits a path relative to the playlist's own folder, but
+    an absolute one when the file sits outside the library, and both forms can
+    sit in the same file after a PLAYLIST_FOLDER move.
+
+    Returns how many entries were removed. A playlist that could not be read or
+    written is worth a line in the log and nothing more, exactly as it is when
+    appending: the rows are already gone and the files with them.
+    """
+    playlist = config.PLAYLIST_PATH
+    if not deleted or not playlist.is_file():
+        return 0
+
+    with _playlist_lock:
+        entries = _parse_playlist(playlist)
+        if not entries:
+            return 0
+
+        kept: list[tuple[str, str]] = []
+        dropped = 0
+        for extinf, entry in entries:
+            if _entry_points_at(entry, playlist.parent, deleted):
+                dropped += 1
+                continue
+            kept.append((extinf, entry))
+
+        if not dropped:
+            return 0
+
+        # Rewritten whole rather than edited in place: the file is small, and a
+        # partial write here would cost more than the stale entries did.
+        try:
+            lines = ["#EXTM3U"]
+            for extinf, entry in kept:
+                if extinf:
+                    lines.append(extinf)
+                lines.append(entry)
+            playlist.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            log.warning("could not prune %s: %s", playlist, exc)
+            return 0
+
+    return dropped
+
+
+def _entry_points_at(entry: str, playlist_dir: Path, deleted: set[Path]) -> bool:
+    """Whether one playlist line names one of the files in ``deleted``."""
+    if "://" in entry:
+        return False
+    try:
+        path = Path(entry)
+        absolute = path if path.is_absolute() else Path(os.path.normpath(playlist_dir / path))
+        return absolute.resolve() in deleted
+    except (OSError, ValueError, RuntimeError):
+        # An entry that cannot even be resolved is not one we can claim to
+        # recognise, so it stays. A line somebody typed by hand can hold a null
+        # byte or a symlink loop, and neither is a reason to lose the playlist.
+        return False
+
+
+def prune_empty_dirs(deleted: set[Path]) -> int:
+    """Remove the folders a deletion emptied, walking up towards the library.
+
+    Deleting every track of an album leaves ``Artist/Album/`` behind, and
+    deleting an artist's last album leaves ``Artist/`` — empty folders a music
+    server still lists. Each parent is climbed until a folder still holds
+    something or the library root is reached.
+
+    MUSIC_DIR itself is never removed. It is usually a mount point, and
+    emptying the library is not a reason to unmount it.
+    """
+    root = config.MUSIC_DIR.resolve()
+    removed = 0
+
+    # Deepest first, so a folder is only considered once everything below it
+    # has already had its chance to go.
+    for directory in sorted(
+        {path.parent for path in deleted}, key=lambda p: len(p.parts), reverse=True
+    ):
+        while directory != root and root in directory.parents:
+            try:
+                if any(directory.iterdir()):
+                    break
+                directory.rmdir()
+            except OSError as exc:
+                log.debug("left %s in place: %s", directory, exc)
+                break
+            removed += 1
+            directory = directory.parent
+
+    return removed
+
+
 def rewrite_entry(entry: str, old_dir: Path, new_dir: Path) -> str:
     """One playlist line, re-expressed for a playlist that has moved.
 
@@ -2500,27 +2602,134 @@ def _reset(conn, row) -> None:
         )
 
 
+# A download that is queued or already running belongs to a worker. Deleting
+# the row out from under it does not stop the download: the worker finishes,
+# writes the file, and updates a row that is no longer there — leaving audio in
+# the library that nothing in Musicdrome knows about. Bulk delete therefore
+# leaves these alone rather than racing them.
+_IN_FLIGHT = {"queued", "downloading"}
+
+
+def _delete_tracked_file(row) -> Path | None:
+    """Delete the file a download row produced, if it is safe to.
+
+    Returns where the file was, resolved, so the playlist and the folders above
+    it can be tidied up afterwards — or None when there was nothing to delete
+    or the path did not survive the containment check.
+    """
+    if not row["path"]:
+        return None
+
+    path = Path(row["path"])
+    try:
+        # Only ever delete inside MUSIC_DIR, whatever the row claims. A path
+        # that escapes it is a corrupt row or a moved library, and either way
+        # not something to act on.
+        resolved = path.resolve()
+        resolved.relative_to(config.MUSIC_DIR.resolve())
+        path.unlink(missing_ok=True)
+    except (ValueError, OSError) as exc:
+        log.warning("refusing to delete %s: %s", path, exc)
+        return None
+    return resolved
+
+
+def _tidy_up(deleted: set[Path]) -> tuple[int, int]:
+    """Prune the playlist and the emptied folders after files are deleted.
+
+    Outside the database transaction on purpose: these touch the filesystem,
+    and holding a SQLite write lock across a directory walk is a good way to
+    make an unrelated download time out waiting for it.
+    """
+    if not deleted:
+        return 0, 0
+    return prune_playlist(deleted), prune_empty_dirs(deleted)
+
+
 def remove(download_id: int, delete_file: bool = False) -> bool:
     """Forget a download, optionally deleting the file it produced."""
     with db.connect() as conn:
         row = conn.execute("SELECT * FROM downloads WHERE id = ?", (download_id,)).fetchone()
         if row is None:
             return False
-        if delete_file and row["path"]:
-            path = Path(row["path"])
-            try:
-                # Only ever delete inside MUSIC_DIR, whatever the row claims.
-                path.resolve().relative_to(config.MUSIC_DIR.resolve())
-                path.unlink(missing_ok=True)
-            except (ValueError, OSError) as exc:
-                log.warning("refusing to delete %s: %s", path, exc)
+        deleted = _delete_tracked_file(row) if delete_file else None
         conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
         if row["suggestion_id"]:
             conn.execute(
                 "UPDATE suggestions SET status = 'new', error = '' WHERE id = ?",
                 (row["suggestion_id"],),
             )
+
+    _tidy_up({deleted} if deleted else set())
     return True
+
+
+def remove_many(ids: list[int], delete_file: bool = True) -> dict[str, int]:
+    """Forget a batch of downloads, deleting the files they produced.
+
+    The per-row delete is fine for one track; a library clear-out is not two
+    hundred of them. Each one opens its own connection, takes its own write
+    lock and re-reads the playlist, so the cost of the obvious loop is paid in
+    the browser as much as on disk.
+
+    Everything selectable goes in one transaction. In-flight rows are skipped
+    rather than refused, so one queued track cannot block the other hundred
+    and seventy-seven; the count comes back so the UI can say so.
+
+    Deleted rows put their suggestion back to 'new', exactly as removing one at
+    a time does — the track becomes suggestable again, and will be re-offered
+    on the next scan.
+    """
+    wanted = sorted({int(one) for one in ids})
+    empty = {"removed": 0, "files_deleted": 0, "skipped": 0,
+             "playlist_pruned": 0, "folders_removed": 0}
+    if not wanted:
+        return empty
+
+    placeholders = ",".join("?" * len(wanted))
+    deleted: set[Path] = set()
+
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM downloads WHERE id IN ({placeholders})", wanted
+        ).fetchall()
+        removable = [row for row in rows if row["status"] not in _IN_FLIGHT]
+        skipped = len(rows) - len(removable)
+        if not removable:
+            return {**empty, "skipped": skipped}
+
+        if delete_file:
+            for row in removable:
+                gone = _delete_tracked_file(row)
+                if gone:
+                    deleted.add(gone)
+
+        gone_ids = [row["id"] for row in removable]
+        placeholders = ",".join("?" * len(gone_ids))
+        conn.execute(f"DELETE FROM downloads WHERE id IN ({placeholders})", gone_ids)
+
+        suggestions = [row["suggestion_id"] for row in removable if row["suggestion_id"]]
+        if suggestions:
+            placeholders = ",".join("?" * len(suggestions))
+            conn.execute(
+                f"UPDATE suggestions SET status = 'new', error = '' "
+                f"WHERE id IN ({placeholders})",
+                suggestions,
+            )
+
+    pruned, folders = _tidy_up(deleted)
+    log.info(
+        "removed %d download(s), deleted %d file(s), pruned %d playlist entr(ies), "
+        "removed %d empty folder(s), skipped %d still in flight",
+        len(removable), len(deleted), pruned, folders, skipped,
+    )
+    return {
+        "removed": len(removable),
+        "files_deleted": len(deleted),
+        "skipped": skipped,
+        "playlist_pruned": pruned,
+        "folders_removed": folders,
+    }
 
 
 def track_is_downloaded(artist: str, title: str) -> bool:
