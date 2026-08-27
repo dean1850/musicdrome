@@ -259,6 +259,141 @@ test('removing a download asks in the page, names the track, and can be cancelle
     await expect(page.locator('#toast')).toContainText('Removed from the list');
   });
 
+/**
+ * Selecting rows. The point of the feature is the case that cannot be tested
+ * by hand: a hundred and seventy-eight downloads, one tick, one delete. What
+ * these check is that the count can never lie about what Delete would take —
+ * the search filters in the browser, so a selection outlives the rows that
+ * made it.
+ */
+
+const picks = () => '#downloads-table tbody [data-pick]';
+
+test('the selection bar stays out of the way until a row is ticked', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+
+  await expect(page.locator('#d-selection')).toBeHidden();
+  await expect(page.locator('#d-select-all')).not.toBeChecked();
+
+  await page.locator(picks()).first().check();
+
+  await expect(page.locator('#d-selection')).toBeVisible();
+  await expect(page.locator('#d-selected-count')).toHaveText('1 selected');
+  // Partial, so the header box reports the list rather than only what it would
+  // do next.
+  await expect(page.locator('#d-select-all')).toHaveJSProperty('indeterminate', true);
+
+  await page.locator('#d-clear-selection').click();
+  await expect(page.locator('#d-selection')).toBeHidden();
+  await expect(page.locator('#d-select-all')).toHaveJSProperty('indeterminate', false);
+});
+
+test('select all takes everything the filter is showing, and no more', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+
+  // Narrowed first: "everything shown" has to mean the search box too, not
+  // just whatever the server last sent.
+  await page.locator('#d-search').fill('/Singles/');
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(2);
+
+  await page.locator('#d-select-all').check();
+  await expect(page.locator('#d-selected-count')).toHaveText('2 selected');
+
+  // Widening the search must not quietly widen the selection with it.
+  await page.locator('#d-search').fill('');
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+  await expect(page.locator('#d-selected-count')).toHaveText('2 selected');
+  await expect(page.locator('#d-select-all')).toHaveJSProperty('indeterminate', true);
+
+  await page.locator('#d-select-all').check();
+  await expect(page.locator('#d-selected-count')).toHaveText(`${SEEDED_DOWNLOADS} selected`);
+  await expect(page.locator('#d-select-all')).toBeChecked();
+
+  await page.locator('#d-select-all').uncheck();
+  await expect(page.locator('#d-selection')).toBeHidden();
+});
+
+test('a selection hidden by the search says so rather than counting silently',
+  async ({ page }) => {
+    await page.goto('/');
+    await page.locator('.tab[data-tab="downloads"]').click();
+
+    await page.locator('#d-select-all').check();
+    await expect(page.locator('#d-selected-hidden')).toBeHidden();
+
+    await page.locator('#d-search').fill('tinlicker');
+    await expect(page.locator('#downloads-table tbody tr')).toHaveCount(1);
+
+    // Still eight selected — and the bar has to say that seven of them are no
+    // longer on the screen, or the count reads as "one".
+    await expect(page.locator('#d-selected-count')).toHaveText(`${SEEDED_DOWNLOADS} selected`);
+    await expect(page.locator('#d-selected-hidden'))
+      .toContainText(`${SEEDED_DOWNLOADS - 1} not shown`);
+  });
+
+test('shift-clicking fills the range between two rows', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+
+  await page.locator(picks()).nth(1).check();
+  await page.locator(picks()).nth(4).click({ modifiers: ['Shift'] });
+
+  await expect(page.locator('#d-selected-count')).toHaveText('4 selected');
+  await expect(page.locator(picks()).nth(0)).not.toBeChecked();
+  await expect(page.locator(picks()).nth(2)).toBeChecked();
+  await expect(page.locator(picks()).nth(5)).not.toBeChecked();
+});
+
+test('changing the status filter drops a selection made against the old rows',
+  async ({ page }) => {
+    await page.goto('/');
+    await page.locator('.tab[data-tab="downloads"]').click();
+
+    await page.locator('#d-select-all').check();
+    await expect(page.locator('#d-selection')).toBeVisible();
+
+    await page.locator('#d-status').selectOption('failed');
+    await expect(page.locator('#d-selection')).toBeHidden();
+  });
+
+test('deleting a selection takes those rows and leaves the rest', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+
+  await page.locator('#d-search').fill('/Singles/');
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(2);
+  await page.locator('#d-select-all').check();
+  await page.locator('#d-search').fill('');
+
+  await page.locator('#d-delete-selected').click();
+
+  // The same in-page dialog the single delete uses, with no option to keep the
+  // files: a bulk delete always takes them.
+  await expect(page.locator('#modal-title')).toHaveText('Delete 2 downloads?');
+  await expect(page.locator('#modal-body')).toContainText('suggestable again');
+  await expect(page.locator('#modal-option')).toBeHidden();
+
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS);
+  await expect(page.locator('#d-selected-count')).toHaveText('2 selected');
+
+  await page.locator('#d-delete-selected').click();
+  await page.locator('#modal-confirm').click();
+
+  await expect(page.locator('#downloads-table tbody tr')).toHaveCount(SEEDED_DOWNLOADS - 2);
+  await expect(page.locator('#toast')).toContainText('Removed 2');
+  await expect(page.locator('#d-selection')).toBeHidden();
+  // The two that went are the two that were ticked.
+  await expect(page.locator('#downloads-table tbody')).not.toContainText('Moments');
+  await expect(page.locator('#downloads-table tbody')).not.toContainText('Heartbeat');
+  await expect(page.locator('#downloads-table tbody')).toContainText('Breathe');
+});
+
 test('the column headings pin under the top bar when the list is scrolled',
   async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 500 });

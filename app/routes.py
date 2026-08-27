@@ -246,6 +246,28 @@ def retry_failed_downloads() -> dict[str, int]:
     return {"queued": download.retry_all_failed()}
 
 
+@router.post("/downloads/delete")
+def delete_downloads(
+    ids: list[int] = Body(..., embed=True),
+    delete_file: bool = Body(True, embed=True),
+) -> dict[str, int]:
+    """Remove a batch of downloads in one request.
+
+    Declared above the ``/downloads/{download_id}`` routes because FastAPI
+    matches in order, and a literal segment registered after a path parameter
+    is never reached.
+
+    The cap is a sanity bound rather than a policy: the list endpoint returns
+    at most a thousand rows, so nothing the UI can legitimately select comes
+    anywhere near it.
+    """
+    if not ids:
+        raise HTTPException(400, "no downloads selected")
+    if len(ids) > 1000:
+        raise HTTPException(400, "too many downloads in one request")
+    return download.remove_many(ids, delete_file=delete_file)
+
+
 @router.post("/downloads/{download_id}/retry")
 def retry_download(download_id: int) -> dict[str, bool]:
     if not download.retry(download_id):
