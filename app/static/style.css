@@ -107,8 +107,12 @@ code {
 .scan-state { color: var(--muted); font-size: 0.85rem; white-space: nowrap; }
 .scan-state.is-running { color: var(--accent-2); }
 
-/* Sits on the header's bottom edge while a scan runs. */
-.scan-progress {
+/* The one loading bar. It sits on the header's bottom edge rather than at the
+   top of the viewport: the header is sticky, so the bar is on screen from
+   every tab and at every scroll position, and it reads as part of the chrome
+   instead of as a separate strip floating above it. Absolutely positioned, so
+   appearing costs the header no height and moves nothing below it. */
+.loading-bar {
   position: absolute;
   left: 0;
   right: 0;
@@ -117,16 +121,16 @@ code {
   background: var(--surface-hi);
   overflow: hidden;
 }
-.scan-progress > i {
+.loading-bar > i {
   display: block;
   height: 100%;
   width: 0;
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
   transition: width 0.4s ease;
 }
-/* Before the model answers there is nothing to count, so sweep instead of
-   pretending to know a percentage. */
-.scan-progress.is-indeterminate > i {
+/* Nothing to count — a request in flight, or a scan still syncing — so sweep
+   instead of pretending to know a percentage. */
+.loading-bar.is-indeterminate > i {
   width: 35%;
   transition: none;
   animation: sweep 1.3s ease-in-out infinite;
@@ -1064,6 +1068,6 @@ input[type="checkbox"] { accent-color: var(--accent); width: 17px; height: 17px;
   .btn:active:not(:disabled) { transform: none; }
   /* A frozen 35% sliver would read as "35% done", which is precisely what an
      indeterminate bar is there not to claim. Fill it and dim it instead. */
-  .scan-progress.is-indeterminate > i { width: 100%; opacity: 0.45; }
+  .loading-bar.is-indeterminate > i { width: 100%; opacity: 0.45; }
   .skeleton { background: var(--surface); }
 }

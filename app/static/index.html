@@ -28,9 +28,12 @@
     <button id="scan-now" class="btn btn-primary">Scan now</button>
   </div>
 
-  <!-- Fills the width of the header while a scan runs. Indeterminate until the
-       model answers, since there is nothing to count until then. -->
-  <div id="scan-progress" class="scan-progress" hidden><i></i></div>
+  <!-- One loading bar for the whole app, on the bottom edge of the header so
+       it is on screen from every tab. Lit by any request the user asked for,
+       and held up for the length of a scan. Indeterminate unless there is
+       something real to count, which only the scan's enrichment phase has. -->
+  <div id="loading" class="loading-bar" hidden
+       role="progressbar" aria-label="Loading" aria-valuemin="0" aria-valuemax="100"><i></i></div>
 </header>
 
 <div id="banner" class="banner" hidden></div>
