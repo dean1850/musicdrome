@@ -420,14 +420,238 @@ test('the column headings pin under the top bar when the list is scrolled',
     expect(Math.abs(pinned.heading - pinned.bar)).toBeLessThan(2);
   });
 
-test('the scan progress bar appears only while a scan runs', async ({ page }) => {
-  await page.goto('/');
-  await expect(page.locator('#scan-progress')).toBeHidden();
+/**
+ * The loading bar. One bar on the header's bottom edge, lit by any request the
+ * user asked for and held up for the length of a scan.
+ *
+ * The test this replaced clicked "Scan now" and waited for the bar. It could
+ * not pass: the seeded instance has no AI backend, so the scan was over before
+ * the next status poll could catch it running, and the assertion was really a
+ * race against a scan that had already failed. Requests are delayed here
+ * instead, which is the only way to make "the bar shows while something is in
+ * flight" a statement about the bar rather than about the server's timing.
+ */
 
-  // The seeded instance has no AI backend, so the scan fails fast — enough to
-  // prove the bar is driven by scan state rather than always painted.
-  await page.locator('#scan-now').click();
-  await expect(page.locator('#scan-progress')).toBeVisible({ timeout: 5000 });
+/** Record whether #loading is ever unhidden from now on. Asserting that a bar
+ *  never appeared cannot be done by sampling — it has to be watched. */
+async function watchLoading(page: import('@playwright/test').Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as { __loadingSeen: boolean };
+    w.__loadingSeen = false;
+    const bar = document.querySelector('#loading')!;
+    if (!bar.hasAttribute('hidden')) w.__loadingSeen = true;
+    new MutationObserver(() => {
+      if (!bar.hasAttribute('hidden')) w.__loadingSeen = true;
+    }).observe(bar, { attributes: true, attributeFilter: ['hidden'] });
+  });
+}
+
+const loadingWasSeen = (page: import('@playwright/test').Page) =>
+  page.evaluate(() => (window as unknown as { __loadingSeen: boolean }).__loadingSeen);
+
+/** A scan state the server will not produce on its own: the real status is
+ *  fetched and only the scan block is rewritten, so every other consumer of
+ *  /api/status still gets a whole, valid payload. */
+async function fakeScan(
+  page: import('@playwright/test').Page,
+  scan: Record<string, unknown>,
+) {
+  await page.route('**/api/status', async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.scan = { ...body.scan, ...scan };
+    await route.fulfill({ response, json: body });
+  });
+}
+
+test('the loading bar stays down when nothing is happening', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.card').first()).toBeVisible();
+  await expect(page.locator('#loading')).toBeHidden();
+});
+
+test('a slow request the user asked for raises the bar, and it goes away after',
+  async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('.card').first()).toBeVisible();
+
+    await page.route('**/api/downloads?**', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await route.fetch().then((response) => route.fulfill({ response }));
+    });
+
+    await page.locator('.tab[data-tab="downloads"]').click();
+
+    await expect(page.locator('#loading')).toBeVisible();
+    // Nothing to count, so it sweeps rather than inventing a percentage.
+    await expect(page.locator('#loading')).toHaveClass(/is-indeterminate/);
+    await expect(page.locator('#loading')).not.toHaveAttribute('aria-valuenow', /.*/);
+
+    await expect(page.locator('#downloads-table tbody tr').first()).toBeVisible();
+    await expect(page.locator('#loading')).toBeHidden();
+  });
+
+test('a request that finishes quickly never flashes the bar', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.card').first()).toBeVisible();
+
+  await watchLoading(page);
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#downloads-table tbody tr').first()).toBeVisible();
+
+  // The seeded server answers in single-digit milliseconds. A bar painted for
+  // one frame on every click is worse than no bar at all.
+  expect(await loadingWasSeen(page)).toBe(false);
+});
+
+test('the background polls never raise the bar, however slow they are',
+  async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('.card').first()).toBeVisible();
+
+    // Slow enough that a foreground request would certainly have shown it.
+    await page.route('**/api/status', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      await route.fetch().then((response) => route.fulfill({ response }));
+    });
+
+    await watchLoading(page);
+    await page.evaluate(() => (window as unknown as
+      { refreshStatus: () => Promise<void> }).refreshStatus());
+    await page.waitForTimeout(900);
+
+    expect(await loadingWasSeen(page)).toBe(false);
+  });
+
+test('a request that fails still puts the bar down', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.card').first()).toBeVisible();
+
+  // The counter is decremented in a `finally`. If it were not, one failed
+  // request would leave the bar spinning for the rest of the session — and
+  // the failure is exactly when a stuck bar is least welcome.
+  await page.route('**/api/downloads?**', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await route.fulfill({ status: 500, json: { detail: 'the server fell over' } });
+  });
+
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#loading')).toBeVisible();
+
+  await expect(page.locator('#toast')).toContainText('the server fell over');
+  await expect(page.locator('#loading')).toBeHidden();
+});
+
+test('the bar waits for the last request, not the first', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.card').first()).toBeVisible();
+
+  // Two overlapping requests. The quick one finishing must not take the bar
+  // down while the slow one is still out — that is the whole reason the bar
+  // counts requests rather than tracking a boolean.
+  await page.route('**/api/downloads?**', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await route.fetch().then((response) => route.fulfill({ response }));
+  });
+  await page.route('**/api/stats?**', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await route.fetch().then((response) => route.fulfill({ response }));
+  });
+
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      loadStats: () => Promise<void>, loadDownloads: () => Promise<void>,
+    };
+    w.loadStats().catch(() => {});
+    w.loadDownloads().catch(() => {});
+  });
+
+  await expect(page.locator('#loading')).toBeVisible();
+  // Well after the downloads request has landed and long before the stats one.
+  await page.waitForTimeout(1000);
+  await expect(page.locator('#loading')).toBeVisible();
+
+  await expect(page.locator('#loading')).toBeHidden({ timeout: 5000 });
+});
+
+test('with reduced motion the bar fills and dims instead of sweeping', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+  await expect(page.locator('.card').first()).toBeVisible();
+
+  await page.route('**/api/downloads?**', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    await route.fetch().then((response) => route.fulfill({ response }));
+  });
+  await page.locator('.tab[data-tab="downloads"]').click();
+  await expect(page.locator('#loading')).toBeVisible();
+
+  // A frozen 35% sliver would read as "35% done", which is precisely what an
+  // indeterminate bar is there not to claim.
+  const fill = page.locator('#loading > i');
+  await expect(fill).toHaveCSS('opacity', '0.45');
+  const [barWidth, fillWidth] = await Promise.all([
+    page.locator('#loading').evaluate((el) => el.getBoundingClientRect().width),
+    fill.evaluate((el) => el.getBoundingClientRect().width),
+  ]);
+  expect(fillWidth).toBeCloseTo(barWidth, 0);
+
+  // Let the delayed request land before the test ends. Without this the route
+  // callback is still in flight at teardown, and Playwright reports the
+  // resulting "Test ended" against whichever test happens to run next.
+  await expect(page.locator('#loading')).toBeHidden();
+});
+
+test('a running scan holds the bar up and counts, once there is something to count',
+  async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('.card').first()).toBeVisible();
+
+    await fakeScan(page, { running: true, step: 'enriching', done: 3, total: 10 });
+    await page.evaluate(() => (window as unknown as
+      { refreshStatus: () => Promise<void> }).refreshStatus());
+
+    await expect(page.locator('#loading')).toBeVisible();
+    await expect(page.locator('#loading')).not.toHaveClass(/is-indeterminate/);
+    await expect(page.locator('#loading')).toHaveAttribute('aria-valuenow', '30');
+    expect(await page.locator('#loading > i').evaluate(
+      (fill) => (fill as HTMLElement).style.width)).toBe('30%');
+
+    // And the header says the same thing in words.
+    await expect(page.locator('#scan-state')).toHaveText('enriching — 3/10');
+    await expect(page.locator('#scan-now')).toBeDisabled();
+  });
+
+test('a scan with nothing countable yet sweeps rather than inventing a number',
+  async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('.card').first()).toBeVisible();
+
+    await fakeScan(page, { running: true, step: 'syncing history', done: 0, total: 0 });
+    await page.evaluate(() => (window as unknown as
+      { refreshStatus: () => Promise<void> }).refreshStatus());
+
+    await expect(page.locator('#loading')).toBeVisible();
+    await expect(page.locator('#loading')).toHaveClass(/is-indeterminate/);
+    await expect(page.locator('#loading')).not.toHaveAttribute('aria-valuenow', /.*/);
+    await expect(page.locator('#scan-state')).toHaveText('syncing history');
+  });
+
+test('the bar comes down once the scan it was holding up finishes', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('.card').first()).toBeVisible();
+
+  await fakeScan(page, { running: true, step: 'enriching', done: 1, total: 4 });
+  await page.evaluate(() => (window as unknown as
+    { refreshStatus: () => Promise<void> }).refreshStatus());
+  await expect(page.locator('#loading')).toBeVisible();
+
+  await page.unroute('**/api/status');
+  await page.evaluate(() => (window as unknown as
+    { refreshStatus: () => Promise<void> }).refreshStatus());
+
+  await expect(page.locator('#loading')).toBeHidden();
+  await expect(page.locator('#scan-now')).toBeEnabled();
 });
 
 test('a match the Navidrome hearts lifted says so, and says by how much', async ({ page }) => {

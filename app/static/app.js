@@ -37,9 +37,27 @@ const state = {
   days: 90,
   settings: {},
   scanning: false,
+  // null while a scan has nothing countable to report, 0-100 once the
+  // enrichment phase starts. Read by the loading bar, which prefers a real
+  // percentage over a sweep whenever there is one.
+  scanPercent: null,
+  // How many requests the user asked for are in flight, and the timers that
+  // keep the bar from flashing on the fast ones.
+  pending: 0,
+  loadingShown: false,
+  loadingSince: 0,
+  loadingIn: null,
+  loadingOut: null,
   fastPoll: null,
   statusPoll: null,
 };
+
+// On a LAN most requests here finish in about ten milliseconds. Painted
+// immediately, the bar is a one-frame flicker on every click — visible enough
+// to be noticed, too brief to be read as anything. So it waits before showing,
+// and once shown it stays long enough to be seen.
+const LOADING_DELAY = 120;
+const LOADING_MINIMUM = 350;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -59,14 +77,107 @@ function animateIn(elements) {
 
 // ─── API ────────────────────────────────────────────────────────────────
 
-async function api(path, options = {}) {
-  const response = await fetch(`/api${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
-  return body;
+/**
+ * Every request the UI makes goes through here, which is what lets one bar
+ * report all of them without each caller having to remember to say so.
+ *
+ * `background: true` opts a request out. The two polls use it: the status
+ * poll runs every five seconds and the downloads poll every two while
+ * anything is in flight, and a bar that lights on its own timer several times
+ * a minute stops meaning "something you asked for is happening".
+ */
+async function api(path, { background = false, ...options } = {}) {
+  if (!background) beginLoading();
+  try {
+    const response = await fetch(`/api${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
+    return body;
+  } finally {
+    // In `finally`, so a request that throws still puts the bar down. A failed
+    // request that left it spinning would be the worst of both.
+    if (!background) endLoading();
+  }
+}
+
+// ─── The loading bar ────────────────────────────────────────────────────
+
+function beginLoading() {
+  state.pending += 1;
+  syncLoading();
+}
+
+function endLoading() {
+  state.pending = Math.max(0, state.pending - 1);
+  syncLoading();
+}
+
+/**
+ * Reconcile the bar with the two things that can want it: a request the user
+ * asked for, and a scan running. One path for both, so a scan that starts and
+ * dies inside the delay window behaves exactly like a request that does — it
+ * is never drawn at all, rather than flashing for a frame.
+ */
+function syncLoading() {
+  const wanted = state.pending > 0 || state.scanning;
+
+  if (wanted) {
+    // Needed again before the hide landed: keep it up rather than blinking.
+    clearTimeout(state.loadingOut);
+    state.loadingOut = null;
+    if (state.loadingShown) {
+      paintLoading();
+      return;
+    }
+    if (state.loadingIn) return;
+    state.loadingIn = setTimeout(() => {
+      state.loadingIn = null;
+      state.loadingShown = true;
+      state.loadingSince = Date.now();
+      paintLoading();
+    }, LOADING_DELAY);
+    return;
+  }
+
+  if (state.loadingIn) {
+    // It never reached the screen, so there is nothing to take off it.
+    clearTimeout(state.loadingIn);
+    state.loadingIn = null;
+    return;
+  }
+  if (!state.loadingShown || state.loadingOut) return;
+
+  // Serve out whatever is left of the minimum. A bar that arrives at 120ms and
+  // leaves at 130ms is the flicker the delay was there to prevent.
+  const served = Date.now() - state.loadingSince;
+  state.loadingOut = setTimeout(() => {
+    state.loadingOut = null;
+    state.loadingShown = false;
+    paintLoading();
+  }, Math.max(0, LOADING_MINIMUM - served));
+}
+
+/**
+ * Draw it. A scan wins the mode when both are running: it is the only one of
+ * the two that ever knows how far along it is, and sweeping over a real
+ * percentage would be throwing that away.
+ */
+function paintLoading() {
+  const bar = $('#loading');
+  bar.hidden = !state.loadingShown;
+  if (!state.loadingShown) {
+    bar.removeAttribute('aria-valuenow');
+    return;
+  }
+
+  const percent = state.scanning ? state.scanPercent : null;
+  bar.classList.toggle('is-indeterminate', percent === null);
+  bar.firstElementChild.style.width = percent === null ? '' : `${percent}%`;
+  if (percent === null) bar.removeAttribute('aria-valuenow');
+  else bar.setAttribute('aria-valuenow', String(percent));
 }
 
 function toast(message, isError = false) {
@@ -526,8 +637,13 @@ async function deleteSelected() {
 async function loadDownloads({ animate = true } = {}) {
   if (!state.downloadRows.length) showDownloadSkeleton();
 
+  // The poll refreshes this table every two seconds while anything is
+  // downloading, and passes animate:false to do it without restarting the row
+  // animation. That is exactly the refresh nobody asked for, so it is the one
+  // that must not light the bar either.
   const data = await api(
-    `/downloads?${new URLSearchParams({ status: state.downloadStatus })}`);
+    `/downloads?${new URLSearchParams({ status: state.downloadStatus })}`,
+    { background: !animate });
 
   state.downloadRows = data.downloads;
   state.downloadActive = new Map(data.active.map((item) => [item.id, item]));
@@ -880,7 +996,8 @@ function renderConnections(status) {
 async function refreshStatus() {
   let status;
   try {
-    status = await api('/status');
+    // Background: this runs on a timer, not because anybody asked for it.
+    status = await api('/status', { background: true });
   } catch {
     $('#scan-state').textContent = 'offline';
     return;
@@ -890,9 +1007,7 @@ async function refreshStatus() {
   state.scanning = status.scan.running;
 
   const label = $('#scan-state');
-  const bar = $('#scan-progress');
   label.classList.toggle('is-running', state.scanning);
-  bar.hidden = !state.scanning;
 
   if (state.scanning) {
     const { step, done, total } = status.scan;
@@ -900,8 +1015,7 @@ async function refreshStatus() {
     // before it (syncing, indexing, waiting on the model) has no meaningful
     // percentage, so the bar sweeps rather than inventing one.
     const countable = total > 0 && done > 0;
-    bar.classList.toggle('is-indeterminate', !countable);
-    bar.firstElementChild.style.width = countable ? `${Math.round((done / total) * 100)}%` : '';
+    state.scanPercent = countable ? Math.round((done / total) * 100) : null;
     label.textContent = countable ? `${step} — ${done}/${total}` : step;
   } else if (status.scan.last) {
     const last = status.scan.last;
@@ -911,6 +1025,9 @@ async function refreshStatus() {
   } else {
     label.textContent = 'never scanned';
   }
+
+  if (!state.scanning) state.scanPercent = null;
+  syncLoading();
 
   $('#scan-now').disabled = state.scanning;
   renderSettings(status.settings);
@@ -953,7 +1070,8 @@ function showSetupBanner(status) {
 function startFastPoll() {
   if (state.fastPoll) return;
   state.fastPoll = setInterval(async () => {
-    const { active } = await api('/downloads/active').catch(() => ({ active: [] }));
+    const { active } = await api('/downloads/active', { background: true })
+      .catch(() => ({ active: [] }));
     // Without `animate: false` the whole table would re-enter every two
     // seconds for as long as anything is downloading.
     if (state.tab === 'downloads') loadDownloads({ animate: false });
@@ -987,6 +1105,7 @@ function init() {
     try {
       await api('/scan', { method: 'POST' });
       state.scanning = true;
+      syncLoading();
       $('#scan-now').disabled = true;
       toast('Scan started');
       refreshStatus();
