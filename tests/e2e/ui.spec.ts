@@ -680,6 +680,21 @@ test('the connections panel reports Navidrome', async ({ page }) => {
   await expect(row).toContainText('3 hearted of 4');
 });
 
+test('the connections panel names Maloja as itself', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('tab', { name: 'Settings' }).click();
+
+  // Every source that was not Last.fm used to be labelled ListenBrainz.
+  const row = page.locator('#connections div', { hasText: 'Maloja' });
+  await expect(row).toContainText('not configured');
+  await expect(page.locator('#connections dt', { hasText: 'ListenBrainz' })).toHaveCount(1);
+});
+
+test('the setup banner offers Maloja as a way to add history', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#banner')).toContainText('MALOJA_URL');
+});
+
 test('settings persist across a reload', async ({ page }) => {
   await page.goto('/');
   await page.locator('.tab[data-tab="settings"]').click();

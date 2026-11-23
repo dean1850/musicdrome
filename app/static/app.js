@@ -955,11 +955,17 @@ async function saveSetting(input) {
   }
 }
 
+// Display names for the scrobble sources /api/status lists. A name missing
+// from here is shown as sent, rather than mislabelled as one of the others.
+const SOURCE_LABELS = { lastfm: 'Last.fm', listenbrainz: 'ListenBrainz', maloja: 'Maloja' };
+
 function renderConnections(status) {
   const rows = status.history.sources.map((source) => {
-    const label = source.name === 'lastfm' ? 'Last.fm' : 'ListenBrainz';
+    const label = SOURCE_LABELS[source.name] || source.name;
     if (!source.configured) return [label, 'not configured', 'off'];
     if (source.error) return [label, source.error, 'err'];
+    // Just added to .env and restarted: say what happens next, not "never".
+    if (!source.synced_at) return [label, 'configured — syncs on the next scan', 'ok'];
     return [label, `synced ${ago(source.synced_at)}`, 'ok'];
   });
 
@@ -1057,7 +1063,7 @@ function showSetupBanner(status) {
     problems.push(`Downloads cannot be saved. ${status.music_dir_problem}`);
   }
   if (!status.history.sources.some((source) => source.configured)) {
-    problems.push('No listening history configured — set LASTFM_USER or LISTENBRAINZ_USER in .env.');
+    problems.push('No listening history configured — set MALOJA_URL, LASTFM_USER or LISTENBRAINZ_USER in .env.');
   }
   if (!status.ai.available) {
     problems.push(`The ${status.ai.provider} backend is not configured — set its key or URL in .env.`);

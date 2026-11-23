@@ -1,9 +1,9 @@
 """Listening history: pulling scrobbles in, and turning them into a taste profile.
 
-Plays arrive from Last.fm and ListenBrainz and land in one table. Each source
-keeps its own cursor — the timestamp of the newest play successfully stored —
-so a sync only ever asks for what it has not seen, and adding a second source
-later back-fills without disturbing the first.
+Plays arrive from Last.fm, ListenBrainz and Maloja and land in one table. Each
+source keeps its own cursor — the timestamp of the newest play successfully
+stored — so a sync only ever asks for what it has not seen, and adding a second
+source later back-fills without disturbing the first.
 
 The cursor advances only after the rows are committed. A sync that dies halfway
 re-reads a page next time and the ``UNIQUE (track_key, played_at, source)``
@@ -17,7 +17,8 @@ is in its own table rather than manufacturing play rows to fit. Charting
 invented timestamps on the stats page would be worse than not having the data.
 
 Who you are comes from the environment: ``LASTFM_USER``, ``LISTENBRAINZ_USER``
-and ``NAVIDROME_USER``. There is one listener.
+and ``NAVIDROME_USER``, or simply ``MALOJA_URL`` — a Maloja server is one
+person's scrobbles, so its address is the identity. There is one listener.
 """
 
 from __future__ import annotations
@@ -27,13 +28,14 @@ from typing import Any, Callable, Iterator
 
 from . import affinity, config, db
 from .norm import artist_key, track_key
-from .sources import lastfm, listenbrainz, navidrome
+from .sources import lastfm, listenbrainz, maloja, navidrome
 
 log = logging.getLogger(__name__)
 
 SOURCES: dict[str, tuple[Callable[..., bool], Callable[..., Iterator[dict]]]] = {
     "lastfm": (lastfm.configured, lastfm.recent_tracks),
     "listenbrainz": (listenbrainz.configured, listenbrainz.recent_tracks),
+    "maloja": (maloja.configured, maloja.recent_tracks),
 }
 
 
@@ -41,7 +43,10 @@ def _identity(source: str) -> dict[str, str]:
     """The arguments identifying the listener to one history source."""
     if source == "lastfm":
         return {"user": config.LASTFM_USER}
-    return {"user": config.LISTENBRAINZ_USER, "token": config.LISTENBRAINZ_TOKEN}
+    if source == "listenbrainz":
+        return {"user": config.LISTENBRAINZ_USER, "token": config.LISTENBRAINZ_TOKEN}
+    # Maloja: nothing to name. The server is the listener.
+    return {}
 
 
 def configured() -> bool:

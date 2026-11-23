@@ -210,6 +210,12 @@ def enrich(item: dict[str, Any]) -> dict[str, Any]:
     MusicBrainz is authoritative for names, year and length; Last.fm supplies
     cover art and genre tags. Either can be down or unconfigured — a suggestion
     with no artwork is still a usable suggestion, so failures are absorbed.
+
+    Without a Last.fm key the genres come from MusicBrainz instead, as the
+    artist's genres. That is not decoration: the tags drive the genre filter on
+    the Discover tab and the genre signal in the Navidrome boost, and an install
+    that reads its history from Maloja would otherwise have neither. Cover art
+    needs no such fallback — the Cover Art Archive URL above is already there.
     """
     artist = str(item.get("artist", "")).strip()
     title = str(item.get("title", "")).strip()
@@ -252,6 +258,8 @@ def enrich(item: dict[str, Any]) -> dict[str, Any]:
                 enriched["album"] = info["album"]
         if not enriched["tags"]:
             enriched["tags"] = lastfm.artist_tags(enriched["artist"])
+    elif resolved:
+        enriched["tags"] = musicbrainz.artist_genres(resolved.get("artist_mbid", ""))
 
     return enriched
 
@@ -288,8 +296,8 @@ def run(trigger: str = "manual") -> dict[str, Any]:
             )
         if not history.configured():
             raise RuntimeError(
-                "no listening history configured — set LASTFM_USER or "
-                "LISTENBRAINZ_USER in .env"
+                "no listening history configured — set MALOJA_URL, LASTFM_USER "
+                "or LISTENBRAINZ_USER in .env"
             )
 
         _state["step"] = "reading scrobbles"

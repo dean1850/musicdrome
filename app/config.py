@@ -1,11 +1,12 @@
 """Runtime configuration.
 
 Everything here comes from the environment, and therefore from ``.env``. Every
-value has a working default — a ``.env`` carrying only your Last.fm key and one
-AI credential is a complete configuration.
+value has a working default — a ``.env`` carrying only your Last.fm key, or only
+your Maloja address, and one AI credential is a complete configuration.
 
 Musicdrome listens to one person. The Last.fm and ListenBrainz names below are
-that person, and there is nothing else to configure about who you are.
+that person — or the Maloja server, which is one person's by construction — and
+there is nothing else to configure about who you are.
 
 Only startup concerns live here: credentials, usernames, paths, the AI backend.
 Anything you would want to change without restarting the container (scan
@@ -144,6 +145,12 @@ LASTFM_USER = _env("LASTFM_USER")
 LISTENBRAINZ_USER = _env("LISTENBRAINZ_USER")
 LISTENBRAINZ_TOKEN = _env("LISTENBRAINZ_TOKEN")
 LISTENBRAINZ_API_URL = _env("LISTENBRAINZ_API_URL", default="https://api.listenbrainz.org")
+
+# Your own scrobble server. The address is the whole configuration: Maloja's
+# read API is public, and its API keys only permit *submitting* scrobbles, which
+# Musicdrome never does — so there is deliberately no MALOJA_API_KEY. See
+# :mod:`app.sources.maloja`.
+MALOJA_URL = _env("MALOJA_URL")
 
 # ─── Navidrome ─────────────────────────────────────────────────────────────
 #
@@ -487,6 +494,8 @@ def history_sources() -> list[str]:
         sources.append("lastfm")
     if LISTENBRAINZ_USER:
         sources.append("listenbrainz")
+    if MALOJA_URL:
+        sources.append("maloja")
     return sources
 
 

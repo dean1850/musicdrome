@@ -9,6 +9,10 @@ canonical spelling rather than the one the model happened to use.
 
 The public server asks for no more than one request per second from a single
 client, and enforces it with 503s. :func:`_throttle` honours that.
+
+It is also where genres come from when there is no Last.fm key —
+:func:`artist_genres`, below — so dropping Last.fm costs a card its tags only
+when MusicBrainz has none to give either.
 """
 
 from __future__ import annotations
@@ -79,6 +83,15 @@ def _credit(recording: dict) -> str:
     return "".join(parts).strip()
 
 
+def _lead_artist_id(recording: dict) -> str:
+    """The MBID of the first credited artist — the one a track is filed under."""
+    for credit in recording.get("artist-credit") or []:
+        artist_id = (credit.get("artist") or {}).get("id") if isinstance(credit, dict) else ""
+        if artist_id:
+            return str(artist_id)
+    return ""
+
+
 def _earliest_release(recording: dict) -> dict[str, str]:
     """The oldest release carrying this recording — usually the original album.
 
@@ -146,9 +159,83 @@ def resolve_track(artist: str, title: str, album: str = "") -> dict[str, Any] | 
         "duration": int(best.get("length") or 0) // 1000,
         "recording_mbid": best.get("id", ""),
         "release_mbid": release["release_mbid"],
+        "artist_mbid": _lead_artist_id(best),
     }
 
 
 def cover_url(release_mbid: str) -> str:
     """A Cover Art Archive front-cover URL. Not fetched here — just built."""
     return f"https://coverartarchive.org/release/{release_mbid}/front-500" if release_mbid else ""
+
+
+# ─── Genres ────────────────────────────────────────────────────────────────
+
+# As many as Last.fm's tags give a card, so the genre filter looks the same
+# whichever of the two filled it in.
+GENRES_PER_ARTIST = 5
+
+# Artist MBID → genres, for the life of the process. A scan suggests up to two
+# tracks per artist, and the next scan suggests many of the same neighbours, so
+# without this every repeat is another second of throttled waiting for an answer
+# that has not changed. Only answers are kept: a lookup that failed is retried
+# next time rather than remembered as "no genres".
+_genre_cache: dict[str, list[str]] = {}
+GENRE_CACHE_LIMIT = 5000
+
+
+def artist_genres(artist_mbid: str) -> list[str]:
+    """An artist's genres, most-voted first, or ``[]`` if there are none.
+
+    Only used when Last.fm is not configured. Anyone with a key keeps Last.fm's
+    tags and never waits on this; anyone without one pays a throttled second
+    per artist, once, in exchange for cards that still have genres.
+
+    The artist's genres rather than the recording's, for the same reason the
+    Last.fm path falls back to ``artist.getInfo``: almost nobody tags a single
+    recording, while artists are tagged constantly. And *genres* rather than
+    tags — MusicBrainz's genres are the tags that appear on its curated genre
+    list, so a card gets "trip hop" and never "seen live" or "favourites".
+    """
+    if not artist_mbid or not config.MUSICBRAINZ_API_URL:
+        return []
+
+    cached = _genre_cache.get(artist_mbid)
+    if cached is not None:
+        return list(cached)
+
+    try:
+        data = _get(f"artist/{artist_mbid}", {"inc": "genres"})
+    except MusicBrainzError as exc:
+        log.debug("musicbrainz genres failed for %s: %s", artist_mbid, exc)
+        return []
+    if not isinstance(data, dict):
+        # Not an answer about this artist; a scan is worth more than its tags.
+        return []
+
+    voted = []
+    for genre in data.get("genres") or []:
+        if not isinstance(genre, dict):
+            continue
+        name = str(genre.get("name") or "").strip()
+        # A genre that has been voted down to nothing is still listed, at zero
+        # or below, and is the opposite of a recommendation.
+        votes = genre.get("count")
+        votes = 1 if votes is None else _votes(votes)
+        if name and votes > 0:
+            voted.append((votes, name))
+
+    # Stable, so genres with equal votes keep MusicBrainz's own order.
+    voted.sort(key=lambda pair: -pair[0])
+    genres = [name for _, name in voted][:GENRES_PER_ARTIST]
+
+    if len(_genre_cache) >= GENRE_CACHE_LIMIT:
+        _genre_cache.clear()
+    _genre_cache[artist_mbid] = genres
+    return list(genres)
+
+
+def _votes(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0

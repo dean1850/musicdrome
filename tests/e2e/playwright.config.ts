@@ -27,6 +27,8 @@ const serverEnv = {
   LASTFM_API_KEY: '',
   LASTFM_USER: '',
   LISTENBRAINZ_USER: '',
+  // Unset, so the setup banner still has "no listening history" to report.
+  MALOJA_URL: '',
   EXCLUDE_MUSIC_DIR: '',
   // Configured, so the Connections panel has a Navidrome row to render. No
   // request is ever made to it: MUSICDROME_TESTING keeps the scheduler off, and

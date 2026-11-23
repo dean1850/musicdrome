@@ -14,7 +14,9 @@ def test_status_reports_configuration(client):
     assert body["history"]["total_plays"] == 0
     assert body["scan"]["running"] is False
     assert body["settings"]["batch_size"] == 40
-    assert {source["name"] for source in body["history"]["sources"]} == {"lastfm", "listenbrainz"}
+    assert {source["name"] for source in body["history"]["sources"]} == {
+        "lastfm", "listenbrainz", "maloja",
+    }
 
 
 def test_the_ui_is_served(client):
