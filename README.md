@@ -191,8 +191,9 @@ rejoined it is your favourite band again rather than "Simon".
 ### Leaving Last.fm
 
 Maloja imports a Last.fm export, so the history you built there comes with
-you. Import it, set `MALOJA_URL`, and clear `LASTFM_API_KEY` and `LASTFM_USER` —
-keep both while Maloja holds the same plays and every one is counted twice.
+you. Import it, set `MALOJA_URL`, then clear `LASTFM_API_KEY` and `LASTFM_USER`.
+Musicdrome reads every source you set, so Last.fm left configured beside a
+Maloja holding the same plays would count each of them twice.
 
 Without a Last.fm key, Musicdrome takes **genres from MusicBrainz** instead:
 each suggested artist's genres, most-voted first, which keep the Discover genre
