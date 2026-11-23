@@ -9,7 +9,7 @@ concurrent readers alongside a single writer, which is exactly the shape of this
 app: a background scan writing while the UI polls.
 
 Musicdrome is single-listener: one Last.fm account, one ListenBrainz account,
-one taste profile, taken from the environment. There is no users table and
+one Maloja server, one taste profile, taken from the environment. There is no users table and
 nothing here is scoped by person.
 """
 
@@ -28,7 +28,7 @@ from . import config
 log = logging.getLogger(__name__)
 
 SCHEMA_TABLES = """
--- Scrobbles pulled from Last.fm and ListenBrainz.
+-- Scrobbles pulled from Last.fm, ListenBrainz and Maloja.
 CREATE TABLE IF NOT EXISTS plays (
     id          INTEGER PRIMARY KEY,
     artist      TEXT    NOT NULL,

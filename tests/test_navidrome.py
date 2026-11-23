@@ -641,7 +641,7 @@ def test_status_reports_navidrome_separately_from_the_scrobble_sources(
 
     status = history.status()
 
-    assert [s["name"] for s in status["sources"]] == ["lastfm", "listenbrainz"]
+    assert [s["name"] for s in status["sources"]] == ["lastfm", "listenbrainz", "maloja"]
     assert status["navidrome"]["configured"] is True
     assert status["navidrome"]["hearts"] == 1
     assert status["navidrome"]["tracks"] == 2

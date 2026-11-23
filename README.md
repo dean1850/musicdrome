@@ -2,18 +2,18 @@
 
 AI music discovery that downloads what it recommends.
 
-Musicdrome reads what you already listen to from Last.fm and ListenBrainz —
-and, optionally, what you have *hearted* in Navidrome — asks an AI what you
-would like next, scores every suggestion with a match percentage, and downloads
-the ones you pick as tagged MP3s at 320 kbps.
+Musicdrome reads what you already listen to from Maloja, Last.fm or
+ListenBrainz — and, optionally, what you have *hearted* in Navidrome — asks an
+AI what you would like next, scores every suggestion with a match percentage,
+and downloads the ones you pick as tagged MP3s at 320 kbps.
 
 Single container: FastAPI plus vanilla HTML, CSS and JavaScript. No database
 server, no build step, no telemetry, no third-party embeds. Dark only.
 
 ```
    your scrobbles          one AI call            you decide
- Last.fm ─┐                     │                      │
-          ├──▶ SQLite ──▶ 40 ranked tracks ──▶  ↓ download  ♥ save  ✕ hide
+ Maloja ──┐                     │                      │
+ Last.fm ─┼──▶ SQLite ──▶ 40 ranked tracks ──▶  ↓ download  ♥ save  ✕ hide
  ListenBrainz ┘           + match % + why            │
  Navidrome ♥ ┘                                       ▼
                               YouTube Music ─▶ yt-dlp ─▶ Opus ~160
@@ -62,12 +62,20 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 ## What you need
 
-**A listening history.** Either is enough, both is fine:
+**A listening history.** Any one of these is enough:
 
-- **Last.fm** — a free [API key](https://www.last.fm/api/account/create) and your
+- **Maloja** — the address of your own [Maloja](https://github.com/krateng/maloja)
+  server, and nothing else: no account, no key. See
+  [Reading from Maloja](#reading-from-maloja).
+- **Last.fm** — an [API key](https://www.last.fm/api/account/create) and your
   username. Musicdrome only reads; it never scrobbles, so it needs no password
   and no API secret. Whatever you already listen with keeps scrobbling as it does.
 - **ListenBrainz** — just your username, for a public profile.
+
+Musicdrome reads every source you configure and counts what each one reports,
+so set the ones that hold *different* plays. Two that receive the same ones — a
+player scrobbling to both, or a history imported from one into the other —
+count every play twice.
 
 **Optionally, Navidrome.** Your hearted tracks, which are a much better signal
 than your plays — see [What you hearted](#what-you-hearted).
@@ -92,6 +100,7 @@ than your plays — see [What you hearted](#what-you-hearted).
    your history led there.
 4. **Resolve.** Each answer goes to MusicBrainz for the canonical artist, album,
    year and recording length, then to Last.fm for cover art and genre tags.
+   With no Last.fm key, the genres come from MusicBrainz as well.
 5. **Score.** The match percentage is the model's confidence plus whatever your
    hearts add to it.
 6. **Filter.** Anything you already have is dropped — see below.
@@ -102,6 +111,97 @@ artist, title and duration against the MusicBrainz recording, and fall back to a
 plain YouTube search when YouTube Music does not carry the track. A card that
 cannot be matched confidently is marked failed rather than guessed at — a wrong
 file in your library is worse than a missing one.
+
+## Reading from Maloja
+
+[Maloja](https://github.com/krateng/maloja) is a scrobble server you run
+yourself: your players submit to it the way they would to Last.fm, and the
+history stays on a machine you own. Musicdrome reads it like any other source.
+One line in `.env`:
+
+```sh
+MALOJA_URL=http://maloja:42010
+```
+
+That is the whole setup. A trailing `/apis/mlj_1` is fine if that is what you
+copied, and so is leaving off the `http://`.
+
+### There is no Maloja API key
+
+You will go looking for one, so it is worth saying plainly. Maloja's read API
+is public — the web interface shows your scrobbles to anyone who can reach it,
+and the API behind it asks for nothing more. Its API keys exist so a *player*
+can submit; in Maloja's own words, "an api key now ONLY permits scrobbling
+tracks". Musicdrome never scrobbles, so it has nowhere to use one, and a
+setting that does nothing would only be something to get wrong.
+
+If Maloja sits behind a login proxy, the Connections panel says so rather than
+asking for a key. Let `/apis/mlj_1/` through the proxy, or — if it takes basic
+auth — put the login in the address, `https://user:password@maloja.example.com`.
+The login is sent to that host and nowhere else, and is stripped from every
+error message before it reaches the log or the Settings page.
+
+### Reaching it from the container
+
+`localhost` is the container itself, not your server. Without gluetun, a Maloja
+on the same compose network is reached by its service name, as above. Behind
+gluetun — which the shipped compose file uses — give the host's LAN address
+instead, and let it out of the tunnel the same way as Ollama:
+
+```sh
+MALOJA_URL=http://192.168.1.5:42010
+# and on the gluetun service:
+FIREWALL_OUTBOUND_SUBNETS=192.168.1.0/24
+```
+
+The **Connections** panel in Settings shows whether it is working, and when it
+is not, which of these it is.
+
+### What it reads
+
+Plays, newest first, from `/apis/mlj_1/scrobbles`. The first sync reads the
+newest 10,000 — months of history even for a heavy listener, and more than the
+listening window uses — and every later one only what is new.
+
+Almost only. Each sync also looks **a day behind** the newest play it already
+has, because Maloja receives plays late as a matter of course: a phone that was
+offline scrobbles from its cache when it reconnects, and multi-scrobbler
+catches up after Maloja was down, both with the original timestamps. Those
+land *behind* plays already read, where a strict "everything since last time"
+would never look. Re-reading the day costs a page of duplicates that the
+database ignores.
+
+**Artists are put back together.** Maloja splits a credit into separate
+artists — "Daft Punk feat. Pharrell Williams" becomes two — and hands them back
+in database order rather than credit order, so the guest can come first. When
+the scrobble says whose album it is, that settles it, and the play is filed the
+way your tags would have it:
+
+```
+Daft Punk — Get Lucky (feat. Pharrell Williams)
+```
+
+So your top artists read "Daft Punk" rather than a different pairing for every
+collaboration, and Get Lucky is matched as the same track any other source
+calls it. Without that album information the names are joined back into one
+credit instead, which matters more than it looks: out of the box `&` is one of
+Maloja's delimiters, so *Simon & Garfunkel* arrives as two artists, and
+rejoined it is your favourite band again rather than "Simon".
+
+### Leaving Last.fm
+
+Maloja imports a Last.fm export, so the history you built there comes with
+you. Import it, set `MALOJA_URL`, and clear `LASTFM_API_KEY` and `LASTFM_USER` —
+keep both while Maloja holds the same plays and every one is counted twice.
+
+Without a Last.fm key, Musicdrome takes **genres from MusicBrainz** instead:
+each suggested artist's genres, most-voted first, which keep the Discover genre
+filter and the genre signal in the [hearts boost](#what-it-changes) working.
+MusicBrainz's genres are its curated list rather than free-form tags, so a card
+gets "trip hop" and never "seen live". It costs time rather than money —
+MusicBrainz takes one request a second, so a scan spends about a second more
+per artist the first time it meets them. Cover art carries on from the Cover
+Art Archive, which is where it already came from whenever Last.fm had none.
 
 ## What you hearted
 
@@ -258,7 +358,8 @@ and applies immediately, no restart:
 ## One listener
 
 Musicdrome recommends for one person. `LASTFM_USER`, `LISTENBRAINZ_USER` and
-`NAVIDROME_USER` in `.env` are who that is, and there is nothing else to set
+`NAVIDROME_USER` in `.env` are who that is, and so is `MALOJA_URL`: a Maloja
+server only ever holds one person's scrobbles. There is nothing else to set
 up — no accounts, no profiles, no picker. Navidrome's hearts are per-user, so
 that name decides whose hearts are read.
 
@@ -901,8 +1002,10 @@ ordinary non-admin Navidrome user is the right account to give it.
 ## Notes
 
 - MusicBrainz asks for one request per second per client and Musicdrome honours
-  it, so enriching a 40-track scan takes about a minute. It runs in the
-  background; you can keep using the UI.
+  it, so enriching a 40-track scan takes about a minute — up to two without a
+  Last.fm key, when each artist's genres are a second request (once per artist,
+  until the container restarts). It runs in the background; you can keep using
+  the UI.
 - If YouTube starts asking for a sign-in, point `YTDLP_COOKIES_FILE` at an
   exported cookies file.
 - You are responsible for complying with copyright law and the terms of service

@@ -22,6 +22,7 @@ os.environ.update(
     LASTFM_API_KEY="",
     LASTFM_USER="",
     LISTENBRAINZ_USER="",
+    MALOJA_URL="",
     NAVIDROME_URL="",
     NAVIDROME_USER="",
     NAVIDROME_PASSWORD="",

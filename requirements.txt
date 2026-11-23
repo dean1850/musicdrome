@@ -2,7 +2,7 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 
-# ── HTTP client (Last.fm, ListenBrainz, MusicBrainz, every AI backend) ──
+# ── HTTP client (Last.fm, ListenBrainz, Maloja, MusicBrainz, every AI backend) ──
 httpx==0.28.1
 
 # ── Track matching and download ─────────────────────────
